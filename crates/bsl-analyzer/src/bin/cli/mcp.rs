@@ -1,4 +1,12 @@
-use std::{collections::BTreeMap, env, error::Error, io, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeMap,
+    env,
+    error::Error,
+    io,
+    net::{IpAddr, Ipv4Addr},
+    path::PathBuf,
+    time::Duration,
+};
 
 use clap::{Args, Subcommand, ValueEnum};
 use serde::Deserialize;
@@ -44,6 +52,15 @@ pub struct McpServeArgs {
     /// launched internally by a broker proxy; it is not meant to be run directly.
     #[arg(long = "mode", value_enum, default_value = "stdio")]
     mode: McpServeMode,
+
+    #[arg(long)]
+    host: Option<IpAddr>,
+
+    #[arg(long)]
+    port: Option<u16>,
+
+    #[arg(long = "allowed-host")]
+    allowed_hosts: Vec<String>,
 
     #[arg(long)]
     onec_url: Option<String>,
@@ -123,6 +140,14 @@ pub enum McpServeMode {
     Stdio,
     Broker,
     Daemon,
+    Http,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HttpServeOptions {
+    host: IpAddr,
+    port: u16,
+    allowed_hosts: Vec<String>,
 }
 
 #[derive(Args)]
@@ -199,6 +224,8 @@ pub fn run(command: McpCommand) -> Result<(), Box<dyn Error + Send + Sync>> {
 }
 
 fn run_mcp_serve(args: McpServeArgs) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let http_options = validate_serve_args(&args)?;
+
     // The broker passes the 1C credential to the detached daemon via the environment
     // (not argv, which `ps` would expose for the backend's whole lifetime), so fall
     // back to it when the flag is absent.
@@ -213,16 +240,6 @@ fn run_mcp_serve(args: McpServeArgs) -> Result<(), Box<dyn Error + Send + Sync>>
         McpProfileCli::Reference => mcp_server::McpProfile::Reference,
     };
 
-    if matches!(profile, mcp_server::McpProfile::Reference)
-        && (args.onec_url.is_some() || !args.onec_user.is_empty() || !args.onec_password.is_empty())
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "reference profile does not accept --onec-url/--onec-user/--onec-password",
-        )
-        .into());
-    }
-
     match resolve_serve_mode(args.mode, profile)? {
         McpServeMode::Stdio => {
             run_mcp_server(profile, args.source_dir, args.onec_url, &args.onec_user, &password)
@@ -231,7 +248,81 @@ fn run_mcp_serve(args: McpServeArgs) -> Result<(), Box<dyn Error + Send + Sync>>
         McpServeMode::Daemon => {
             run_mcp_daemon(profile, args.source_dir, args.onec_url, &args.onec_user, &password)
         }
+        McpServeMode::Http => {
+            let options =
+                http_options.expect("validated HTTP mode must contain HTTP serve options");
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "HTTP MCP transport on {}:{} with {} allowed hosts is not implemented yet",
+                    options.host,
+                    options.port,
+                    options.allowed_hosts.len()
+                ),
+            )
+            .into())
+        }
     }
+}
+
+fn validate_serve_args(args: &McpServeArgs) -> Result<Option<HttpServeOptions>, io::Error> {
+    if matches!(args.runtime_profile, McpProfileCli::Workspace) && args.source_dir.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "workspace profile requires --source-dir",
+        ));
+    }
+
+    if matches!(args.runtime_profile, McpProfileCli::Reference)
+        && (args.onec_url.is_some() || !args.onec_user.is_empty() || !args.onec_password.is_empty())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "reference profile does not accept --onec-url/--onec-user/--onec-password",
+        ));
+    }
+
+    if !matches!(args.mode, McpServeMode::Http) {
+        if args.host.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--host is only valid with --mode http",
+            ));
+        }
+        if args.port.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--port is only valid with --mode http",
+            ));
+        }
+        if !args.allowed_hosts.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--allowed-host is only valid with --mode http",
+            ));
+        }
+        return Ok(None);
+    }
+
+    let port = args.port.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "--port is required with --mode http")
+    })?;
+    if port == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--port must be in 1..=65535",
+        ));
+    }
+
+    let host = args.host.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    if !host.is_loopback() && args.allowed_hosts.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "non-loopback --host requires at least one --allowed-host",
+        ));
+    }
+
+    Ok(Some(HttpServeOptions { host, port, allowed_hosts: args.allowed_hosts.clone() }))
 }
 
 /// Resolve the effective serve mode.
