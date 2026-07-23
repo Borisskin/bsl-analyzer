@@ -56,7 +56,12 @@ impl ProcessRecordGuard {
         std::fs::create_dir_all(parent)?;
 
         let lock_path = path.with_extension("json.lock");
-        let lock_file = OpenOptions::new().read(true).write(true).create(true).open(&lock_path)?;
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
         match lock_file.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
@@ -66,7 +71,8 @@ impl ProcessRecordGuard {
             }
             Err(TryLockError::Error(error)) => return Err(error),
         }
-        let record_file = OpenOptions::new().read(true).write(true).create(true).open(&path)?;
+        let record_file =
+            OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
 
         let record = ProcessRecord {
             schema_version: SCHEMA_VERSION,
