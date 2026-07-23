@@ -71,6 +71,14 @@ sysinfo = { version = "0.37", default-features = false, features = ["system"] }
 [dev-dependencies]
 expect-test.workspace = true
 tempfile.workspace = true
-# Client feature only for the broker integration test (drives a real MCP handshake
-# through the daemon). Unified with the lib's server features at build time.
-rmcp = { version = "1.7", features = ["client"] }
+# Client features for integration tests that drive real MCP handshakes through
+# the broker and Streamable HTTP transports. Unified with the library's server
+# features at build time.
+rmcp = { version = "1.7", features = [
+    "client",
+    "transport-streamable-http-client-reqwest",
+] }
+reqwest = { version = "0.13", default-features = false, features = [
+    "json",
+    "rustls",
+] }

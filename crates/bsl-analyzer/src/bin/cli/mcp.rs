@@ -775,10 +775,18 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
     use super::{
-        resolve_serve_mode_with_override, McpCommand, McpProfileCli, McpServeArgs, McpServeMode,
-        ServeModeContext,
+        resolve_serve_mode_with_override, validate_serve_args, McpCommand, McpProfileCli,
+        McpServeArgs, McpServeMode, ServeModeContext,
     };
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[derive(Parser)]
+    struct ServeCli {
+        #[command(flatten)]
+        args: McpServeArgs,
+    }
 
     #[test]
     fn workspace_profile_defaults_to_broker() {
@@ -853,15 +861,247 @@ mod tests {
         assert!(matches!(mode, McpServeMode::Daemon));
     }
 
-    fn serve_command(mode: McpServeMode, source_dir: &std::path::Path) -> McpCommand {
-        McpCommand::Serve(McpServeArgs {
+    #[test]
+    fn explicit_http_mode_wins_over_broker_defaults() {
+        let mode = resolve_serve_mode_with_override(
+            McpServeMode::Http,
+            mcp_server::McpProfile::Workspace,
+            ServeModeContext { broker_override: Some(true), platform_default_broker: true },
+        );
+
+        assert!(matches!(mode, McpServeMode::Http));
+    }
+
+    #[test]
+    fn http_mode_requires_a_port() {
+        let args = serve_args(McpServeMode::Http, None);
+
+        let err = validate_serve_args(&args).expect_err("HTTP without --port must be rejected");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("--port"));
+    }
+
+    #[test]
+    fn user_supplied_port_zero_is_rejected() {
+        let args = serve_args(McpServeMode::Http, Some(0));
+
+        let err = validate_serve_args(&args).expect_err("port zero is reserved for internal tests");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("1..=65535"));
+    }
+
+    #[test]
+    fn http_without_explicit_host_uses_ipv4_loopback() {
+        let args = serve_args(McpServeMode::Http, Some(8021));
+
+        let options = validate_serve_args(&args)
+            .expect("valid HTTP options")
+            .expect("HTTP mode returns HTTP options");
+
+        assert_eq!(options.host, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(options.port, 8021);
+        assert!(options.allowed_hosts.is_empty());
+    }
+
+    #[test]
+    fn http_cli_parses_ip_and_repeated_allowed_hosts() {
+        let cli = ServeCli::try_parse_from([
+            "serve",
+            "--profile",
+            "workspace",
+            "--source-dir",
+            ".",
+            "--mode",
+            "http",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "8021",
+            "--allowed-host",
+            "first.example.test",
+            "--allowed-host",
+            "second.example.test",
+        ])
+        .expect("valid HTTP command line");
+
+        assert_eq!(cli.args.host, Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+        assert_eq!(cli.args.port, Some(8021));
+        assert_eq!(cli.args.allowed_hosts, ["first.example.test", "second.example.test"]);
+    }
+
+    #[test]
+    fn http_cli_rejects_invalid_ip_and_out_of_range_port() {
+        let invalid_ip = ServeCli::try_parse_from([
+            "serve",
+            "--profile",
+            "workspace",
+            "--source-dir",
+            ".",
+            "--mode",
+            "http",
+            "--host",
+            "not-an-ip",
+            "--port",
+            "8021",
+        ])
+        .expect_err("--host must be parsed as IpAddr");
+        assert_eq!(invalid_ip.kind(), clap::error::ErrorKind::ValueValidation);
+
+        let oversized_port = ServeCli::try_parse_from([
+            "serve",
+            "--profile",
+            "workspace",
+            "--source-dir",
+            ".",
+            "--mode",
+            "http",
+            "--port",
+            "65536",
+        ])
+        .expect_err("ports above u16::MAX must be rejected");
+        assert_eq!(oversized_port.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn existing_stdio_cli_keeps_parsing_without_http_options() {
+        let cli = ServeCli::try_parse_from([
+            "serve",
+            "--profile",
+            "workspace",
+            "--source-dir",
+            ".",
+            "--mode",
+            "stdio",
+        ])
+        .expect("the existing stdio command line must remain valid");
+
+        assert!(matches!(cli.args.mode, McpServeMode::Stdio));
+        assert!(cli.args.host.is_none());
+        assert!(cli.args.port.is_none());
+        assert!(cli.args.allowed_hosts.is_empty());
+    }
+
+    #[test]
+    fn http_only_options_are_rejected_in_existing_modes() {
+        for mode in [McpServeMode::Stdio, McpServeMode::Broker, McpServeMode::Daemon] {
+            let mut args = serve_args(mode, None);
+            args.host = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
+            assert!(
+                validate_serve_args(&args).unwrap_err().to_string().contains("--host"),
+                "{mode:?} must reject --host"
+            );
+
+            args.host = None;
+            args.port = Some(8021);
+            assert!(
+                validate_serve_args(&args).unwrap_err().to_string().contains("--port"),
+                "{mode:?} must reject --port"
+            );
+
+            args.port = None;
+            args.allowed_hosts = vec!["mcp.example.test".to_owned()];
+            assert!(
+                validate_serve_args(&args).unwrap_err().to_string().contains("--allowed-host"),
+                "{mode:?} must reject --allowed-host"
+            );
+        }
+    }
+
+    #[test]
+    fn non_loopback_http_host_requires_an_allowed_host() {
+        let mut args = serve_args(McpServeMode::Http, Some(8021));
+        args.host = Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+
+        let err =
+            validate_serve_args(&args).expect_err("non-loopback bind without allowlist is unsafe");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("--allowed-host"));
+    }
+
+    #[test]
+    fn non_loopback_http_host_accepts_an_allowed_host() {
+        let mut args = serve_args(McpServeMode::Http, Some(8021));
+        args.host = Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        args.allowed_hosts = vec!["mcp.example.test".to_owned()];
+
+        let options = validate_serve_args(&args)
+            .expect("an explicit allowlist permits a non-loopback bind")
+            .expect("HTTP mode returns HTTP options");
+
+        assert_eq!(options.host, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(options.allowed_hosts, ["mcp.example.test"]);
+    }
+
+    #[test]
+    fn http_accepts_the_maximum_user_port() {
+        let args = serve_args(McpServeMode::Http, Some(u16::MAX));
+
+        let options = validate_serve_args(&args)
+            .expect("65535 is a valid user port")
+            .expect("HTTP mode returns HTTP options");
+
+        assert_eq!(options.port, u16::MAX);
+    }
+
+    #[test]
+    fn workspace_profile_still_requires_source_dir() {
+        let mut args = serve_args(McpServeMode::Stdio, None);
+        args.source_dir = None;
+
+        let err = validate_serve_args(&args).expect_err("workspace must keep requiring --source-dir");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("--source-dir"));
+    }
+
+    #[test]
+    fn reference_profile_still_rejects_onec_options() {
+        let mut args = serve_args(McpServeMode::Stdio, None);
+        args.runtime_profile = McpProfileCli::Reference;
+        args.source_dir = None;
+        args.onec_url = Some("http://onec.example.test".to_owned());
+
+        let err =
+            validate_serve_args(&args).expect_err("reference must keep rejecting 1C options");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("--onec-url/--onec-user/--onec-password"));
+    }
+
+    #[test]
+    fn reference_profile_without_onec_options_remains_valid() {
+        let mut args = serve_args(McpServeMode::Stdio, None);
+        args.runtime_profile = McpProfileCli::Reference;
+        args.source_dir = None;
+
+        assert!(
+            validate_serve_args(&args)
+                .expect("reference without 1C options remains valid")
+                .is_none()
+        );
+    }
+
+    fn serve_args(mode: McpServeMode, port: Option<u16>) -> McpServeArgs {
+        McpServeArgs {
             runtime_profile: McpProfileCli::Workspace,
-            source_dir: Some(source_dir.to_path_buf()),
+            source_dir: Some(std::path::PathBuf::from(".")),
             mode,
+            host: None,
+            port,
+            allowed_hosts: Vec::new(),
             onec_url: None,
             onec_user: String::new(),
             onec_password: String::new(),
-        })
+        }
+    }
+
+    fn serve_command(mode: McpServeMode, source_dir: &std::path::Path) -> McpCommand {
+        let mut args = serve_args(mode, None);
+        args.source_dir = Some(source_dir.to_path_buf());
+        McpCommand::Serve(args)
     }
 
     #[test]
