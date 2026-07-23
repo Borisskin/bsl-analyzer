@@ -34,7 +34,7 @@ pub enum McpCommand {
     Install(McpInstallArgs),
 }
 
-#[derive(Args, Clone)]
+#[derive(Debug, Args, Clone)]
 pub struct McpServeArgs {
     #[arg(long = "profile", value_enum)]
     runtime_profile: McpProfileCli,
@@ -308,10 +308,7 @@ fn validate_serve_args(args: &McpServeArgs) -> Result<Option<HttpServeOptions>, 
         io::Error::new(io::ErrorKind::InvalidInput, "--port is required with --mode http")
     })?;
     if port == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "--port must be in 1..=65535",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "--port must be in 1..=65535"));
     }
 
     let host = args.host.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
@@ -871,14 +868,14 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
     use super::{
         resolve_serve_mode_with_override, validate_serve_args, McpCommand, McpProfileCli,
         McpServeArgs, McpServeMode, ServeModeContext,
     };
+    use clap::Parser;
     use std::net::{IpAddr, Ipv4Addr};
 
-    #[derive(Parser)]
+    #[derive(Debug, Parser)]
     struct ServeCli {
         #[command(flatten)]
         args: McpServeArgs,
@@ -1147,7 +1144,8 @@ mod tests {
         let mut args = serve_args(McpServeMode::Stdio, None);
         args.source_dir = None;
 
-        let err = validate_serve_args(&args).expect_err("workspace must keep requiring --source-dir");
+        let err =
+            validate_serve_args(&args).expect_err("workspace must keep requiring --source-dir");
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("--source-dir"));
@@ -1160,8 +1158,7 @@ mod tests {
         args.source_dir = None;
         args.onec_url = Some("http://onec.example.test".to_owned());
 
-        let err =
-            validate_serve_args(&args).expect_err("reference must keep rejecting 1C options");
+        let err = validate_serve_args(&args).expect_err("reference must keep rejecting 1C options");
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("--onec-url/--onec-user/--onec-password"));
@@ -1173,11 +1170,9 @@ mod tests {
         args.runtime_profile = McpProfileCli::Reference;
         args.source_dir = None;
 
-        assert!(
-            validate_serve_args(&args)
-                .expect("reference without 1C options remains valid")
-                .is_none()
-        );
+        assert!(validate_serve_args(&args)
+            .expect("reference without 1C options remains valid")
+            .is_none());
     }
 
     fn serve_args(mode: McpServeMode, port: Option<u16>) -> McpServeArgs {
