@@ -14,19 +14,30 @@ pub fn extract_leading_comments_at_offset(offset: usize, source_text: &str) -> O
 
     let mut comments = Vec::new();
 
-    // Walk lines backwards from the offset; the loop stops at the first
-    // non-comment, non-blank line, so only the comment block itself is
-    // scanned, never the whole preceding text (this runs per method).
-    for line in text_before_node.rsplit('\n') {
+    // Walk lines backwards from the offset. The documentation block is only
+    // the contiguous run of `//` lines directly above the method: a blank
+    // line or code breaks it, so an unrelated comment further up (e.g. a
+    // change-log marker) is never attached as the method's documentation.
+    let mut lines = text_before_node.rsplit('\n');
+
+    // The first fragment is the method's own line up to the offset
+    // (indentation before the keyword or annotation); it is not a separate
+    // source line and must not terminate the scan.
+    if let Some(fragment) = lines.next() {
+        let trimmed = fragment.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with("//") {
+            return None;
+        }
+    }
+
+    for line in lines {
         let trimmed = line.trim();
 
-        if trimmed.starts_with("//") {
-            let comment_text = trimmed.trim_start_matches("//").trim();
+        if let Some(comment_text) = trimmed.strip_prefix("//") {
+            let comment_text = comment_text.trim();
             if !comment_text.is_empty() {
                 comments.push(comment_text.to_string());
             }
-        } else if trimmed.is_empty() {
-            continue;
         } else {
             break;
         }
@@ -472,10 +483,16 @@ mod leading_comment_scan_tests {
     }
 
     #[test]
-    fn blank_lines_inside_block_are_skipped() {
+    fn blank_line_above_method_detaches_the_block() {
         let text = "// первый\n\n// второй\n\nПроцедура П()";
+        assert_eq!(extract_leading_comments_at_offset(off(text, "Процедура"), text), None);
+    }
+
+    #[test]
+    fn blank_line_inside_block_keeps_only_adjacent_part() {
+        let text = "// далёкий\n\n// ближний\nПроцедура П()";
         let got = extract_leading_comments_at_offset(off(text, "Процедура"), text).unwrap();
-        assert_eq!(got, vec!["первый".to_string(), "второй".to_string()]);
+        assert_eq!(got, vec!["ближний".to_string()]);
     }
 
     #[test]
@@ -504,6 +521,21 @@ mod leading_comment_scan_tests {
         let text = "КонецПроцедуры\nПроцедура П()";
         assert_eq!(extract_leading_comments_at_offset(off(text, "Процедура П"), text), None);
         assert_eq!(extract_leading_comments_at_offset(0, text), None);
+    }
+
+    #[test]
+    fn comments_above_annotation_anchor_are_attached() {
+        // Callers anchor the offset at the annotation when a method has one,
+        // so the doc block right above the annotation is found.
+        let text = "// Описание.\n&НаСервере\nПроцедура П()";
+        let got = extract_leading_comments_at_offset(off(text, "&НаСервере"), text).unwrap();
+        assert_eq!(got, vec!["Описание.".to_string()]);
+    }
+
+    #[test]
+    fn code_before_offset_on_same_line_returns_none() {
+        let text = "// Описание.\nПерем А; Процедура П()";
+        assert_eq!(extract_leading_comments_at_offset(off(text, "Процедура"), text), None);
     }
 
     #[test]

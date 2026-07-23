@@ -214,6 +214,15 @@ const MAX_CONDITION_TOKENS: usize = 64;
 
 /// Slice the condition out of a directive header: `#Если X Тогда` → `X`.
 pub(crate) fn extract_condition_text(header: &str) -> Option<&str> {
+    // Real configs routinely append a line comment after the directive
+    // (`#Если … Тогда // +бит добавлено …`); drop it so the `Тогда`/`Then`
+    // terminator lands on the actual directive text. Preprocessor
+    // conditions never contain string literals, so the first `//` always
+    // begins the comment.
+    let header = match header.find("//") {
+        Some(at) => &header[..at],
+        None => header,
+    };
     let rest = header.trim_start();
     let rest = rest.strip_prefix('#')?.trim_start();
     let keyword_len = ["ИначеЕсли", "ElsIf", "Если", "If"]
@@ -222,7 +231,12 @@ pub(crate) fn extract_condition_text(header: &str) -> Option<&str> {
         .len();
     let rest = rest[keyword_len..].trim();
     let then_at = ["Тогда", "Then"].iter().find_map(|kw| {
-        rest.len().checked_sub(kw.len()).filter(|&at| stdx::case::eq_ignore_case(&rest[at..], kw))
+        rest.len()
+            .checked_sub(kw.len())
+            // `checked_sub` yields a byte offset; a non-boundary index (a
+            // trailing multibyte char that is shorter than the keyword)
+            // would panic the slice, so reject it before comparing.
+            .filter(|&at| rest.is_char_boundary(at) && stdx::case::eq_ignore_case(&rest[at..], kw))
     })?;
     Some(rest[..then_at].trim_end())
 }
@@ -442,6 +456,41 @@ mod tests {
         assert_eq!(h("#Если ВебКлиент"), PreprocCondition::Unknown);
         assert_eq!(h("#КонецЕсли"), PreprocCondition::Unknown);
         assert_eq!(h(""), PreprocCondition::Unknown);
+    }
+
+    #[test]
+    fn trailing_cyrillic_comment_does_not_panic() {
+        let h = PreprocCondition::parse_directive_header;
+        // Exact line from the reported БИТ config: the Cyrillic comment used
+        // to slice the header at a non-char-boundary byte and panic.
+        let real = "#Если Сервер Или ТолстыйКлиентОбычноеПриложение Или \
+                    ВнешнееСоединение Или ТолстыйКлиентУправляемоеПриложение Тогда \
+                    // +бит добавлено ТолстыйКлиентУправляемоеПриложение.";
+        assert_eq!(h(real).eval(EnvFlags::SERVER), Some(true));
+        // The comment must not leak into the extracted condition.
+        assert_eq!(
+            h("#Если Сервер Тогда // комментарий"),
+            PreprocCondition::Symbol(PreprocSymbol::Server)
+        );
+        assert_eq!(
+            h("#If Server Then // comment"),
+            PreprocCondition::Symbol(PreprocSymbol::Server)
+        );
+        // A comment without a valid terminator still yields Unknown, not a panic.
+        assert_eq!(h("#Если Сервер // забыли Тогда"), PreprocCondition::Unknown);
+        // No comment at all, but a trailing multibyte char shorter than the
+        // terminator lands the suffix offset off a char boundary — this is
+        // what the `is_char_boundary` guard alone protects.
+        assert_eq!(h("#Если Сервер Ж"), PreprocCondition::Unknown);
+        // Comment glued to the terminator, and a commented `#ИначеЕсли`.
+        assert_eq!(
+            h("#Если Сервер Тогда//комментарий"),
+            PreprocCondition::Symbol(PreprocSymbol::Server)
+        );
+        assert_eq!(
+            h("#ИначеЕсли Сервер Тогда // +бит"),
+            PreprocCondition::Symbol(PreprocSymbol::Server)
+        );
     }
 
     #[test]

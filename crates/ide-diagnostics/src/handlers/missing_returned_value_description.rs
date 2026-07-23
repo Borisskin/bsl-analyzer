@@ -86,6 +86,10 @@ fn check_function_hir(
     }
 
     if docs.returned_value.is_empty() {
+        // bsl-ls suppresses this case when the doc contains any `см.` link
+        // (`MethodDescription.getLinks()`), even one inside a parameter
+        // description. We deliberately do not: an inline link elsewhere in
+        // the doc does not document the return value.
         return Some(create_diagnostic(
             name_range,
             "Добавьте описание возвращаемого значения функции",
@@ -529,6 +533,48 @@ mod tests {
                 MissingReturnedValueDescription @ 11:9..11:19
                   message: Добавьте описание возвращаемого значения функции
                   severity: Warning"#]],
+        );
+    }
+
+    #[test]
+    fn test_see_link_in_parameter_description_does_not_excuse_missing_returns() {
+        // bsl-ls stays silent here because of the `см.` link inside the
+        // parameter description; the return value is still undocumented, so
+        // we report it.
+        let code = r#"// ++ 23.07.26 Мамонтов. Сделать простановку документа Транспортировка к выгрузке.
+// Параметры:
+//  Транспортировка - ДокументСсылка.Транспортировка - заполняемая транспортировка.
+//  НеРегистрироватьВШине - Булево - Истина, если вызов выполняется внутри записи документа
+//                          Транспортировка (см. ЗаполнитьПлечиДоставки). При вызове извне
+//                          записи документа параметр указывать не нужно.
+//
+// -- 23.07.26 Мамонтов. Сделать простановку документа Транспортировка к выгрузке.
+Функция ЗаполнитьПеревозчикаПоПлечамДоставки(Транспортировка, НеРегистрироватьВШине = Ложь) Экспорт
+    Возврат Истина;
+КонецФункции"#;
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::MissingReturnedValueDescription,
+            expect![[r#"
+                MissingReturnedValueDescription @ 9:9..9:45
+                  message: Добавьте описание возвращаемого значения функции
+                  severity: Warning"#]],
+        );
+    }
+
+    #[test]
+    fn test_detached_comment_block_is_not_documentation() {
+        // A comment separated from the function by a blank line is not its
+        // documentation, so the returns-description check has nothing to say.
+        let code = r#"// ++ SDG 26.12.2024 Добавить Исполнителя на вкладке В пути.
+
+Функция ЗаполнитьПеревозчика(Транспортировка) Экспорт
+    Возврат Истина;
+КонецФункции"#;
+        check_diagnostics_snapshot_for(
+            code,
+            DiagnosticCode::MissingReturnedValueDescription,
+            expect![[r#""#]],
         );
     }
 

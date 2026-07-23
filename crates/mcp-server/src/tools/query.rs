@@ -32,9 +32,12 @@ pub async fn validate_query(
         return Err(McpError::invalid_params("Пустой запрос", None));
     }
 
-    if connection.is_some() || state.onec_client().is_some() {
+    if connection.is_some() {
         let selected =
             state.onec_connection(connection).map_err(|e| McpError::invalid_params(e, None))?;
+        return validate_query_remote(selected.client(), query).await;
+    }
+    if let Ok(selected) = state.onec_connection(None) {
         return validate_query_remote(selected.client(), query).await;
     }
 

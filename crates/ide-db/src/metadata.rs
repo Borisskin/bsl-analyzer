@@ -1678,7 +1678,14 @@ pub trait MetadataDb: salsa::Database {
 }
 
 pub fn get_module_type_from_uri(file_uri: &str) -> Option<bsl_metadata::ModuleType> {
-    let parts: Vec<&str> = file_uri.split('/').collect();
+    // On Windows the LSP feeds native paths (`C:\…\Forms\F\Ext\Form\Module.bsl`);
+    // segment matching below keys on `/`, so a backslash path would collapse into
+    // one segment and misclassify every module as Unknown — e.g. a form module
+    // would lose its metadata and form-self members (`Команды`, `Элементы`) would
+    // fail to resolve. Normalize separators the same way the `find_*_by_path`
+    // helpers do.
+    let normalized = file_uri.replace('\\', "/");
+    let parts: Vec<&str> = normalized.split('/').collect();
 
     if parts.is_empty() {
         return None;
@@ -1782,7 +1789,10 @@ pub struct ModulePathInfo {
 }
 
 pub fn parse_module_path(file_uri: &str) -> Option<ModulePathInfo> {
-    let parts: Vec<&str> = file_uri.split('/').collect();
+    // Normalize Windows separators before `/`-keyed segment matching (see
+    // `get_module_type_from_uri`).
+    let normalized = file_uri.replace('\\', "/");
+    let parts: Vec<&str> = normalized.split('/').collect();
 
     if parts.len() < 4 {
         return None;
@@ -1898,7 +1908,10 @@ pub fn get_module_owner<DB: MetadataDb>(
 ) -> Option<ModuleOwner> {
     let _span = tracing::debug_span!("get_module_owner", file_uri).entered();
 
-    let parts: Vec<&str> = file_uri.split('/').collect();
+    // Normalize Windows separators before `/`-keyed segment matching (see
+    // `get_module_type_from_uri`).
+    let normalized = file_uri.replace('\\', "/");
+    let parts: Vec<&str> = normalized.split('/').collect();
 
     if parts.len() < 3 {
         tracing::debug!("URI too short, expected at least 3 parts");
@@ -2317,6 +2330,23 @@ mod tests {
     }
 
     #[test]
+    fn test_get_module_owner_windows_backslash_uri() {
+        let db = TestDatabase::default();
+
+        let path =
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../bsl-metadata/fixtures/designer").to_string();
+        let path_input = ConfigurationPathInput::new(&db, path, 0);
+
+        let owner = get_module_owner(&db, path_input, r"Catalogs\Справочник1\Ext\ObjectModule.bsl");
+
+        assert_eq!(
+            owner.map(|o| o.name().to_string()),
+            Some("Справочник1".to_string()),
+            "backslash-separated URI must resolve the same owner as a forward-slash URI"
+        );
+    }
+
+    #[test]
     fn test_get_module_owner_catalog_russian() {
         let db = TestDatabase::default();
 
@@ -2435,6 +2465,23 @@ mod tests {
         assert_eq!(get_module_type_from_uri(uri), Some(bsl_metadata::ModuleType::FormModule));
 
         let uri = "/home/user/project/src/cf/BusinessProcesses/Исполнение/Forms/ВводОписанияЗадачиИсполнителя/Ext/Form/Module.bsl";
+        assert_eq!(get_module_type_from_uri(uri), Some(bsl_metadata::ModuleType::FormModule));
+    }
+
+    #[test]
+    fn get_module_type_handles_windows_backslash_paths() {
+        // The LSP feeds native Windows paths (backslash separators); classification
+        // must still recognize a form module, otherwise its metadata is never loaded
+        // and form-self members (`Команды`, `Элементы`) become UnresolvedMethodCall.
+        let uri = r"C:\work\erp\src\cf\Documents\ЭтапПроизводства2_2\Forms\Диспетчирование\Ext\Form\Module.bsl";
+        assert_eq!(get_module_type_from_uri(uri), Some(bsl_metadata::ModuleType::FormModule));
+
+        let uri = r"C:\work\erp\src\cf\CommonModules\ГлобальныйМодуль\Ext\Module.bsl";
+        assert_eq!(get_module_type_from_uri(uri), Some(bsl_metadata::ModuleType::CommonModule));
+
+        // Mixed separators (drive prefix backslash, rest forward) must also work.
+        let uri =
+            r"C:\work/erp/src/cf/Catalogs/Номенклатура/Forms/ФормаЭлемента/Ext/Form/Module.bsl";
         assert_eq!(get_module_type_from_uri(uri), Some(bsl_metadata::ModuleType::FormModule));
     }
 

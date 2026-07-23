@@ -568,28 +568,82 @@ fn is_hyperlink_line(line: &str) -> bool {
 
 /// Whether the text contains a `См.` / `See` cross-reference (not only at the start of a
 /// line), e.g. `Продолжение процедуры (см. выше)`. Mirrors bsl-ls, which parses such
-/// references as documentation links. A Russian `см.` must sit on a word boundary and be
-/// followed by a reference word, so the unit abbreviation `5 см.` is not mistaken for a
-/// link. The English form keeps bsl-ls's line-start `see ` pattern to avoid matching the
-/// common verb mid-sentence.
+/// references as documentation links. Delegates to the same scanner that collects link
+/// targets, so detection and collection cannot drift apart: a reference counts only when
+/// a plausible target follows the marker.
 fn contains_see_reference(text: &str) -> bool {
-    const MARKER: &str = "см.";
-    let lower = text.fold_lower();
-
-    for (idx, _) in lower.match_indices(MARKER) {
-        let before = &lower[..idx];
-        // Part of a longer word (e.g. a compound) — not the "См." abbreviation.
-        let preceded_by_letter = matches!(before.chars().next_back(), Some(c) if c.is_alphabetic());
-        // A unit abbreviation such as `5 см.` is preceded by a number, not a link.
-        let preceded_by_number =
-            matches!(before.trim_end().chars().next_back(), Some(c) if c.is_numeric());
-        let followed_by_word = matches!(lower[idx + MARKER.len()..].trim_start().chars().next(), Some(c) if c.is_alphabetic());
-        if !preceded_by_letter && !preceded_by_number && followed_by_word {
+    let mut targets = Vec::new();
+    for line in text.lines() {
+        append_see_targets(line, &mut targets);
+        if !targets.is_empty() {
             return true;
         }
     }
+    false
+}
 
-    lower.lines().any(|line| line.trim_start().starts_with("see "))
+/// Collect `см.` / `see` reference targets from a single line, applying the
+/// word-boundary guards that make the marker a real cross-reference: a
+/// Russian `см.` counts anywhere except after a letter (compound word) or a
+/// number (the unit abbreviation `5 см.`), and it must be followed by a
+/// plausible target; the English `see` only at line start, so the common
+/// verb mid-sentence is not matched.
+fn append_see_targets(line: &str, out: &mut Vec<String>) {
+    let chars: Vec<char> = line.chars().collect();
+
+    let mut i = 0;
+    while i < chars.len() {
+        let is_marker = i + 2 < chars.len()
+            && chars[i].to_lowercase().eq(['с'])
+            && chars[i + 1].to_lowercase().eq(['м'])
+            && chars[i + 2] == '.';
+        if !is_marker {
+            i += 1;
+            continue;
+        }
+
+        let preceded_by_letter = i > 0 && chars[i - 1].is_alphabetic();
+        let preceded_by_number =
+            chars[..i].iter().rev().find(|c| !c.is_whitespace()).is_some_and(|c| c.is_numeric());
+        if preceded_by_letter || preceded_by_number {
+            i += 1;
+            continue;
+        }
+
+        let mut j = i + 3;
+        while j < chars.len() && chars[j].is_whitespace() {
+            j += 1;
+        }
+        if !chars.get(j).is_some_and(|c| c.is_alphabetic()) {
+            i += 1;
+            continue;
+        }
+
+        let start = j;
+        while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_' || chars[j] == '.')
+        {
+            j += 1;
+        }
+        let target: String = chars[start..j].iter().collect();
+        let target = target.trim_end_matches('.');
+        if !target.is_empty() {
+            out.push(target.to_string());
+        }
+        i = j;
+    }
+
+    let trimmed = line.trim_start();
+    if trimmed.is_char_boundary(4) && trimmed[..4].eq_ignore_ascii_case("see ") {
+        let target: String = trimmed[4..]
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
+            .collect();
+        let target = target.trim_end_matches('.');
+        if target.chars().next().is_some_and(char::is_alphabetic) {
+            out.push(target.to_string());
+        }
+    }
 }
 
 fn parse_parameters(lines: &[String]) -> Vec<ParameterDoc> {
@@ -1890,6 +1944,24 @@ mod tests {
         assert!(
             !docs.has_see_reference(),
             "a см. reference inside a parameter line is not a method-level link"
+        );
+    }
+
+    #[test]
+    fn test_uppercase_see_marker_is_detected() {
+        let comments = vec!["Данные реквизита (СМ. ОбщийМодуль.Метод).".to_string()];
+        let docs = parse_method_docs(&comments).unwrap();
+        assert!(docs.has_see_reference());
+    }
+
+    #[test]
+    fn test_see_marker_without_target_is_not_reference() {
+        let comments =
+            vec!["подробности см.".to_string(), "раздел см. 123 справочника".to_string()];
+        let docs = parse_method_docs(&comments).unwrap();
+        assert!(
+            !docs.has_see_reference(),
+            "a marker with no target or a non-alphabetic target is not a reference"
         );
     }
 

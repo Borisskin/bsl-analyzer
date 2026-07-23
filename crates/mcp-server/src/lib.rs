@@ -70,6 +70,8 @@ struct MetadataParams {
     action: String,
     /// `tree`: case-insensitive substring to narrow the returned tree (optional).
     filter: Option<String>,
+    /// `tree` in infobase mode: metadata collection, e.g. `Справочники`/`Documents`.
+    meta_type: Option<String>,
     /// `tree` in infobase mode: case-insensitive object name/synonym substring.
     name_mask: Option<String>,
     /// `tree` in infobase mode: maximum returned objects (default 100, max 1000).
@@ -360,7 +362,7 @@ impl McpServer {
         if live {
             return match p.action.as_str() {
                 "tree" => {
-                    let meta_type = require(p.filter, "filter", "tree in infobase mode")?;
+                    let meta_type = require(p.meta_type, "meta_type", "tree in infobase mode")?;
                     tools::metadata::get_live_metadata_tree(
                         &self.state,
                         p.connection.as_deref(),
@@ -1614,6 +1616,7 @@ mod contract {
               - max_items: `tree` in infobase mode: maximum returned objects (default 100, max 1000).
               - max_output_tokens: `tree` (filtered listing): output budget in tokens (~4 chars each); an over-budget
             listing is truncated at a line boundary with a continuation note (default 6000).
+              - meta_type: `tree` in infobase mode: metadata collection, e.g. `Справочники`/`Documents`.
               - mode: auto | source | infobase (default auto).
               - name_mask: `tree` in infobase mode: case-insensitive object name/synonym substring.
               - object_name: Metadata object name, e.g. `ЗаказКлиента`. Required for `object`; for `form` it

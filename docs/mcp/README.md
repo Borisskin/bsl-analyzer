@@ -17,10 +17,11 @@
 | `reference` | справка платформы, поиск по документации, `syntax_help`, `its_help` | при необходимости `EMBEDDING_URL` и `NAPARNIK_TOKEN` |
 | `workspace` | поиск по коду проекта, metadata, SDBL, выполнение BSL-кода, debug | `--source-dir`; для live-инструментов ещё `--onec-url` и учётные данные |
 
-Для нескольких ИБ используйте один `workspace` и
-`BSL_ONEC_CONNECTIONS_FILE=docs/mcp/onec-connections.example.json`; живые
-инструменты выбирают профиль параметром `connection`. Пароли задаются только
-переменными окружения, указанными в реестре.
+Для нескольких ИБ используйте один `workspace`: скопируйте
+`docs/mcp/onec-connections.example.json` за пределы репозитория, заполните и
+передайте путь через `BSL_ONEC_CONNECTIONS_FILE`; живые инструменты выбирают
+профиль параметром `connection`. Пароли задаются только переменными окружения,
+указанными в реестре.
 
 Расширение VS Code запускает языковой сервер отдельным процессом
 `bsl-analyzer-app --stdio`. MCP-профиль `workspace` использует локальный

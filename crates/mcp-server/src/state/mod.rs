@@ -134,18 +134,34 @@ impl SharedState {
     pub fn onec_connection(&self, name: Option<&str>) -> Result<OnecConnection, String> {
         if let Some(name) = name {
             return self.onec_connections.get(name).cloned().ok_or_else(|| {
-                let available =
-                    self.onec_connections.keys().cloned().collect::<Vec<_>>().join(", ");
-                format!("Unknown 1C connection '{name}'. Available: {available}")
+                if self.onec_connections.is_empty() {
+                    format!(
+                        "Unknown 1C connection '{name}'. No named connections are configured; \
+                         omit `connection` to use the --onec-url client."
+                    )
+                } else {
+                    let available =
+                        self.onec_connections.keys().cloned().collect::<Vec<_>>().join(", ");
+                    format!("Unknown 1C connection '{name}'. Available: {available}")
+                }
             });
         }
         if let Some(client) = &self.onec_client {
-            return Ok(OnecConnection::new(client.clone(), false));
+            // The legacy `--onec-url` client predates per-connection gating; keep run/eval
+            // enabled for it — execution is still guarded by the 1C-side role split.
+            return Ok(OnecConnection::new(client.clone(), true));
         }
         if self.onec_connections.len() == 1 {
             return Ok(self.onec_connections.values().next().expect("one connection").clone());
         }
-        Err("1C connection is required".to_string())
+        if self.onec_connections.is_empty() {
+            return Err(
+                "1C HTTP клиент не настроен. Укажите --onec-url или BSL_ONEC_CONNECTIONS_FILE."
+                    .to_string(),
+            );
+        }
+        let available = self.onec_connections.keys().cloned().collect::<Vec<_>>().join(", ");
+        Err(format!("1C connection is required. Available: {available}"))
     }
 
     pub fn set_workspace_root(&mut self, root: PathBuf) {
@@ -245,6 +261,13 @@ mod onec_connection_tests {
             Err(error) => error,
         };
         assert!(error.contains("test"));
+    }
+
+    #[test]
+    fn legacy_client_keeps_execute_enabled() {
+        let mut state = SharedState::shared();
+        state.set_onec_client(OnecClient::new("http://localhost/legacy", "", ""));
+        assert!(state.onec_connection(None).unwrap().allow_execute());
     }
 
     #[test]

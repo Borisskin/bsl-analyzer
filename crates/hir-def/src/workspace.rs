@@ -98,6 +98,16 @@ fn extract_module_name_from_file(db: &dyn DefDatabase, file_id: FileId) -> Optio
 
     let vfs_path = file_set.path_for_file(&file_id)?;
     let path_str = vfs_path.as_path().to_string_lossy();
+    module_name_from_path(&path_str)
+}
+
+/// Derive a module name from a file path: the segment after `CommonModules/`
+/// (localized `ОбщиеМодули/`), else the `.bsl` file stem.
+fn module_name_from_path(path: &str) -> Option<Name> {
+    // The VFS stores native paths; on Windows those use `\`. The segment matching
+    // below keys on `/`, so normalize first — otherwise `CommonModules/` is never
+    // found and the filename split yields the whole path as the module name.
+    let path_str = path.replace('\\', "/");
 
     debug!(path = %path_str, "Extracting module name from path");
 
@@ -191,5 +201,29 @@ mod tests {
     fn is_bsl_source_rejects_unknown_file_id() {
         let fs = make_file_set(&[(1, "/ws/a.bsl")]);
         assert!(!is_bsl_source(&fs, FileId(999)));
+    }
+
+    #[test]
+    fn module_name_from_forward_slash_paths() {
+        assert_eq!(
+            module_name_from_path("/ws/src/cf/CommonModules/ОбщегоНазначения/Ext/Module.bsl"),
+            Some(Name::new("ОбщегоНазначения"))
+        );
+        assert_eq!(
+            module_name_from_path("/ws/Documents/Заказ/Ext/ObjectModule.bsl"),
+            Some(Name::new("ObjectModule"))
+        );
+    }
+
+    #[test]
+    fn module_name_from_windows_backslash_paths() {
+        assert_eq!(
+            module_name_from_path(r"C:\ws\src\cf\CommonModules\ОбщегоНазначения\Ext\Module.bsl"),
+            Some(Name::new("ОбщегоНазначения"))
+        );
+        assert_eq!(
+            module_name_from_path(r"C:\ws\Documents\Заказ\Ext\ObjectModule.bsl"),
+            Some(Name::new("ObjectModule"))
+        );
     }
 }

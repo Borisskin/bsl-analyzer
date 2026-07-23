@@ -13,6 +13,7 @@ struct OnecConnectionConfig {
     url: String,
     #[serde(default)]
     user_env: String,
+    #[serde(default)]
     password_env: String,
     #[serde(default)]
     allow_execute: bool,
@@ -661,12 +662,16 @@ fn configure_named_onec_connections(
                 )
             })?
         };
-        let password = env::var(&connection.password_env).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("missing environment variable {}", connection.password_env),
-            )
-        })?;
+        let password = if connection.password_env.is_empty() {
+            String::new()
+        } else {
+            env::var(&connection.password_env).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("missing environment variable {}", connection.password_env),
+                )
+            })?
+        };
         state.add_onec_connection(
             name,
             mcp_server::OnecConnection::new(

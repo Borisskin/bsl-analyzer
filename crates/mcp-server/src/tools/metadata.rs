@@ -20,7 +20,7 @@ pub async fn get_live_metadata_tree(
         .list_metadata(&onec_client::MetadataListRequest {
             meta_type: meta_type.to_string(),
             name_mask,
-            limit: limit.min(1000),
+            limit: limit.clamp(1, 1000),
         })
         .await
         .map_err(|e| McpError::internal_error(format!("Ошибка чтения метаданных 1С: {e}"), None))?;
