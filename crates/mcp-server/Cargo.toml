@@ -27,10 +27,17 @@ vfs.workspace = true
 walkdir.workspace = true
 rayon.workspace = true
 
-rmcp = { version = "1.7", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "1.7", features = [
+    "server",
+    "macros",
+    "transport-io",
+    "transport-streamable-http-server",
+] }
 # rmcp's per-request cancellation token type (`notifications/cancelled` bridge);
 # already in the tree via rmcp itself.
 tokio-util = "0.7"
+axum = "0.8"
+tower-http = { version = "0.6", features = ["limit"] }
 schemars = "1.2"
 tokio = { version = "1", features = [
     "net",

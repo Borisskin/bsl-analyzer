@@ -6,15 +6,11 @@
 
 use std::{net::SocketAddr, time::Duration};
 
-use mcp_server::{
-    serve_http, McpProfile, McpServer, SharedState, MAX_HTTP_REQUEST_BODY_BYTES,
-};
+use mcp_server::{serve_http, McpProfile, McpServer, SharedState, MAX_HTTP_REQUEST_BODY_BYTES};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HOST};
 use rmcp::{
-    model::CallToolRequestParams,
-    service::RunningService,
-    transport::StreamableHttpClientTransport,
-    RoleClient, ServiceExt,
+    model::CallToolRequestParams, service::RunningService,
+    transport::StreamableHttpClientTransport, RoleClient, ServiceExt,
 };
 use serde_json::Value;
 use tokio::{net::TcpListener, task::JoinHandle};
@@ -33,12 +29,10 @@ struct TestServer {
 
 impl TestServer {
     async fn start(allowed_hosts: Vec<String>) -> Self {
-        let listener =
-            TcpListener::bind("127.0.0.1:0").await.expect("test listener should bind");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("test listener should bind");
         let address = listener.local_addr().expect("bound listener has an address");
         let cancellation = CancellationToken::new();
-        let server =
-            McpServer::new(McpProfile::Reference, SharedState::reference(None));
+        let server = McpServer::new(McpProfile::Reference, SharedState::reference(None));
 
         let task_cancellation = cancellation.clone();
         let task = tokio::spawn(async move {
@@ -122,10 +116,8 @@ async fn two_clients_use_the_same_ready_server() {
     let first = server.connect().await;
     let second = server.connect().await;
 
-    let (first_tools, second_tools) = tokio::join!(
-        first.list_tools(Default::default()),
-        second.list_tools(Default::default())
-    );
+    let (first_tools, second_tools) =
+        tokio::join!(first.list_tools(Default::default()), second.list_tools(Default::default()));
     assert!(first_tools.expect("first client should list tools").tools.len() >= 3);
     assert!(second_tools.expect("second client should list tools").tools.len() >= 3);
 
@@ -142,9 +134,8 @@ async fn two_clients_use_the_same_ready_server() {
 async fn health_reports_actual_listener_without_sensitive_state() {
     let server = TestServer::start(loopback_allowed_hosts()).await;
 
-    let response = reqwest::get(server.health_url())
-        .await
-        .expect("health request should reach server");
+    let response =
+        reqwest::get(server.health_url()).await.expect("health request should reach server");
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let body: Value = response.json().await.expect("health should be JSON");
 
@@ -182,10 +173,7 @@ async fn disallowed_host_is_rejected_before_mcp_dispatch() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversized_request_body_is_rejected() {
-    assert!(
-        MAX_HTTP_REQUEST_BODY_BYTES > 0,
-        "request limit must be finite and non-zero"
-    );
+    assert!(MAX_HTTP_REQUEST_BODY_BYTES > 0, "request limit must be finite and non-zero");
     let server = TestServer::start(loopback_allowed_hosts()).await;
     let response = reqwest::Client::new()
         .post(server.mcp_url())
@@ -214,11 +202,8 @@ async fn malformed_json_does_not_stop_the_server() {
         .expect("malformed request should receive an HTTP response");
     assert!(malformed.status().is_client_error());
 
-    let health = client
-        .get(server.health_url())
-        .send()
-        .await
-        .expect("server should remain reachable");
+    let health =
+        client.get(server.health_url()).send().await.expect("server should remain reachable");
     assert_eq!(health.status(), reqwest::StatusCode::OK);
 
     server.stop().await;
@@ -231,8 +216,7 @@ async fn cancellation_stops_http_and_releases_the_listener() {
 
     server.stop().await;
 
-    let rebound = TcpListener::bind(address)
-        .await
-        .expect("graceful shutdown should release the port");
+    let rebound =
+        TcpListener::bind(address).await.expect("graceful shutdown should release the port");
     drop(rebound);
 }

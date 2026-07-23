@@ -7,6 +7,7 @@ mod drift_classify;
 mod graph;
 mod graph_db;
 mod graph_query;
+mod http;
 mod state;
 mod tools;
 
@@ -18,6 +19,7 @@ pub use graph_db::{
     read_source_root_scoped_sqlite_method_call_digest, read_sqlite_method_call_digest,
 };
 pub use graph_query::{GraphDb, GraphDbContextProvider};
+pub use http::{serve_http, MAX_HTTP_REQUEST_BODY_BYTES};
 use state::WorkspaceSearchMode;
 pub use state::{OnecConnection, SharedState};
 
