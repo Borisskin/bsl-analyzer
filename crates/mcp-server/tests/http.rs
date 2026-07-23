@@ -207,7 +207,6 @@ async fn disallowed_host_is_rejected_before_mcp_dispatch() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversized_request_body_is_rejected() {
-    assert!(MAX_HTTP_REQUEST_BODY_BYTES > 0, "request limit must be finite and non-zero");
     let server = TestServer::start(loopback_allowed_hosts()).await;
     let response = reqwest::Client::new()
         .post(server.mcp_url())

@@ -37,7 +37,8 @@ struct ProcessRecord {
 
 #[derive(Debug)]
 pub(super) struct ProcessRecordGuard {
-    file: File,
+    lock_file: File,
+    record_file: File,
     path: PathBuf,
     record: ProcessRecord,
 }
@@ -54,15 +55,18 @@ impl ProcessRecordGuard {
         })?;
         std::fs::create_dir_all(parent)?;
 
-        let mut file = OpenOptions::new().read(true).write(true).create(true).open(&path)?;
-        match file.try_lock() {
+        let lock_path = path.with_extension("json.lock");
+        let lock_file = OpenOptions::new().read(true).write(true).create(true).open(&lock_path)?;
+        match lock_file.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
-                let existing = read_record(&mut file).ok();
+                let existing =
+                    std::fs::read(&path).ok().and_then(|json| serde_json::from_slice(&json).ok());
                 return Err(already_running_error(&path, existing.as_ref()));
             }
             Err(TryLockError::Error(error)) => return Err(error),
         }
+        let record_file = OpenOptions::new().read(true).write(true).create(true).open(&path)?;
 
         let record = ProcessRecord {
             schema_version: SCHEMA_VERSION,
@@ -80,9 +84,10 @@ impl ProcessRecordGuard {
             started_at: chrono::Utc::now().to_rfc3339(),
             state: ProcessState::Starting,
         };
-        let mut guard = Self { file, path, record };
+        let mut guard = Self { lock_file, record_file, path, record };
         if let Err(error) = guard.write_unchecked() {
-            let _ = guard.file.unlock();
+            guard.record.state = ProcessState::Stopped;
+            let _ = guard.lock_file.unlock();
             return Err(error);
         }
         Ok(guard)
@@ -117,7 +122,7 @@ impl ProcessRecordGuard {
 
     fn write_owned(&mut self) -> io::Result<()> {
         let instance_id = self.record.instance_id.clone();
-        let existing = read_record(&mut self.file)?;
+        let existing = read_record(&mut self.record_file)?;
         if existing.instance_id != instance_id {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -128,11 +133,11 @@ impl ProcessRecordGuard {
     }
 
     fn write_unchecked(&mut self) -> io::Result<()> {
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.set_len(0)?;
-        serde_json::to_writer_pretty(&mut self.file, &self.record)?;
-        self.file.write_all(b"\n")?;
-        self.file.flush()
+        self.record_file.seek(SeekFrom::Start(0))?;
+        self.record_file.set_len(0)?;
+        serde_json::to_writer_pretty(&mut self.record_file, &self.record)?;
+        self.record_file.write_all(b"\n")?;
+        self.record_file.flush()
     }
 }
 
@@ -141,7 +146,7 @@ impl Drop for ProcessRecordGuard {
         if self.record.state != ProcessState::Stopped {
             let _ = self.mark_stopped();
         }
-        let _ = self.file.unlock();
+        let _ = self.lock_file.unlock();
     }
 }
 
