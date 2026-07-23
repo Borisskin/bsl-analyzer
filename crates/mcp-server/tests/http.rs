@@ -29,22 +29,23 @@ struct TestServer {
 
 impl TestServer {
     async fn start(allowed_hosts: Vec<String>) -> Self {
+        Self::start_with_state(McpProfile::Reference, SharedState::reference(None), allowed_hosts)
+            .await
+    }
+
+    async fn start_with_state(
+        profile: McpProfile,
+        state: SharedState,
+        allowed_hosts: Vec<String>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("test listener should bind");
         let address = listener.local_addr().expect("bound listener has an address");
         let cancellation = CancellationToken::new();
-        let server = McpServer::new(McpProfile::Reference, SharedState::reference(None));
+        let server = McpServer::new(profile, state);
 
         let task_cancellation = cancellation.clone();
         let task = tokio::spawn(async move {
-            serve_http(
-                listener,
-                server,
-                McpProfile::Reference,
-                address,
-                allowed_hosts,
-                task_cancellation,
-            )
-            .await
+            serve_http(listener, server, profile, address, allowed_hosts, task_cancellation).await
         });
 
         Self { address, cancellation, task }
@@ -105,6 +106,37 @@ async fn http_initializes_lists_tools_and_calls_a_safe_tool() {
     .await
     .expect("safe tools/call should not hang")
     .expect("safe tools/call should succeed");
+
+    client.cancel().await.expect("client session should close");
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workspace_http_preserves_the_metadata_meta_type_contract() {
+    let project = tempfile::tempdir().expect("temporary workspace should be created");
+    let state = SharedState::workspace(project.path().to_path_buf())
+        .expect("temporary workspace should initialize");
+    let server =
+        TestServer::start_with_state(McpProfile::Workspace, state, loopback_allowed_hosts()).await;
+    let client = server.connect().await;
+
+    let tools = tokio::time::timeout(TEST_TIMEOUT, client.list_tools(Default::default()))
+        .await
+        .expect("tools/list should not hang")
+        .expect("tools/list should succeed");
+    let metadata = tools
+        .tools
+        .iter()
+        .find(|tool| tool.name == "metadata")
+        .expect("workspace profile should publish the metadata tool");
+    assert!(
+        metadata
+            .input_schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .is_some_and(|properties| properties.contains_key("meta_type")),
+        "HTTP tools/list must preserve the metadata.meta_type input contract"
+    );
 
     client.cancel().await.expect("client session should close");
     server.stop().await;
@@ -212,13 +244,20 @@ async fn malformed_json_does_not_stop_the_server() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cancellation_stops_http_and_releases_the_listener() {
+async fn cancellation_stops_an_active_session_and_releases_the_listener() {
     let server = TestServer::start(loopback_allowed_hosts()).await;
     let address = server.address;
+    let client = server.connect().await;
+
+    TcpListener::bind(address)
+        .await
+        .expect_err("the running HTTP server must keep its listener exclusive");
 
     server.stop().await;
 
-    let rebound =
-        TcpListener::bind(address).await.expect("graceful shutdown should release the port");
+    let rebound = TcpListener::bind(address)
+        .await
+        .expect("graceful shutdown should release the port even with an active client");
     drop(rebound);
+    drop(client);
 }
