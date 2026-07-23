@@ -51,17 +51,21 @@ pub struct McpServeArgs {
     /// client disconnects and reconnects, then idles out on its own once no client has
     /// used it for the idle TTL (`BSL_MCP_IDLE_TTL_SECS`, default 300s); a backend that
     /// never served any traffic gives up after a short orphan grace
-    /// (`BSL_MCP_ORPHAN_GRACE_SECS`, default 30s). `daemon` *is* that backend and is
+    /// (`BSL_MCP_ORPHAN_GRACE_SECS`, default 30s). `http` serves multiple clients over
+    /// Streamable HTTP on the required `--port`. `daemon` *is* the broker backend and is
     /// launched internally by a broker proxy; it is not meant to be run directly.
     #[arg(long = "mode", value_enum, default_value = "stdio")]
     mode: McpServeMode,
 
+    /// IP address for HTTP binding (default: 127.0.0.1).
     #[arg(long)]
     host: Option<IpAddr>,
 
+    /// TCP port for HTTP mode. Required and must be in 1..=65535.
     #[arg(long)]
     port: Option<u16>,
 
+    /// Accepted HTTP Host value. Repeat for aliases; required for non-loopback binding.
     #[arg(long = "allowed-host")]
     allowed_hosts: Vec<String>,
 
