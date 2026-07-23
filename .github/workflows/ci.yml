@@ -24,7 +24,7 @@ jobs:
       - run: cargo test --all --no-fail-fast
 
   windows-mcp:
-    name: Windows MCP stdio + secure broker
+    name: Windows MCP transports + secure broker
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,7 +32,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build binary
         run: cargo build -p bsl-analyzer --bin bsl-analyzer-app
-      - name: CLI MCP mode guard tests
-        run: cargo test -p bsl-analyzer --bin bsl-analyzer-app mcp::tests
+      - name: CLI MCP mode and lifecycle tests
+        run: cargo test -p bsl-analyzer --bin bsl-analyzer-app cli::mcp
+      - name: HTTP transport tests
+        run: cargo test -p mcp-server --test http
       - name: Broker runtime tests
         run: cargo test -p mcp-server --test broker
