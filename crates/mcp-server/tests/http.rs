@@ -82,7 +82,7 @@ fn loopback_allowed_hosts() -> Vec<String> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_initializes_lists_tools_and_calls_a_safe_tool() {
-    let server = TestServer::start(loopback_allowed_hosts()).await;
+    let server = TestServer::start(Vec::new()).await;
     let client = server.connect().await;
 
     assert!(client.peer_info().is_some(), "initialize should return server information");
@@ -140,7 +140,9 @@ async fn health_reports_actual_listener_without_sensitive_state() {
     let body: Value = response.json().await.expect("health should be JSON");
 
     assert_eq!(body["status"], "ok");
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(body["profile"], "reference");
+    assert_eq!(body["mode"], "http");
     assert_eq!(body["host"], server.address.ip().to_string());
     assert_eq!(body["port"], u64::from(server.address.port()));
     assert_eq!(body["pid"], u64::from(std::process::id()));

@@ -3,13 +3,16 @@ use std::{
     env,
     error::Error,
     io,
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     time::Duration,
 };
 
 use clap::{Args, Subcommand, ValueEnum};
+use process_record::ProcessRecordGuard;
 use serde::Deserialize;
+
+mod process_record;
 
 #[derive(Debug, Deserialize)]
 struct OnecConnectionsFile {
@@ -251,16 +254,14 @@ fn run_mcp_serve(args: McpServeArgs) -> Result<(), Box<dyn Error + Send + Sync>>
         McpServeMode::Http => {
             let options =
                 http_options.expect("validated HTTP mode must contain HTTP serve options");
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "HTTP MCP transport on {}:{} with {} allowed hosts is not implemented yet",
-                    options.host,
-                    options.port,
-                    options.allowed_hosts.len()
-                ),
+            run_mcp_http(
+                profile,
+                args.source_dir,
+                args.onec_url,
+                &args.onec_user,
+                &password,
+                options,
             )
-            .into())
         }
     }
 }
@@ -687,6 +688,131 @@ fn run_mcp_server(
 
     serve_result?;
     Ok(())
+}
+
+fn run_mcp_http(
+    profile: mcp_server::McpProfile,
+    source_dir: Option<PathBuf>,
+    onec_url: Option<String>,
+    onec_user: &str,
+    onec_password: &str,
+    options: HttpServeOptions,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let source_dir = source_dir
+        .map(|path| {
+            path.canonicalize().map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("failed to canonicalize --source-dir {}: {error}", path.display()),
+                )
+            })
+        })
+        .transpose()?;
+    let requested_address = SocketAddr::new(options.host, options.port);
+    let mut process_record =
+        ProcessRecordGuard::acquire(profile, source_dir.clone(), requested_address)?;
+
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let listener =
+        rt.block_on(tokio::net::TcpListener::bind(requested_address)).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to bind HTTP MCP listener on {requested_address}: {error}"),
+            )
+        })?;
+    let actual_address = listener.local_addr()?;
+    process_record.write_bound_process(actual_address)?;
+
+    let server = build_server(profile, source_dir, onec_url, onec_user, onec_password)?;
+    let shutdown_guard = server.clone();
+    let serve_result = match process_record.mark_running(actual_address) {
+        Ok(()) => {
+            if !actual_address.ip().is_loopback() {
+                tracing::warn!(
+                    %actual_address,
+                    "MCP HTTP is exposed beyond loopback without authentication or TLS"
+                );
+            }
+            tracing::info!(
+                %actual_address,
+                ?profile,
+                allowed_hosts = ?options.allowed_hosts,
+                "Starting MCP server (HTTP)"
+            );
+
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            rt.block_on(serve_http_until_signal(
+                listener,
+                server,
+                profile,
+                actual_address,
+                options.allowed_hosts,
+                cancellation,
+                &mut process_record,
+            ))
+        }
+        Err(error) => Err(error.into()),
+    };
+
+    drop(rt);
+    shutdown_guard.shutdown();
+    drop(shutdown_guard);
+
+    let record_result = process_record.mark_stopped();
+    drop(process_record);
+
+    record_result?;
+    serve_result?;
+    Ok(())
+}
+
+async fn serve_http_until_signal(
+    listener: tokio::net::TcpListener,
+    server: mcp_server::McpServer,
+    profile: mcp_server::McpProfile,
+    address: SocketAddr,
+    allowed_hosts: Vec<String>,
+    cancellation: tokio_util::sync::CancellationToken,
+    process_record: &mut ProcessRecordGuard,
+) -> anyhow::Result<()> {
+    let serve = mcp_server::serve_http(
+        listener,
+        server,
+        profile,
+        address,
+        allowed_hosts,
+        cancellation.clone(),
+    );
+    tokio::pin!(serve);
+
+    tokio::select! {
+        result = &mut serve => result,
+        signal_result = shutdown_signal() => {
+            let record_result = process_record.mark_stopping();
+            cancellation.cancel();
+            let serve_result = serve.await;
+            record_result?;
+            signal_result?;
+            serve_result
+        }
+    }
+}
+
+async fn shutdown_signal() -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
 }
 
 /// Build the MCP server (resident state + tool router) for a profile. Shared by the

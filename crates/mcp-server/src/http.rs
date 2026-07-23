@@ -25,7 +25,9 @@ struct HealthState {
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
+    version: &'static str,
     profile: &'static str,
+    mode: &'static str,
     host: String,
     port: u16,
     pid: u32,
@@ -35,7 +37,9 @@ struct HealthResponse {
 async fn health(State(state): State<HealthState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
+        version: env!("CARGO_PKG_VERSION"),
         profile: state.profile.as_str(),
+        mode: "http",
         host: state.address.ip().to_string(),
         port: state.address.port(),
         pid: std::process::id(),
@@ -54,9 +58,10 @@ pub async fn serve_http(
     allowed_hosts: Vec<String>,
     cancellation: CancellationToken,
 ) -> anyhow::Result<()> {
-    let config = StreamableHttpServerConfig::default()
-        .with_allowed_hosts(allowed_hosts)
-        .with_cancellation_token(cancellation.clone());
+    let config =
+        StreamableHttpServerConfig::default().with_cancellation_token(cancellation.clone());
+    let config =
+        if allowed_hosts.is_empty() { config } else { config.with_allowed_hosts(allowed_hosts) };
     let mcp = StreamableHttpService::new(
         move || Ok(server.clone()),
         Arc::new(LocalSessionManager::default()),
