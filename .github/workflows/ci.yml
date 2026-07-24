@@ -14,7 +14,6 @@ env:
 jobs:
   check:
     name: Check
-    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,7 +25,6 @@ jobs:
 
   windows-mcp:
     name: Windows MCP transports + secure broker
-    if: github.event_name != 'workflow_dispatch'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -40,92 +38,3 @@ jobs:
         run: cargo test -p mcp-server --test http
       - name: Broker runtime tests
         run: cargo test -p mcp-server --test broker
-
-  temporary-encrypted-windows-build:
-    name: Temporary encrypted Windows release build
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Validate temporary encryption key
-        shell: pwsh
-        env:
-          BUILD_ARTIFACT_KEY: ${{ secrets.BSL_TEMP_WINDOWS_BUILD_KEY }}
-        run: |
-          $keyMaterial = [Convert]::FromBase64String($env:BUILD_ARTIFACT_KEY)
-          if ($keyMaterial.Length -ne 64) {
-            throw "Invalid temporary build key"
-          }
-      - name: Build release binary
-        run: cargo build --locked --release -p bsl-analyzer --bin bsl-analyzer-app
-      - name: Verify version and encrypt binary
-        shell: pwsh
-        env:
-          BUILD_ARTIFACT_KEY: ${{ secrets.BSL_TEMP_WINDOWS_BUILD_KEY }}
-        run: |
-          Set-StrictMode -Version Latest
-          $ErrorActionPreference = "Stop"
-
-          $version = (& target/release/bsl-analyzer-app.exe --version | Out-String).Trim()
-          if ($version -notmatch '(^|\s)0\.2\.63$') {
-            throw "Unexpected application version: $version"
-          }
-
-          $keyMaterial = [Convert]::FromBase64String($env:BUILD_ARTIFACT_KEY)
-          if ($keyMaterial.Length -ne 64) {
-            throw "Invalid temporary build key"
-          }
-
-          [byte[]] $encryptionKey = $keyMaterial[0..31]
-          [byte[]] $authenticationKey = $keyMaterial[32..63]
-          $plain = [IO.File]::ReadAllBytes("target/release/bsl-analyzer-app.exe")
-
-          $aes = [Security.Cryptography.Aes]::Create()
-          try {
-            $aes.KeySize = 256
-            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
-            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
-            $aes.Key = $encryptionKey
-            $aes.GenerateIV()
-
-            $encryptor = $aes.CreateEncryptor()
-            try {
-              $cipher = $encryptor.TransformFinalBlock($plain, 0, $plain.Length)
-            }
-            finally {
-              $encryptor.Dispose()
-            }
-
-            [byte[]] $authenticatedPayload = [byte[]]::new($aes.IV.Length + $cipher.Length)
-            [Array]::Copy($aes.IV, 0, $authenticatedPayload, 0, $aes.IV.Length)
-            [Array]::Copy($cipher, 0, $authenticatedPayload, $aes.IV.Length, $cipher.Length)
-
-            $hmac = [Security.Cryptography.HMACSHA256]::new($authenticationKey)
-            try {
-              $tag = $hmac.ComputeHash($authenticatedPayload)
-            }
-            finally {
-              $hmac.Dispose()
-            }
-
-            [byte[]] $encryptedArtifact = [byte[]]::new($authenticatedPayload.Length + $tag.Length)
-            [Array]::Copy($authenticatedPayload, 0, $encryptedArtifact, 0, $authenticatedPayload.Length)
-            [Array]::Copy($tag, 0, $encryptedArtifact, $authenticatedPayload.Length, $tag.Length)
-            [IO.File]::WriteAllBytes(
-              "target/release/bsl-analyzer-app.exe.enc",
-              $encryptedArtifact
-            )
-          }
-          finally {
-            $aes.Dispose()
-          }
-
-          Write-Output "Verified $version"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: bsl-analyzer-app-windows-x86_64-encrypted
-          path: target/release/bsl-analyzer-app.exe.enc
-          if-no-files-found: error
-          retention-days: 1
