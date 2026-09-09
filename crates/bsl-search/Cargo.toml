@@ -14,7 +14,7 @@ code-chunk.workspace = true
 project-model.workspace = true
 syntax.workspace = true
 
-rusqlite.workspace = true
+rusqlite = { workspace = true, features = ["functions"] }
 postgres = "0.19"
 r2d2_postgres = "0.18"
 

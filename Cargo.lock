@@ -400,6 +400,8 @@ dependencies = [
  "vfs",
  "vfs-notify",
  "walkdir",
+ "win-security-identifier",
+ "windows-sys 0.61.2",
  "winresource",
  "zip",
 ]

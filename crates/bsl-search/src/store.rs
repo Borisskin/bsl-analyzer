@@ -1,12 +1,13 @@
 use crate::document::Document;
 use crate::error::SearchError;
+use crate::lifecycle::{Counts, Mutation, Outcome, Reason};
 use crate::workspace_roots::{FileKey, CONFIGURATION_ROOT_ID};
 use code_chunk::Chunk;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub struct Store {
@@ -28,6 +29,8 @@ pub struct Store {
     /// a mark leaves that mark pending for a later publish instead of clearing it against a
     /// graph that predates it.
     mark_seq: Arc<AtomicI64>,
+    observed_clears: Arc<AtomicU64>,
+    clear_observer_enabled: AtomicBool,
 }
 
 pub(crate) struct CollectionReplaceOutcome {
@@ -250,8 +253,23 @@ impl RootKeyedTable {
     }
 }
 
+// Best-effort diagnostics: a failed count must not change the existing write result.
+fn observe_count(
+    conn: &Connection,
+    sql: &str,
+    values: impl rusqlite::Params,
+    total: &mut Option<u64>,
+) {
+    let count = conn
+        .query_row(sql, values, |row| row.get::<_, i64>(0))
+        .ok()
+        .and_then(|n| u64::try_from(n).ok());
+    *total = total.zip(count).map(|(a, b)| a.saturating_add(b));
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self, SearchError> {
+        crate::lifecycle::startup_snapshot(path, "store");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             match Self::open_once(path) {
@@ -308,7 +326,13 @@ impl Store {
         // Set this before `journal_mode=WAL`: on a brand-new shared cache, changing journal
         // mode is itself the first contended write and must wait for the peer bootstrap.
         conn.busy_timeout(busy_timeout)?;
-        let store = Self { conn, path: path.to_path_buf(), mark_seq: Arc::new(AtomicI64::new(0)) };
+        let store = Self {
+            conn,
+            path: path.to_path_buf(),
+            mark_seq: Arc::new(AtomicI64::new(0)),
+            observed_clears: Arc::new(AtomicU64::new(0)),
+            clear_observer_enabled: AtomicBool::new(false),
+        };
         store.apply_pragmas()?;
         Ok(store)
     }
@@ -369,12 +393,19 @@ impl Store {
     /// owner's tables on a version mismatch, and a pass has no business doing either.
     /// `seed_mark_seq` still runs: it only raises the in-memory counter floor.
     pub fn open_existing(path: &Path) -> Result<Self, SearchError> {
+        crate::lifecycle::startup_snapshot(path, "existing_store");
         // No CREATE flag: the default open would materialize an empty file for a missing
         // path — a side effect the "existing" contract (and the ownership discipline of the
         // standalone pass) forbids.
         let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         conn.busy_timeout(std::time::Duration::from_secs(30))?;
-        let store = Self { conn, path: path.to_path_buf(), mark_seq: Arc::new(AtomicI64::new(0)) };
+        let store = Self {
+            conn,
+            path: path.to_path_buf(),
+            mark_seq: Arc::new(AtomicI64::new(0)),
+            observed_clears: Arc::new(AtomicU64::new(0)),
+            clear_observer_enabled: AtomicBool::new(false),
+        };
         store.apply_pragmas()?;
         let stored: Option<String> = store
             .conn
@@ -393,7 +424,27 @@ impl Store {
         Ok(store)
     }
 
+    fn register_clear_observer(&self) {
+        let observed = Arc::clone(&self.observed_clears);
+        let enabled = self
+            .conn
+            .create_scalar_function(
+                "bsl_observe_clear",
+                1,
+                rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+                move |context| {
+                    if matches!(context.get_raw(0), rusqlite::types::ValueRef::Integer(1)) {
+                        observed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(rusqlite::types::Null)
+                },
+            )
+            .is_ok();
+        self.clear_observer_enabled.store(enabled, Ordering::Relaxed);
+    }
+
     fn apply_pragmas(&self) -> Result<(), SearchError> {
+        self.register_clear_observer();
         self.conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
@@ -471,6 +522,10 @@ impl Store {
         pending: &[&RootKeyedTable],
         checkpoint: &mut dyn FnMut() -> ControlFlow<()>,
     ) -> Result<ControlFlow<()>, SearchError> {
+        let mut observation = Mutation::new(&self.path, Reason::RootTransition);
+        observation.record.kind = "root_key_migration";
+        observation.record.emit(crate::lifecycle::Context::current().is_some());
+        let counts = Counts::default();
         let tx = self.conn.unchecked_transaction()?;
         for table in pending {
             let staging = format!("{}_root_id_migration", table.name);
@@ -495,6 +550,9 @@ impl Store {
                 )?;
                 offset += copied;
                 if copied == crate::engine::WORKSPACE_APPLY_BATCH_ROWS && checkpoint().is_break() {
+                    if tx.rollback().is_ok() {
+                        observation.finish(Outcome::Cancelled, Counts::default());
+                    }
                     return Ok(ControlFlow::Break(()));
                 }
                 if copied < crate::engine::WORKSPACE_APPLY_BATCH_ROWS {
@@ -524,12 +582,15 @@ impl Store {
         // instead of wiping the rows just carried over. A store with no `meta`
         // table at all is stamped by that migration instead.
         if !Self::column_names(&tx, "meta").is_empty() {
+            observation.record.version_kind = Some("schema");
+            observation.record.to_version = Some(SCHEMA_VERSION);
             tx.execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?1)",
                 params![SCHEMA_VERSION.to_string()],
             )?;
         }
         tx.commit()?;
+        observation.finish(Outcome::Committed, counts);
         Ok(ControlFlow::Continue(()))
     }
 
@@ -543,16 +604,59 @@ impl Store {
         // Two processes may bootstrap the same derived cache. Taking the writer reservation
         // before reading the version prevents both from observing the same pre-migration state
         // and then racing a deferred read transaction's upgrade to writer.
+        let mut observation = Mutation::new(&self.path, Reason::Startup);
+        let mut counts = Counts::default();
         let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        if let Some(stored) = Self::stored_schema_version(&tx)? {
+        let stored = Self::stored_schema_version(&tx)?;
+        observation.record.version_kind = Some("schema");
+        observation.record.from_version = stored;
+        observation.record.to_version = Some(SCHEMA_VERSION);
+        if let Some(stored) = stored {
             if stored != SCHEMA_VERSION {
+                observation.record.reason = Reason::SchemaReset;
+                observation.record.emit(crate::lifecycle::Context::current().is_some());
                 tracing::info!(
                     from = stored,
                     to = SCHEMA_VERSION,
                     "search index schema changed; wiping derived cache to rebuild"
                 );
+                for (table, target) in [
+                    ("chunks", &mut counts.sqlite_vectors_removed),
+                    ("overlay_chunks", &mut counts.overlay_vectors_removed),
+                    ("overlay_embedding_cache", &mut counts.overlay_cache_entries_removed),
+                ] {
+                    let columns = Self::column_names(&tx, table);
+                    if columns.is_empty() {
+                        let exists = tx.query_row("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1", [table], |row| row.get::<_, i64>(0)).ok().and_then(|n| u64::try_from(n).ok());
+                        *target = if exists == Some(0) { Some(0) } else { None };
+                    } else {
+                        let predicate = if table == "overlay_embedding_cache" {
+                            ""
+                        } else {
+                            " WHERE embedding IS NOT NULL"
+                        };
+                        observe_count(
+                            &tx,
+                            &format!("SELECT COUNT(*) FROM {table}{predicate}"),
+                            [],
+                            target,
+                        );
+                    }
+                }
                 Self::wipe_all_tables(&tx)?;
             }
+        }
+        if Self::column_names(&tx, "overlay_embedding_cache")
+            .iter()
+            .any(|column| column == "content_hash")
+        {
+            observation.record.reason = Reason::SchemaReset;
+            observe_count(
+                &tx,
+                "SELECT COUNT(*) FROM overlay_embedding_cache",
+                [],
+                &mut counts.overlay_cache_entries_removed,
+            );
         }
         Self::create_schema(&tx)?;
         // Additive columns are added in place, NOT via a SCHEMA_VERSION bump: a version
@@ -572,6 +676,7 @@ impl Store {
             params![SCHEMA_VERSION.to_string()],
         )?;
         tx.commit()?;
+        observation.finish(Outcome::Committed, counts);
         Ok(())
     }
 
@@ -678,6 +783,11 @@ impl Store {
     ) -> Result<ControlFlow<()>, SearchError> {
         let version: i64 = self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version != EMBED_TEXT_VERSION {
+            let mut observation = Mutation::new(&self.path, Reason::EmbedTextVersion);
+            observation.record.version_kind = Some("embed_text");
+            observation.record.from_version = Some(version);
+            observation.record.to_version = Some(EMBED_TEXT_VERSION);
+            observation.record.emit(crate::lifecycle::Context::current().is_some());
             let tx = self.conn.unchecked_transaction()?;
             let mut cleared = 0usize;
             loop {
@@ -688,6 +798,9 @@ impl Store {
                 )?;
                 cleared += batch;
                 if batch == crate::engine::WORKSPACE_APPLY_BATCH_ROWS && checkpoint().is_break() {
+                    if tx.rollback().is_ok() {
+                        observation.finish(Outcome::Cancelled, Counts::default());
+                    }
                     return Ok(ControlFlow::Break(()));
                 }
                 if batch < crate::engine::WORKSPACE_APPLY_BATCH_ROWS {
@@ -696,9 +809,16 @@ impl Store {
             }
             tx.pragma_update(None, "user_version", EMBED_TEXT_VERSION)?;
             if checkpoint().is_break() {
+                if tx.rollback().is_ok() {
+                    observation.finish(Outcome::Cancelled, Counts::default());
+                }
                 return Ok(ControlFlow::Break(()));
             }
             tx.commit()?;
+            observation.finish(
+                Outcome::Committed,
+                Counts { hashes_cleared: cleared as u64, ..Counts::default() },
+            );
             if cleared > 0 {
                 tracing::info!(
                     cleared,
@@ -715,8 +835,13 @@ impl Store {
     pub fn in_memory() -> Result<Self, SearchError> {
         let conn = Connection::open_in_memory()?;
         conn.busy_timeout(std::time::Duration::from_secs(30))?;
-        let store =
-            Self { conn, path: PathBuf::from(":memory:"), mark_seq: Arc::new(AtomicI64::new(0)) };
+        let store = Self {
+            conn,
+            path: PathBuf::from(":memory:"),
+            mark_seq: Arc::new(AtomicI64::new(0)),
+            observed_clears: Arc::new(AtomicU64::new(0)),
+            clear_observer_enabled: AtomicBool::new(false),
+        };
         store.apply_pragmas()?;
         let mut checkpoint = || ControlFlow::Continue(());
         assert!(store.finish_open_checkpointed(&mut checkpoint)?.is_continue());
@@ -1104,6 +1229,15 @@ impl Store {
         path: &str,
         collection: &str,
     ) -> Result<(), SearchError> {
+        let mut observation = Mutation::new(&self.path, Reason::FileDeleted);
+        observation.record.files = 1;
+        observation.record.examples.push(format!(
+            "{}:{}:{}",
+            crate::lifecycle::bounded(collection, 48),
+            crate::lifecycle::bounded(root_id, 64),
+            crate::lifecycle::bounded(path, 128)
+        ));
+        let mut counts = Counts::default();
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "DELETE FROM chunks_fts WHERE rowid IN (
@@ -1113,11 +1247,18 @@ impl Store {
              )",
             params![root_id, path, collection],
         )?;
+        observe_count(
+            &tx,
+            "SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL AND file_id IN (SELECT id FROM files WHERE root_id = ?1 AND path = ?2 AND collection = ?3)",
+            params![root_id, path, collection],
+            &mut counts.sqlite_vectors_removed,
+        );
         tx.execute(
             "DELETE FROM files WHERE root_id = ?1 AND path = ?2 AND collection = ?3",
             params![root_id, path, collection],
         )?;
         tx.commit()?;
+        observation.finish(Outcome::Committed, counts);
         Ok(())
     }
 
@@ -1142,7 +1283,12 @@ impl Store {
     }
 
     pub fn delete_chunks_for_file(&self, file_id: i64) -> Result<(), SearchError> {
+        let observation = Mutation::new(&self.path, Reason::ExplicitRebuild);
         self.conn.execute("DELETE FROM chunks WHERE file_id = ?1", params![file_id])?;
+        observation.finish(
+            Outcome::Committed,
+            Counts { sqlite_vectors_removed: None, ..Counts::default() },
+        );
         Ok(())
     }
 
@@ -1403,6 +1549,8 @@ impl Store {
         if checkpoint().is_break() {
             return ControlFlow::Break(());
         }
+        let observation = Mutation::new(&self.path, Reason::ContextChanged);
+        self.observed_clears.store(0, Ordering::Relaxed);
         let tx = match self.conn.unchecked_transaction() {
             Ok(tx) => tx,
             Err(error) => return ControlFlow::Continue(Err(error.into())),
@@ -1424,7 +1572,11 @@ impl Store {
                     params![key.root_id, key.path, marked_at, seq],
                 ),
                 ContextRefreshMutation::Update { chunk_id, graph_context } => tx.execute(
-                    "UPDATE chunks SET graph_context = ?2, embedding = NULL WHERE id = ?1",
+                    if self.clear_observer_enabled.load(Ordering::Relaxed) {
+                        "UPDATE chunks SET graph_context = ?2, embedding = bsl_observe_clear(embedding IS NOT NULL) WHERE id = ?1"
+                    } else {
+                        "UPDATE chunks SET graph_context = ?2, embedding = NULL WHERE id = ?1"
+                    },
                     params![chunk_id, graph_context],
                 ),
                 ContextRefreshMutation::Clear { key, seq_bound } => tx.execute(
@@ -1444,10 +1596,25 @@ impl Store {
             }
         }
         if checkpoint().is_break() {
+            if tx.rollback().is_ok() {
+                observation.finish(Outcome::Cancelled, Counts::default());
+            }
             return ControlFlow::Break(());
         }
         match tx.commit() {
-            Ok(()) => ControlFlow::Continue(Ok((marked, updated, cleared))),
+            Ok(()) => {
+                observation.finish(
+                    Outcome::Committed,
+                    Counts {
+                        sqlite_vectors_removed: self
+                            .clear_observer_enabled
+                            .load(Ordering::Relaxed)
+                            .then(|| self.observed_clears.load(Ordering::Relaxed)),
+                        ..Counts::default()
+                    },
+                );
+                ControlFlow::Continue(Ok((marked, updated, cleared)))
+            }
             Err(error) => ControlFlow::Continue(Err(error.into())),
         }
     }
@@ -1461,6 +1628,8 @@ impl Store {
         if checkpoint().is_break() {
             return Ok(ControlFlow::Break(()));
         }
+        let observation = Mutation::new(&self.path, Reason::FileDeleted);
+        let mut counts = Counts::default();
         let tx = self.conn.unchecked_transaction()?;
         let mut removed_chunk_ids = Vec::new();
         let deleted_at = std::time::SystemTime::now()
@@ -1494,6 +1663,12 @@ impl Store {
                  )",
                 params![key.root_id, key.path],
             )?;
+            observe_count(
+                &tx,
+                "SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL AND file_id IN (SELECT id FROM files WHERE collection = 'code' AND root_id = ?1 AND path = ?2)",
+                params![key.root_id, key.path],
+                &mut counts.sqlite_vectors_removed,
+            );
             tx.execute(
                 "DELETE FROM files WHERE collection = 'code' AND root_id = ?1 AND path = ?2",
                 params![key.root_id, key.path],
@@ -1518,9 +1693,13 @@ impl Store {
             Some(seq)
         };
         if checkpoint().is_break() {
+            if tx.rollback().is_ok() {
+                observation.finish(Outcome::Cancelled, Counts::default());
+            }
             return Ok(ControlFlow::Break(()));
         }
         tx.commit()?;
+        observation.finish(Outcome::Committed, counts);
         Ok(ControlFlow::Continue(WorkspaceDriftStoreOutcome {
             removed_chunk_ids,
             context_mark_seq,
@@ -1543,6 +1722,7 @@ impl Store {
         let embedding_blob: Option<Vec<u8>> =
             embedding.map(|e| e.iter().flat_map(|f| f.to_le_bytes()).collect());
 
+        let observation = Mutation::new(&self.path, Reason::Embedding);
         self.conn.execute(
             "INSERT INTO chunks (file_id, kind, symbol_name, is_export, annotations,
                                  line_start, line_end, text, embedding)
@@ -1559,6 +1739,10 @@ impl Store {
                 embedding_blob,
             ],
         )?;
+        observation.finish(
+            Outcome::Committed,
+            Counts { embeddings_written: u64::from(embedding.is_some()), ..Counts::default() },
+        );
         Ok(self.conn.last_insert_rowid())
     }
 
@@ -1586,6 +1770,21 @@ impl Store {
         if checkpoint().is_break() {
             return Ok(ControlFlow::Break(()));
         }
+        let mut observation = Mutation::new(&self.path, Reason::RootTransition);
+        observation.record.examples = change
+            .changed_root_ids
+            .iter()
+            .map(|root| format!("root:{}", crate::lifecycle::bounded(root, 128)))
+            .chain(change.cleanup.iter().map(|key| {
+                format!(
+                    "code:{}:{}",
+                    crate::lifecycle::bounded(&key.root_id, 64),
+                    crate::lifecycle::bounded(&key.path, 128)
+                )
+            }))
+            .take(crate::lifecycle::MAX_EXAMPLES)
+            .collect();
+        let mut counts = Counts::default();
         let tx = self.conn.transaction()?;
         let mut rows = 0usize;
         let mut tick = || {
@@ -1602,6 +1801,12 @@ impl Store {
                  )",
                 params![root_id],
             )?;
+            observe_count(
+                &tx,
+                "SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL AND file_id IN (SELECT id FROM files WHERE collection = 'code' AND root_id = ?1)",
+                params![root_id],
+                &mut counts.sqlite_vectors_removed,
+            );
             tx.execute(
                 "DELETE FROM files WHERE collection = 'code' AND root_id = ?1",
                 params![root_id],
@@ -1614,6 +1819,12 @@ impl Store {
                  )",
                 params![root_id],
             )?;
+            observe_count(
+                &tx,
+                "SELECT COUNT(*) FROM overlay_chunks WHERE embedding IS NOT NULL AND file_id IN (SELECT id FROM overlay_files WHERE collection = 'code' AND root_id = ?1)",
+                params![root_id],
+                &mut counts.overlay_vectors_removed,
+            );
             tx.execute(
                 "DELETE FROM overlay_files WHERE collection = 'code' AND root_id = ?1",
                 params![root_id],
@@ -1623,6 +1834,9 @@ impl Store {
                 tx.execute(&sql, params![root_id])?;
             }
             if tick() {
+                if tx.rollback().is_ok() {
+                    observation.finish(Outcome::Cancelled, Counts::default());
+                }
                 return Ok(ControlFlow::Break(()));
             }
         }
@@ -1635,6 +1849,12 @@ impl Store {
                  )",
                 params![key.root_id, key.path],
             )?;
+            observe_count(
+                &tx,
+                "SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL AND file_id IN (SELECT id FROM files WHERE collection = 'code' AND root_id = ?1 AND path = ?2)",
+                params![key.root_id, key.path],
+                &mut counts.sqlite_vectors_removed,
+            );
             tx.execute(
                 "DELETE FROM files WHERE collection = 'code' AND root_id = ?1 AND path = ?2",
                 params![key.root_id, key.path],
@@ -1647,6 +1867,12 @@ impl Store {
                  )",
                 params![key.root_id, key.path],
             )?;
+            observe_count(
+                &tx,
+                "SELECT COUNT(*) FROM overlay_chunks WHERE embedding IS NOT NULL AND file_id IN (SELECT id FROM overlay_files WHERE collection = 'code' AND root_id = ?1 AND path = ?2)",
+                params![key.root_id, key.path],
+                &mut counts.overlay_vectors_removed,
+            );
             tx.execute(
                 "DELETE FROM overlay_files WHERE collection = 'code' AND root_id = ?1 AND path = ?2",
                 params![key.root_id, key.path],
@@ -1656,6 +1882,9 @@ impl Store {
                 tx.execute(&sql, params![key.root_id, key.path])?;
             }
             if tick() {
+                if tx.rollback().is_ok() {
+                    observation.finish(Outcome::Cancelled, Counts::default());
+                }
                 return Ok(ControlFlow::Break(()));
             }
         }
@@ -1673,6 +1902,9 @@ impl Store {
                 params![key.root_id, key.path, deleted_at],
             )?;
             if tick() {
+                if tx.rollback().is_ok() {
+                    observation.finish(Outcome::Cancelled, Counts::default());
+                }
                 return Ok(ControlFlow::Break(()));
             }
         }
@@ -1701,6 +1933,12 @@ impl Store {
                 "DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM chunks WHERE file_id = ?1)",
                 params![file_id],
             )?;
+            observe_count(
+                &tx,
+                "SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL AND (file_id = ?1)",
+                params![file_id],
+                &mut counts.sqlite_vectors_removed,
+            );
             tx.execute("DELETE FROM chunks WHERE file_id = ?1", params![file_id])?;
 
             let mut chunk_stmt = tx.prepare(
@@ -1734,14 +1972,23 @@ impl Store {
                 let chunk_id = tx.last_insert_rowid();
                 fts_stmt.execute(params![chunk_id, chunk.name, chunk.text])?;
                 if tick() {
+                    drop(fts_stmt);
+                    drop(chunk_stmt);
+                    if tx.rollback().is_ok() {
+                        observation.finish(Outcome::Cancelled, Counts::default());
+                    }
                     return Ok(ControlFlow::Break(()));
                 }
             }
         }
         if checkpoint().is_break() {
+            if tx.rollback().is_ok() {
+                observation.finish(Outcome::Cancelled, Counts::default());
+            }
             return Ok(ControlFlow::Break(()));
         }
         tx.commit()?;
+        observation.finish(Outcome::Committed, counts);
         Ok(ControlFlow::Continue(()))
     }
 
@@ -1834,6 +2081,15 @@ impl Store {
         if checkpoint().is_break() {
             return Ok(ControlFlow::Break(()));
         }
+        let mut observation = Mutation::new(&self.path, Reason::HashChanged);
+        observation.record.files = 1;
+        observation.record.examples.push(format!(
+            "{}:{}:{}",
+            crate::lifecycle::bounded(collection, 48),
+            crate::lifecycle::bounded(root_id, 64),
+            crate::lifecycle::bounded(path, 128)
+        ));
+        let mut counts = Counts::default();
         let tx = self.conn.transaction()?;
 
         let now = std::time::SystemTime::now()
@@ -1858,6 +2114,12 @@ impl Store {
             params![file_id],
         )?;
 
+        observe_count(
+            &tx,
+            "SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL AND (file_id = ?1)",
+            params![file_id],
+            &mut counts.sqlite_vectors_removed,
+        );
         tx.execute("DELETE FROM chunks WHERE file_id = ?1", params![file_id])?;
 
         {
@@ -1904,15 +2166,26 @@ impl Store {
                 if (i + 1).is_multiple_of(crate::engine::WORKSPACE_APPLY_BATCH_ROWS)
                     && checkpoint().is_break()
                 {
+                    drop(fts_stmt);
+                    drop(stmt);
+                    if tx.rollback().is_ok() {
+                        observation.finish(Outcome::Cancelled, Counts::default());
+                    }
                     return Ok(ControlFlow::Break(()));
                 }
             }
         }
 
         if checkpoint().is_break() {
+            if tx.rollback().is_ok() {
+                observation.finish(Outcome::Cancelled, Counts::default());
+            }
             return Ok(ControlFlow::Break(()));
         }
+        counts.embeddings_written =
+            embeddings.map_or(0, |values| values.len().min(chunks.len())) as u64;
         tx.commit()?;
+        observation.finish(Outcome::Committed, counts);
         Ok(ControlFlow::Continue(file_id))
     }
 
@@ -1924,6 +2197,15 @@ impl Store {
         documents: &[Document],
         embeddings: Option<&[Vec<f32>]>,
     ) -> Result<i64, SearchError> {
+        let mut observation = Mutation::new(&self.path, Reason::HashChanged);
+        observation.record.files = 1;
+        observation.record.examples.push(format!(
+            "{}:{}:{}",
+            crate::lifecycle::bounded(collection, 48),
+            crate::lifecycle::bounded(CONFIGURATION_ROOT_ID, 64),
+            crate::lifecycle::bounded(virtual_path, 128)
+        ));
+        let mut counts = Counts::default();
         let tx = self.conn.transaction()?;
 
         let now = std::time::SystemTime::now()
@@ -1947,6 +2229,12 @@ impl Store {
             "DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM chunks WHERE file_id = ?1)",
             params![file_id],
         )?;
+        observe_count(
+            &tx,
+            "SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL AND (file_id = ?1)",
+            params![file_id],
+            &mut counts.sqlite_vectors_removed,
+        );
         tx.execute("DELETE FROM chunks WHERE file_id = ?1", params![file_id])?;
 
         {
@@ -1970,7 +2258,10 @@ impl Store {
             }
         }
 
+        counts.embeddings_written =
+            embeddings.map_or(0, |values| values.len().min(documents.len())) as u64;
         tx.commit()?;
+        observation.finish(Outcome::Committed, counts);
         Ok(file_id)
     }
 
@@ -1983,6 +2274,15 @@ impl Store {
         embeddings: Option<&[Vec<f32>]>,
     ) -> Result<CollectionReplaceOutcome, SearchError> {
         let key = format!("reference_collection_fingerprint:{collection}");
+        let mut observation = Mutation::new(&self.path, Reason::HashChanged);
+        observation.record.files = 1;
+        observation.record.examples.push(format!(
+            "{}:{}:{}",
+            crate::lifecycle::bounded(collection, 48),
+            crate::lifecycle::bounded(CONFIGURATION_ROOT_ID, 64),
+            crate::lifecycle::bounded(virtual_path, 128)
+        ));
+        let mut counts = Counts::default();
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let committed = tx
             .query_row("SELECT value FROM meta WHERE key = ?1", [&key], |row| {
@@ -1991,6 +2291,7 @@ impl Store {
             .optional()?;
         if committed.as_deref() == Some(fingerprint) {
             tx.commit()?;
+            observation.finish(Outcome::NoOp, counts);
             return Ok(CollectionReplaceOutcome {
                 committed_fingerprint: fingerprint.to_owned(),
                 written: false,
@@ -2004,6 +2305,12 @@ impl Store {
              )",
             [collection],
         )?;
+        observe_count(
+            &tx,
+            "SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL AND file_id IN (SELECT id FROM files WHERE collection = ?1)",
+            [collection],
+            &mut counts.sqlite_vectors_removed,
+        );
         tx.execute("DELETE FROM files WHERE collection = ?1", [collection])?;
 
         let now = std::time::SystemTime::now()
@@ -2043,7 +2350,10 @@ impl Store {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![key, fingerprint],
         )?;
+        counts.embeddings_written =
+            embeddings.map_or(0, |values| values.len().min(documents.len())) as u64;
         tx.commit()?;
+        observation.finish(Outcome::Committed, counts);
         Ok(CollectionReplaceOutcome {
             committed_fingerprint: fingerprint.to_owned(),
             written: true,
@@ -2079,6 +2389,15 @@ impl Store {
         documents: &[crate::IndexedDocument],
         embeddings: Option<&[Vec<f32>]>,
     ) -> Result<i64, SearchError> {
+        let mut observation = Mutation::new(&self.path, Reason::HashChanged);
+        observation.record.files = 1;
+        observation.record.examples.push(format!(
+            "{}:{}:{}",
+            crate::lifecycle::bounded(collection, 48),
+            crate::lifecycle::bounded(root_id, 64),
+            crate::lifecycle::bounded(path, 128)
+        ));
+        let mut counts = Counts::default();
         let tx = self.conn.transaction()?;
 
         let now = std::time::SystemTime::now()
@@ -2102,6 +2421,12 @@ impl Store {
             "DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM chunks WHERE file_id = ?1)",
             params![file_id],
         )?;
+        observe_count(
+            &tx,
+            "SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL AND (file_id = ?1)",
+            params![file_id],
+            &mut counts.sqlite_vectors_removed,
+        );
         tx.execute("DELETE FROM chunks WHERE file_id = ?1", params![file_id])?;
 
         {
@@ -2133,7 +2458,10 @@ impl Store {
             }
         }
 
+        counts.embeddings_written =
+            embeddings.map_or(0, |values| values.len().min(documents.len())) as u64;
         tx.commit()?;
+        observation.finish(Outcome::Committed, counts);
         Ok(file_id)
     }
 
@@ -2315,6 +2643,7 @@ impl Store {
     }
 
     pub fn clear_collection(&self, collection: &str) -> Result<(), SearchError> {
+        let observation = Mutation::new(&self.path, Reason::ExplicitRebuild);
         self.conn.execute(
             "DELETE FROM chunks_fts WHERE rowid IN (
                  SELECT c.id FROM chunks c
@@ -2324,6 +2653,10 @@ impl Store {
             params![collection],
         )?;
         self.conn.execute("DELETE FROM files WHERE collection = ?1", params![collection])?;
+        observation.finish(
+            Outcome::Committed,
+            Counts { sqlite_vectors_removed: None, ..Counts::default() },
+        );
         Ok(())
     }
 
@@ -2479,7 +2812,26 @@ impl Store {
     /// bump `embedding_generation`, correctly invalidating the persisted vector sidecar
     /// because the chunk's vector must be recomputed.
     pub fn clear_chunk_embedding(&self, chunk_id: i64) -> Result<(), SearchError> {
-        self.conn.execute("UPDATE chunks SET embedding = NULL WHERE id = ?1", params![chunk_id])?;
+        let observation = Mutation::new(&self.path, Reason::ContextChanged);
+        self.observed_clears.store(0, Ordering::Relaxed);
+        self.conn.execute(
+            if self.clear_observer_enabled.load(Ordering::Relaxed) {
+                "UPDATE chunks SET embedding = bsl_observe_clear(embedding IS NOT NULL) WHERE id = ?1"
+            } else {
+                "UPDATE chunks SET embedding = NULL WHERE id = ?1"
+            },
+            params![chunk_id],
+        )?;
+        observation.finish(
+            Outcome::Committed,
+            Counts {
+                sqlite_vectors_removed: self
+                    .clear_observer_enabled
+                    .load(Ordering::Relaxed)
+                    .then(|| self.observed_clears.load(Ordering::Relaxed)),
+                ..Counts::default()
+            },
+        );
         Ok(())
     }
 
@@ -2487,19 +2839,31 @@ impl Store {
     /// the write half of the fused build's embedding phase.
     pub fn set_chunk_embedding(&self, chunk_id: i64, embedding: &[f32]) -> Result<(), SearchError> {
         let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-        self.conn
+        let observation = Mutation::new(&self.path, Reason::Embedding);
+        let written = self
+            .conn
             .execute("UPDATE chunks SET embedding = ?2 WHERE id = ?1", params![chunk_id, blob])?;
+        observation.finish(
+            Outcome::Committed,
+            Counts { embeddings_written: written as u64, ..Counts::default() },
+        );
         Ok(())
     }
 
     /// Commit one prepared embedding batch atomically.
     pub fn set_chunk_embeddings(&self, embeddings: &[(i64, Vec<f32>)]) -> Result<(), SearchError> {
+        let observation = Mutation::new(&self.path, Reason::Embedding);
+        let mut counts = Counts::default();
         let tx = self.conn.unchecked_transaction()?;
         for (chunk_id, embedding) in embeddings {
             let blob: Vec<u8> = embedding.iter().flat_map(|value| value.to_le_bytes()).collect();
-            tx.execute("UPDATE chunks SET embedding = ?2 WHERE id = ?1", params![chunk_id, blob])?;
+            counts.embeddings_written += tx.execute(
+                "UPDATE chunks SET embedding = ?2 WHERE id = ?1",
+                params![chunk_id, blob],
+            )? as u64;
         }
         tx.commit()?;
+        observation.finish(Outcome::Committed, counts);
         Ok(())
     }
 
@@ -2604,10 +2968,15 @@ impl Store {
     }
 
     pub fn clear_file_hashes(&self, collection: &str) -> Result<usize, SearchError> {
+        let observation = Mutation::new(&self.path, Reason::HashCleared);
         let count = self.conn.execute(
             "UPDATE files SET hash = zeroblob(0) WHERE collection = ?1",
             params![collection],
         )?;
+        observation.finish(
+            Outcome::Committed,
+            Counts { hashes_cleared: count as u64, ..Counts::default() },
+        );
         Ok(count)
     }
 
@@ -2621,6 +2990,7 @@ impl Store {
         // cold-build's embedding phase failing after the chunks were written) must be
         // re-indexed in full on the next run; the previous `NOT IN (… IS NOT NULL)`
         // predicate kept such a file's hash and skipped it forever.
+        let observation = Mutation::new(&self.path, Reason::HashCleared);
         let count = self.conn.execute(
             "UPDATE files SET hash = zeroblob(0)
              WHERE collection = ?1
@@ -2629,6 +2999,10 @@ impl Store {
                )",
             params![collection],
         )?;
+        observation.finish(
+            Outcome::Committed,
+            Counts { hashes_cleared: count as u64, ..Counts::default() },
+        );
         Ok(count)
     }
 
@@ -2904,6 +3278,15 @@ impl Store {
         chunks: &[Chunk],
         embeddings: Option<&[Vec<f32>]>,
     ) -> Result<i64, SearchError> {
+        let mut observation = Mutation::new(&self.path, Reason::HashChanged);
+        observation.record.files = 1;
+        observation.record.examples.push(format!(
+            "{}:{}:{}",
+            crate::lifecycle::bounded(collection, 48),
+            crate::lifecycle::bounded(root_id, 64),
+            crate::lifecycle::bounded(path, 128)
+        ));
+        let mut counts = Counts::default();
         let tx = self.conn.transaction()?;
 
         let now = std::time::SystemTime::now()
@@ -2927,6 +3310,12 @@ impl Store {
             "DELETE FROM overlay_chunks_fts WHERE rowid IN (SELECT id FROM overlay_chunks WHERE file_id = ?1)",
             params![file_id],
         )?;
+        observe_count(
+            &tx,
+            "SELECT COUNT(*) FROM overlay_chunks WHERE embedding IS NOT NULL AND (file_id = ?1)",
+            params![file_id],
+            &mut counts.overlay_vectors_removed,
+        );
         tx.execute("DELETE FROM overlay_chunks WHERE file_id = ?1", params![file_id])?;
 
         {
@@ -2971,11 +3360,22 @@ impl Store {
             }
         }
 
+        counts.embeddings_written =
+            embeddings.map_or(0, |values| values.len().min(chunks.len())) as u64;
         tx.commit()?;
+        observation.finish(Outcome::Committed, counts);
         Ok(file_id)
     }
 
     pub fn remove_overlay_file(&self, root_id: &str, path: &str) -> Result<(), SearchError> {
+        let mut observation = Mutation::new(&self.path, Reason::FileDeleted);
+        observation.record.files = 1;
+        observation.record.examples.push(format!(
+            "{}:{}:{}",
+            "",
+            crate::lifecycle::bounded(root_id, 64),
+            crate::lifecycle::bounded(path, 128)
+        ));
         self.conn.execute(
             "DELETE FROM overlay_chunks_fts WHERE rowid IN (
                  SELECT c.id FROM overlay_chunks c
@@ -2988,6 +3388,10 @@ impl Store {
             "DELETE FROM overlay_files WHERE root_id = ?1 AND path = ?2",
             params![root_id, path],
         )?;
+        observation.finish(
+            Outcome::Committed,
+            Counts { overlay_vectors_removed: None, ..Counts::default() },
+        );
         Ok(())
     }
 
@@ -3199,6 +3603,8 @@ impl Store {
         if checkpoint().is_break() {
             return Ok(ControlFlow::Break(()));
         }
+        let observation = Mutation::new(&self.path, Reason::Embedding);
+        let mut counts = Counts::default();
         let tx = self.conn.unchecked_transaction()?;
         let mut rows = 0usize;
         let mut tick = || {
@@ -3226,6 +3632,10 @@ impl Store {
                     entry.canonical,
                 ])?;
                 if tick() {
+                    drop(stmt);
+                    if tx.rollback().is_ok() {
+                        observation.finish(Outcome::Cancelled, Counts::default());
+                    }
                     return Ok(ControlFlow::Break(()));
                 }
             }
@@ -3239,16 +3649,25 @@ impl Store {
             for (embedding_key, embedding) in entries {
                 let blob: Vec<u8> =
                     embedding.iter().flat_map(|value| value.to_le_bytes()).collect();
-                stmt.execute(params![embedding_key, model_id, dimension as i64, blob])?;
+                counts.embeddings_written +=
+                    stmt.execute(params![embedding_key, model_id, dimension as i64, blob])? as u64;
                 if tick() {
+                    drop(stmt);
+                    if tx.rollback().is_ok() {
+                        observation.finish(Outcome::Cancelled, Counts::default());
+                    }
                     return Ok(ControlFlow::Break(()));
                 }
             }
         }
         if checkpoint().is_break() {
+            if tx.rollback().is_ok() {
+                observation.finish(Outcome::Cancelled, Counts::default());
+            }
             return Ok(ControlFlow::Break(()));
         }
         tx.commit()?;
+        observation.finish(Outcome::Committed, counts);
         Ok(ControlFlow::Continue(()))
     }
 
@@ -3350,21 +3769,36 @@ impl Store {
         dimension: usize,
         entries: &HashMap<String, Vec<f32>>,
     ) -> Result<(), SearchError> {
-        let dimension = dimension as i64;
-        let mut stmt = self.conn.prepare(
-            "INSERT OR REPLACE INTO overlay_embedding_cache
+        let batch = crate::lifecycle::Batch::new(&self.path, Reason::Embedding);
+        let result = batch.context().in_scope(|| {
+            let dimension = dimension as i64;
+            let mut stmt = self.conn.prepare(
+                "INSERT OR REPLACE INTO overlay_embedding_cache
              (embedding_key, model_id, dimension, embedding)
              VALUES (?1, ?2, ?3, ?4)",
-        )?;
-        for (embedding_key, embedding) in entries {
-            let blob: Vec<u8> = embedding.iter().flat_map(|v| v.to_le_bytes()).collect();
-            stmt.execute(params![embedding_key, model_id, dimension, blob])?;
-        }
-        Ok(())
+            )?;
+            for (embedding_key, embedding) in entries {
+                let blob: Vec<u8> = embedding.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let observation = Mutation::new(&self.path, Reason::Embedding);
+                let written = stmt.execute(params![embedding_key, model_id, dimension, blob])?;
+                observation.finish(
+                    Outcome::Committed,
+                    Counts { embeddings_written: written as u64, ..Counts::default() },
+                );
+            }
+            Ok(())
+        });
+        batch.finish(if result.is_ok() { Outcome::Completed } else { Outcome::Failed });
+        result
     }
 
     pub fn clear_overlay_embedding_cache(&self) -> Result<(), SearchError> {
-        self.conn.execute("DELETE FROM overlay_embedding_cache", [])?;
+        let observation = Mutation::new(&self.path, Reason::ExplicitRebuild);
+        let removed = self.conn.execute("DELETE FROM overlay_embedding_cache", [])?;
+        observation.finish(
+            Outcome::Committed,
+            Counts { overlay_cache_entries_removed: Some(removed as u64), ..Counts::default() },
+        );
         Ok(())
     }
 
@@ -3377,12 +3811,17 @@ impl Store {
              )",
             params![collection],
         )?;
+        let observation = Mutation::new(&self.path, Reason::ExplicitRebuild);
         self.conn.execute(
             "DELETE FROM overlay_chunks WHERE file_id IN (
                  SELECT id FROM overlay_files WHERE collection = ?1
              )",
             params![collection],
         )?;
+        observation.finish(
+            Outcome::Committed,
+            Counts { overlay_vectors_removed: None, ..Counts::default() },
+        );
         self.conn
             .execute("DELETE FROM overlay_files WHERE collection = ?1", params![collection])?;
         self.clear_overlay_tombstones(collection)?;
@@ -3398,6 +3837,8 @@ impl Store {
         if checkpoint().is_break() {
             return Ok(ControlFlow::Break(()));
         }
+        let observation = Mutation::new(&self.path, Reason::ModeTransition);
+        let mut counts = Counts::default();
         let tx = self.conn.unchecked_transaction()?;
         let file_ids = {
             let mut stmt = tx.prepare("SELECT id FROM files WHERE collection = ?1 ORDER BY id")?;
@@ -3420,11 +3861,20 @@ impl Store {
                 "DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM chunks WHERE file_id = ?1)",
                 params![file_id],
             )?;
+            observe_count(
+                &tx,
+                "SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL AND file_id IN (SELECT id FROM files WHERE id = ?1)",
+                params![file_id],
+                &mut counts.sqlite_vectors_removed,
+            );
             tx.execute("DELETE FROM files WHERE id = ?1", params![file_id])?;
             rows += 1;
             if rows.is_multiple_of(crate::engine::WORKSPACE_APPLY_BATCH_ROWS)
                 && checkpoint().is_break()
             {
+                if tx.rollback().is_ok() {
+                    observation.finish(Outcome::Cancelled, Counts::default());
+                }
                 return Ok(ControlFlow::Break(()));
             }
         }
@@ -3434,19 +3884,32 @@ impl Store {
                  WHERE rowid IN (SELECT id FROM overlay_chunks WHERE file_id = ?1)",
                 params![file_id],
             )?;
+            observe_count(
+                &tx,
+                "SELECT COUNT(*) FROM overlay_chunks WHERE embedding IS NOT NULL AND file_id IN (SELECT id FROM overlay_files WHERE id = ?1)",
+                params![file_id],
+                &mut counts.overlay_vectors_removed,
+            );
             tx.execute("DELETE FROM overlay_files WHERE id = ?1", params![file_id])?;
             rows += 1;
             if rows.is_multiple_of(crate::engine::WORKSPACE_APPLY_BATCH_ROWS)
                 && checkpoint().is_break()
             {
+                if tx.rollback().is_ok() {
+                    observation.finish(Outcome::Cancelled, Counts::default());
+                }
                 return Ok(ControlFlow::Break(()));
             }
         }
         tx.execute("DELETE FROM overlay_tombstones WHERE collection = ?1", params![collection])?;
         if checkpoint().is_break() {
+            if tx.rollback().is_ok() {
+                observation.finish(Outcome::Cancelled, Counts::default());
+            }
             return Ok(ControlFlow::Break(()));
         }
         tx.commit()?;
+        observation.finish(Outcome::Committed, counts);
         Ok(ControlFlow::Continue(()))
     }
 }
@@ -5455,5 +5918,558 @@ mod tests {
         let store = Store::open(&path).unwrap();
         assert_eq!(store.file_count().unwrap(), 1);
         assert_eq!(Store::stored_schema_version(&store.conn).unwrap(), Some(SCHEMA_VERSION));
+    }
+    mod lifecycle_tests {
+        use super::*;
+        use serde_json::Value;
+        use std::sync::{Arc, Mutex};
+
+        fn capture(f: impl FnOnce()) -> Vec<Value> {
+            capture_level(f, tracing_subscriber::filter::LevelFilter::TRACE)
+        }
+
+        fn capture_level(
+            f: impl FnOnce(),
+            level: tracing_subscriber::filter::LevelFilter,
+        ) -> Vec<Value> {
+            use tracing_subscriber::prelude::*;
+            struct Capture(Arc<Mutex<Vec<Value>>>);
+            impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+                fn on_event(
+                    &self,
+                    event: &tracing::Event<'_>,
+                    _: tracing_subscriber::layer::Context<'_, S>,
+                ) {
+                    struct Visitor<'a>(&'a mut Vec<Value>);
+                    impl tracing::field::Visit for Visitor<'_> {
+                        fn record_debug(
+                            &mut self,
+                            _: &tracing::field::Field,
+                            _: &dyn std::fmt::Debug,
+                        ) {
+                        }
+                        fn record_str(&mut self, field: &tracing::field::Field, text: &str) {
+                            if field.name() == "record" {
+                                self.0.push(serde_json::from_str(text).unwrap());
+                            }
+                        }
+                    }
+                    if event.metadata().target() == crate::lifecycle::TARGET {
+                        event.record(&mut Visitor(&mut self.0.lock().unwrap()));
+                    }
+                }
+            }
+            let records = Arc::new(Mutex::new(Vec::new()));
+            crate::lifecycle::test_with_subscriber(
+                tracing_subscriber::registry().with(Capture(records.clone()).with_filter(level)),
+                f,
+            );
+            Arc::try_unwrap(records).unwrap().into_inner().unwrap()
+        }
+
+        fn mixed(store: &mut Store, root: &str, path: &str) -> i64 {
+            store
+                .reindex_file(
+                    root,
+                    path,
+                    b"hash",
+                    &[sample_chunk("A"), sample_chunk("B")],
+                    Some(&[vec![1.0]]),
+                )
+                .unwrap()
+        }
+        fn committed(records: &[Value]) -> &Value {
+            records
+                .iter()
+                .rev()
+                .find(|r| r["kind"] == "mutation" && r["outcome"] == "committed")
+                .expect("committed mutation")
+        }
+        fn assert_count(record: &Value, field: &str, count: u64) {
+            assert_eq!(record["counts"][field], count, "{record}");
+        }
+
+        #[test]
+        fn overlay_cache_save_bounds_info_and_retains_prior_autocommits() {
+            let store = Store::in_memory().unwrap();
+            let entries: HashMap<_, _> = (0..129).map(|i| (i.to_string(), vec![1.0])).collect();
+            let records = capture_level(
+                || store.save_overlay_embedding_cache("model", 1, &entries).unwrap(),
+                tracing_subscriber::filter::LevelFilter::INFO,
+            );
+            assert_eq!(records.len(), 4);
+            let summaries: Vec<_> =
+                records.iter().filter(|r| r["kind"] == "embedding_pass").collect();
+            assert_eq!(summaries.len(), 4);
+            let intents: Vec<_> = summaries.iter().filter(|r| r["outcome"] == "started").collect();
+            assert_eq!(intents.len(), 2);
+            assert!(intents.iter().all(|r| r["counts"]["embeddings_written"] == 0
+                && r["counts"]["sqlite_vectors_removed"] == 0));
+            assert_eq!(summaries.last().unwrap()["committed_totals"]["embeddings_written"], 129);
+            assert!(records
+                .iter()
+                .filter(|r| r["kind"] == "mutation")
+                .all(|r| r["parent_operation_id"].is_number()));
+            store.conn.execute("DELETE FROM overlay_embedding_cache", []).unwrap();
+            store.conn.execute_batch("CREATE TRIGGER reject_second BEFORE INSERT ON overlay_embedding_cache WHEN (SELECT COUNT(*) FROM overlay_embedding_cache) >= 1 BEGIN SELECT RAISE(ABORT, 'fixture'); END;").unwrap();
+            let records = capture(|| {
+                assert!(store.save_overlay_embedding_cache("model", 1, &entries).is_err())
+            });
+            let terminal = records.last().unwrap();
+            assert_eq!(terminal["outcome"], "failed");
+            assert_eq!(terminal["committed_totals"]["embeddings_written"], 1);
+        }
+
+        #[test]
+        fn failed_observer_registration_keeps_original_null_updates() {
+            let mut store = Store::in_memory().unwrap();
+            mixed(&mut store, "", "a");
+            let ids: Vec<_> =
+                store.load_all_embeddings(1).unwrap().into_iter().map(|(id, _)| id).collect();
+            // SQLite rejects function replacement while a statement is executing.
+            let mut statement = store.conn.prepare("SELECT id FROM chunks").unwrap();
+            let mut rows = statement.query([]).unwrap();
+            assert!(rows.next().unwrap().is_some());
+            store.register_clear_observer();
+            assert!(!store.clear_observer_enabled.load(Ordering::Relaxed));
+            drop(rows);
+            drop(statement);
+            store.conn.remove_function("bsl_observe_clear", 1).unwrap();
+            let generation = store.embedding_generation().unwrap();
+            let records = capture(|| store.clear_chunk_embedding(ids[0]).unwrap());
+            assert!(committed(&records)["counts"]["sqlite_vectors_removed"].is_null());
+            assert_eq!(store.embedding_generation().unwrap(), generation + 1);
+            store.set_chunk_embedding(ids[0], &[1.0]).unwrap();
+            let records = capture(|| {
+                assert!(matches!(
+                    store.apply_context_refresh_batch(
+                        &[ContextRefreshMutation::Update {
+                            chunk_id: ids[0],
+                            graph_context: Some("context".into())
+                        }],
+                        &mut || ControlFlow::Continue(()),
+                    ),
+                    ControlFlow::Continue(Ok((0, 1, 0)))
+                ));
+            });
+            assert!(committed(&records)["counts"]["sqlite_vectors_removed"].is_null());
+            assert!(store.load_all_embeddings(1).unwrap().is_empty());
+        }
+
+        #[test]
+        fn replacement_and_cascade_count_non_null_children_once() {
+            let mut store = Store::in_memory().unwrap();
+            mixed(&mut store, "", "a");
+            let records = capture(|| {
+                mixed(&mut store, "", "a");
+            });
+            assert_eq!(records.iter().filter(|r| r["outcome"] == "committed").count(), 1);
+            assert_count(committed(&records), "sqlite_vectors_removed", 1);
+            assert_count(committed(&records), "embeddings_written", 1);
+            let records = capture(|| store.remove_file("", "a", "code").unwrap());
+            assert_count(committed(&records), "sqlite_vectors_removed", 1);
+            assert_eq!(store.chunk_count().unwrap(), 0);
+        }
+
+        #[test]
+        fn context_observer_preserves_matched_rows_generation_and_rollback() {
+            let mut store = Store::in_memory().unwrap();
+            mixed(&mut store, "", "a");
+            let ids = store.chunk_ids_for_file("code", "", "a").unwrap();
+            let mutations: Vec<_> = ids
+                .iter()
+                .chain(ids.iter())
+                .map(|id| ContextRefreshMutation::Update {
+                    chunk_id: *id,
+                    graph_context: Some("context".into()),
+                })
+                .collect();
+            let generation = store.embedding_generation().unwrap();
+            let records = capture(|| {
+                let outcome = store
+                    .apply_context_refresh_batch(&mutations, &mut || ControlFlow::Continue(()));
+                assert_eq!(outcome.continue_value().unwrap().unwrap(), (0, 4, 0));
+            });
+            assert_count(committed(&records), "sqlite_vectors_removed", 1);
+            assert_eq!(store.embedding_generation().unwrap(), generation + 4);
+            store.set_chunk_embedding(ids[0], &[1.0]).unwrap();
+            let generation = store.embedding_generation().unwrap();
+            let mut polls = 0;
+            let records = capture(|| {
+                assert!(store
+                    .apply_context_refresh_batch(&mutations, &mut || {
+                        polls += 1;
+                        if polls == 2 {
+                            ControlFlow::Break(())
+                        } else {
+                            ControlFlow::Continue(())
+                        }
+                    })
+                    .is_break())
+            });
+            let cancelled = records.iter().find(|r| r["outcome"] == "cancelled").unwrap();
+            assert_count(cancelled, "sqlite_vectors_removed", 0);
+            assert_eq!(store.embedding_generation().unwrap(), generation);
+            assert_eq!(store.load_all_embeddings(1).unwrap().len(), 1);
+        }
+
+        #[test]
+        fn cancelled_replacement_has_zero_committed_loss_and_keeps_generation() {
+            let mut store = Store::in_memory().unwrap();
+            mixed(&mut store, "", "a");
+            let generation = store.embedding_generation().unwrap();
+            let mut polls = 0;
+            let records = capture(|| {
+                assert!(store
+                    .reindex_file_in_collection_checkpointed(
+                        "",
+                        "a",
+                        b"next",
+                        "code",
+                        &[sample_chunk("C")],
+                        None,
+                        None,
+                        &mut || {
+                            polls += 1;
+                            if polls == 2 {
+                                ControlFlow::Break(())
+                            } else {
+                                ControlFlow::Continue(())
+                            }
+                        }
+                    )
+                    .unwrap()
+                    .is_break())
+            });
+            let cancelled = records.iter().find(|r| r["outcome"] == "cancelled").unwrap();
+            assert_count(cancelled, "sqlite_vectors_removed", 0);
+            assert_eq!(store.embedding_generation().unwrap(), generation);
+            assert_eq!(store.load_all_embeddings(1).unwrap().len(), 1);
+        }
+
+        #[test]
+        fn failed_cascade_never_claims_committed_loss() {
+            let mut store = Store::in_memory().unwrap();
+            mixed(&mut store, "", "a");
+            store.conn.execute_batch("CREATE TEMP TRIGGER reject_delete BEFORE DELETE ON files BEGIN SELECT RAISE(ABORT, 'test'); END;").unwrap();
+            let records = capture(|| assert!(store.remove_file("", "a", "code").is_err()));
+            assert!(!records.iter().any(|r| r["outcome"] == "committed"));
+            assert_eq!(records.last().unwrap()["outcome"], "unknown");
+            assert_eq!(store.load_all_embeddings(1).unwrap().len(), 1);
+        }
+
+        #[test]
+        fn failed_commit_keeps_rows_and_reports_unknown_not_committed_loss() {
+            let mut store = Store::in_memory().unwrap();
+            mixed(&mut store, "", "a");
+            let generation = store.embedding_generation().unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "CREATE TABLE commit_guard (
+                    file_id INTEGER REFERENCES files(id) DEFERRABLE INITIALLY DEFERRED
+                 );
+                 CREATE TEMP TRIGGER defer_delete_failure BEFORE DELETE ON files BEGIN
+                    INSERT INTO commit_guard VALUES (OLD.id);
+                 END;",
+                )
+                .unwrap();
+            let records = capture(|| {
+                // The insert and delete statements succeed: the deferred constraint
+                // rejects only COMMIT, after all destructive SQL has run.
+                let error = store.remove_file("", "a", "code").unwrap_err();
+                assert!(
+                    matches!(error, SearchError::Sqlite(rusqlite::Error::SqliteFailure(code, _))
+                    if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY)
+                );
+            });
+            assert!(!records.iter().any(|r| r["outcome"] == "committed"));
+            let terminal = records.last().unwrap();
+            assert_eq!(terminal["outcome"], "unknown");
+            assert_eq!(terminal["count_quality"], "unavailable");
+            assert!(terminal["counts"]["sqlite_vectors_removed"].is_null());
+            assert!(store.conn.is_autocommit());
+            assert_eq!(store.embedding_generation().unwrap(), generation);
+            assert_eq!(store.load_all_embeddings(1).unwrap().len(), 1);
+            assert_eq!(store.file_count().unwrap(), 1);
+            assert_eq!(
+                store
+                    .conn
+                    .query_row("SELECT COUNT(*) FROM commit_guard", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+
+        #[test]
+        fn repeated_root_cleanup_counts_each_baseline_and_overlay_vector_once() {
+            let mut store = Store::in_memory().unwrap();
+            mixed(&mut store, "root", "a");
+            store
+                .upsert_overlay_file_with_chunks(
+                    "root",
+                    "a",
+                    b"h",
+                    "code",
+                    &[sample_chunk("A"), sample_chunk("B")],
+                    Some(&[vec![1.0]]),
+                )
+                .unwrap();
+            let roots = HashSet::from(["root".to_owned()]);
+            let keys = HashSet::from([FileKey::new("root", "a")]);
+            let records = capture(|| {
+                assert!(store
+                    .apply_workspace_roots_transition(
+                        WorkspaceStoreTransition {
+                            changed_root_ids: &roots,
+                            cleanup: &keys,
+                            tombstones: &HashSet::new(),
+                            upserts: &[]
+                        },
+                        &mut || ControlFlow::Continue(())
+                    )
+                    .unwrap()
+                    .is_continue());
+            });
+            assert_count(committed(&records), "sqlite_vectors_removed", 1);
+            assert_count(committed(&records), "overlay_vectors_removed", 1);
+            assert_count(committed(&records), "overlay_cache_entries_removed", 0);
+        }
+
+        #[test]
+        fn hash_only_cache_only_and_structural_reset_are_distinct() {
+            let mut store = Store::in_memory().unwrap();
+            mixed(&mut store, "", "a");
+            let records = capture(|| {
+                assert_eq!(store.clear_file_hashes("code").unwrap(), 1);
+            });
+            assert_count(committed(&records), "hashes_cleared", 1);
+            assert_count(committed(&records), "sqlite_vectors_removed", 0);
+            store
+                .save_overlay_embedding_cache("m", 1, &HashMap::from([("v".into(), vec![1.0])]))
+                .unwrap();
+            let records = capture(|| store.clear_overlay_embedding_cache().unwrap());
+            assert_count(committed(&records), "overlay_cache_entries_removed", 1);
+            assert_count(committed(&records), "sqlite_vectors_removed", 0);
+            store
+                .save_overlay_embedding_cache("m", 1, &HashMap::from([("v".into(), vec![1.0])]))
+                .unwrap();
+            store
+                .upsert_overlay_file_with_chunks(
+                    "",
+                    "a",
+                    b"h",
+                    "code",
+                    &[sample_chunk("A")],
+                    Some(&[vec![1.0]]),
+                )
+                .unwrap();
+            store
+                .conn
+                .execute("UPDATE meta SET value = '999' WHERE key = 'schema_version'", [])
+                .unwrap();
+            let records = capture(|| store.migrate_structural_schema().unwrap());
+            assert_count(committed(&records), "sqlite_vectors_removed", 1);
+            assert_count(committed(&records), "overlay_vectors_removed", 1);
+            assert_count(committed(&records), "overlay_cache_entries_removed", 1);
+            assert_eq!(committed(&records)["version_kind"], "schema");
+            assert_eq!(committed(&records)["from_version"], 999);
+            assert_eq!(committed(&records)["to_version"], SCHEMA_VERSION);
+            store.conn.pragma_update(None, "user_version", 999).unwrap();
+            let records = capture(|| {
+                assert!(store
+                    .migrate_embed_text_version_checkpointed(&mut || ControlFlow::Continue(()))
+                    .unwrap()
+                    .is_continue());
+            });
+            assert_eq!(committed(&records)["version_kind"], "embed_text");
+            assert_eq!(committed(&records)["from_version"], 999);
+            assert_eq!(committed(&records)["to_version"], EMBED_TEXT_VERSION);
+        }
+
+        #[test]
+        fn dormant_autocommit_preimage_is_explicitly_unavailable() {
+            let mut store = Store::in_memory().unwrap();
+            let file = mixed(&mut store, "", "a");
+            let records = capture(|| store.delete_chunks_for_file(file).unwrap());
+            assert!(committed(&records)["counts"]["sqlite_vectors_removed"].is_null());
+            assert_eq!(committed(&records)["count_quality"], "unavailable");
+        }
+
+        #[test]
+        fn reference_fingerprint_noop_never_counts_replacement() {
+            let mut store = Store::in_memory().unwrap();
+            let records = capture(|| {
+                store
+                    .replace_reference_collection_if_stale("platform", "p", "fp", &[], None)
+                    .unwrap();
+                assert!(
+                    !store
+                        .replace_reference_collection_if_stale("platform", "p", "fp", &[], None)
+                        .unwrap()
+                        .written
+                );
+            });
+            let noop = records.iter().find(|r| r["outcome"] == "no_op").unwrap();
+            assert_count(noop, "sqlite_vectors_removed", 0);
+            assert_eq!(records.iter().filter(|r| r["outcome"] == "committed").count(), 1);
+        }
+        #[test]
+        fn preserving_root_migration_and_legacy_cache_report_separate_losses() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("search.db");
+            write_pre_root_id_store(&path);
+            let records = capture(|| {
+                Store::open(&path).unwrap();
+            });
+            let preserved = records
+                .iter()
+                .find(|r| r["reason"] == "root_transition" && r["outcome"] == "committed")
+                .unwrap();
+            assert_count(preserved, "sqlite_vectors_removed", 0);
+            assert_eq!(preserved["kind"], "root_key_migration");
+            assert!(preserved["from_version"].is_null());
+            assert_eq!(preserved["to_version"], SCHEMA_VERSION);
+            let store = Store::in_memory().unwrap();
+            store.conn.execute_batch("DROP TABLE overlay_embedding_cache; CREATE TABLE overlay_embedding_cache(content_hash TEXT, embedding BLOB); INSERT INTO overlay_embedding_cache VALUES ('old', x'00');").unwrap();
+            let records = capture(|| store.migrate_structural_schema().unwrap());
+            assert_count(committed(&records), "overlay_cache_entries_removed", 1);
+            assert_count(committed(&records), "sqlite_vectors_removed", 0);
+        }
+
+        #[test]
+        fn prior_embedding_commits_survive_later_statement_failure() {
+            let mut store = Store::in_memory().unwrap();
+            mixed(&mut store, "", "a");
+            let ids = store.chunk_ids_for_file("code", "", "a").unwrap();
+            let records = capture(|| {
+                store.set_chunk_embeddings(&[(ids[1], vec![2.0])]).unwrap();
+                store.conn.execute_batch("CREATE TEMP TRIGGER reject_embedding BEFORE UPDATE OF embedding ON chunks BEGIN SELECT RAISE(ABORT, 'test'); END;").unwrap();
+                assert!(store.set_chunk_embeddings(&[(ids[0], vec![3.0])]).is_err());
+            });
+            assert_count(committed(&records), "embeddings_written", 1);
+            assert_eq!(records.last().unwrap()["outcome"], "unknown");
+            assert_eq!(store.load_all_embeddings(1).unwrap().len(), 2);
+        }
+
+        #[test]
+        fn counter_failure_is_unavailable_and_does_not_change_writes() {
+            let mut store = Store::in_memory().unwrap();
+            let file = mixed(&mut store, "", "a");
+            let mut count = Some(0);
+            observe_count(&store.conn, "SELECT COUNT(*) FROM absent_table", [], &mut count);
+            assert_eq!(count, None);
+            store.delete_chunks_for_file(file).unwrap();
+            assert_eq!(store.chunk_count().unwrap(), 0);
+        }
+
+        #[test]
+        fn context_observer_matches_original_sql_with_competing_writer_and_rollback() {
+            use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+            use std::time::Duration;
+
+            thread_local! {
+                static CONTENTION: std::cell::RefCell<Option<(SyncSender<()>, Receiver<()>)>> = const { std::cell::RefCell::new(None) };
+            }
+            fn release_after_peer_commit(_: i32) -> bool {
+                CONTENTION.with(|slot| {
+                    let Some((blocked, release)) = slot.borrow_mut().take() else {
+                        return false;
+                    };
+                    blocked.send(()).is_ok() && release.recv_timeout(Duration::from_secs(5)).is_ok()
+                })
+            }
+
+            for cancel in [false, true] {
+                let mut control = None;
+                for observe in [false, true] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("search.db");
+                    let mut store = Store::open(&path).unwrap();
+                    mixed(&mut store, "", "a");
+                    let ids = store.chunk_ids_for_file("code", "", "a").unwrap();
+                    let generation = store.embedding_generation().unwrap();
+                    let peer = Store::open_existing(&path).unwrap();
+                    let tx = peer.conn.unchecked_transaction().unwrap();
+                    tx.execute(
+                        "UPDATE chunks SET embedding = ?2 WHERE id = ?1",
+                        params![ids[1], 2.0f32.to_le_bytes().as_slice()],
+                    )
+                    .unwrap();
+                    // Disable only telemetry to exercise the exact original NULL assignment.
+                    store.clear_observer_enabled.store(observe, Ordering::Relaxed);
+                    let (blocked_tx, blocked_rx) = sync_channel(1);
+                    let (release_tx, release_rx) = sync_channel(1);
+                    let worker = std::thread::spawn(move || {
+                        CONTENTION.with(|slot| *slot.borrow_mut() = Some((blocked_tx, release_rx)));
+                        store.conn.busy_handler(Some(release_after_peer_commit)).unwrap();
+                        let changes: Vec<_> = ids
+                            .iter()
+                            .chain(ids.iter())
+                            .map(|chunk_id| ContextRefreshMutation::Update {
+                                chunk_id: *chunk_id,
+                                graph_context: Some("updated".into()),
+                            })
+                            .collect();
+                        let mut polls = 0;
+                        let records = capture(|| {
+                            let result = store.apply_context_refresh_batch(&changes, &mut || {
+                                polls += 1;
+                                if cancel && polls == 2 {
+                                    ControlFlow::Break(())
+                                } else {
+                                    ControlFlow::Continue(())
+                                }
+                            });
+                            if cancel {
+                                assert!(result.is_break());
+                            } else {
+                                assert_eq!(result.continue_value().unwrap().unwrap(), (0, 4, 0));
+                            }
+                        });
+                        let outcome = records
+                            .iter()
+                            .find(|r| {
+                                r["outcome"] == if cancel { "cancelled" } else { "committed" }
+                            })
+                            .unwrap();
+                        if cancel || observe {
+                            assert_count(
+                                outcome,
+                                "sqlite_vectors_removed",
+                                if cancel { 0 } else { 2 },
+                            );
+                        } else {
+                            assert!(outcome["counts"]["sqlite_vectors_removed"].is_null());
+                        }
+                        (
+                            store.embedding_generation().unwrap() - generation,
+                            store.load_all_embeddings(1).unwrap(),
+                            store.chunks_with_context_for_file("code", "", "a").unwrap(),
+                        )
+                    });
+                    // This notification comes from SQLite's busy handler, proving overlap.
+                    blocked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    tx.commit().unwrap();
+                    release_tx.send(()).unwrap();
+                    let actual = worker.join().unwrap();
+                    assert_eq!(actual.0, if cancel { 1 } else { 5 });
+                    assert_eq!(actual.1.len(), if cancel { 2 } else { 0 });
+                    if let Some(expected) = &control {
+                        assert_eq!(&actual, expected);
+                    } else {
+                        control = Some(actual);
+                    }
+                }
+            }
+        }
+        #[test]
+        fn schema_reset_counts_cache_entries_even_without_readable_vectors() {
+            let store = Store::in_memory().unwrap();
+            store.conn.execute_batch("DROP TABLE overlay_embedding_cache; CREATE TABLE overlay_embedding_cache(legacy_value BLOB); INSERT INTO overlay_embedding_cache VALUES (NULL); UPDATE meta SET value = '999' WHERE key = 'schema_version';").unwrap();
+            let records = capture(|| store.migrate_structural_schema().unwrap());
+            assert_count(committed(&records), "overlay_cache_entries_removed", 1);
+            assert_count(committed(&records), "sqlite_vectors_removed", 0);
+        }
     }
 }

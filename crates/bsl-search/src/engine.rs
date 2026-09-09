@@ -2,6 +2,7 @@ use crate::document::Document;
 use crate::embedder::{Embedder, EmbedderConfig};
 use crate::error::SearchError;
 use crate::index::VectorIndex;
+use crate::lifecycle::{self, Batch, Outcome, Reason};
 use crate::local_baseline::LocalStoreBaselineAdapter;
 use crate::ports::{ModuleSnapshotSource, SnapshotCatalog, SnapshotContentStore};
 use crate::publish::EmbeddingExecutionPolicy;
@@ -616,7 +617,7 @@ impl SearchEngine {
         ) -> FenceOutcome<Result<(), SearchError>>,
     {
         let SearchConfig { embedder: embedder_config, execution } = config;
-        let store = match Self::open_store_fenced(db_path, &mut apply)? {
+        let store = match Self::open_store_fenced(db_path, "semantic", &mut apply)? {
             FenceOutcome::Applied(store) => store,
             FenceOutcome::TransientRefusal => return Ok(FenceOutcome::TransientRefusal),
             FenceOutcome::Superseded => return Ok(FenceOutcome::Superseded),
@@ -688,6 +689,7 @@ impl SearchEngine {
 
     fn open_store_fenced<A>(
         db_path: &Path,
+        mode: &str,
         apply: &mut A,
     ) -> Result<FenceOutcome<Store>, SearchError>
     where
@@ -697,6 +699,7 @@ impl SearchEngine {
             ) -> ControlFlow<(), Result<(), SearchError>>,
         ) -> FenceOutcome<Result<(), SearchError>>,
     {
+        lifecycle::startup_snapshot(db_path, mode);
         // Opening stays inside the fence so a refused boot leaves no artifact behind: an
         // unadmitted daemon must not create this derived cache. The WAIT does not stay inside
         // it. Two processes may bootstrap the same database, and losing that race costs tens of
@@ -877,6 +880,10 @@ impl SearchEngine {
             assert!(!active.get(), "HNSW build ran inside the constructor apply callback")
         });
         let index = VectorIndex::build(dim, &data)?;
+        let mut observed =
+            lifecycle::Record::new(store.db_path(), "artifact_rebuilt", Reason::ExplicitRebuild);
+        observed.outcome = Outcome::Completed;
+        observed.emit(false);
         Ok((index, Some(generation)))
     }
 
@@ -892,6 +899,10 @@ impl SearchEngine {
         let (generation, data) = store.load_all_embeddings_with_generation(dim)?;
         let index = VectorIndex::build(dim, &data)?;
         Self::persist_built(store, dim, embedder, &index, generation);
+        let mut observed =
+            lifecycle::Record::new(store.db_path(), "artifact_rebuilt", Reason::ExplicitRebuild);
+        observed.outcome = Outcome::Completed;
+        observed.emit(false);
         Ok(index)
     }
 
@@ -928,6 +939,13 @@ impl SearchEngine {
         match crate::vector_persist::prepare(index, &key, generation) {
             Ok(prepared) => Some(prepared),
             Err(error) => {
+                let mut record = lifecycle::Record::new(
+                    store.db_path(),
+                    "artifact_prepare",
+                    Reason::ExplicitRebuild,
+                );
+                record.outcome = Outcome::Failed;
+                record.emit(false);
                 warn!("failed to prepare vector index: {error}");
                 None
             }
@@ -938,8 +956,19 @@ impl SearchEngine {
         store: &Store,
         prepared: &mut crate::vector_persist::PreparedPersist,
     ) -> Result<(), SearchError> {
-        let generation = store.embedding_generation()?;
+        let generation = store.embedding_generation().inspect_err(|_| {
+            let mut record =
+                lifecycle::Record::new(store.db_path(), "artifact_publish", Reason::ReadError);
+            record.outcome = Outcome::Failed;
+            record.examples.push("generation_read".to_owned());
+            record.emit(false);
+        })?;
         if generation != prepared.generation() {
+            let mut record =
+                lifecycle::Record::new(store.db_path(), "artifact_publish", Reason::ArtifactStale);
+            record.outcome = Outcome::Refused;
+            record.examples.push("generation_mismatch".to_owned());
+            record.emit(false);
             return Err(SearchError::Index(
                 "vector index changed while its sidecar was prepared".to_owned(),
             ));
@@ -985,7 +1014,7 @@ impl SearchEngine {
             ) -> ControlFlow<(), Result<(), SearchError>>,
         ) -> FenceOutcome<Result<(), SearchError>>,
     {
-        let store = match Self::open_store_fenced(db_path, &mut apply)? {
+        let store = match Self::open_store_fenced(db_path, "fts", &mut apply)? {
             FenceOutcome::Applied(store) => store,
             FenceOutcome::TransientRefusal => return Ok(FenceOutcome::TransientRefusal),
             FenceOutcome::Superseded => return Ok(FenceOutcome::Superseded),
@@ -1050,7 +1079,7 @@ impl SearchEngine {
         ) -> FenceOutcome<Result<(), SearchError>>,
     {
         let SearchConfig { embedder: embedder_config, execution } = config;
-        let store = match Self::open_store_fenced(db_path, &mut apply)? {
+        let store = match Self::open_store_fenced(db_path, "semantic_overlay", &mut apply)? {
             FenceOutcome::Applied(store) => store,
             FenceOutcome::TransientRefusal => return Ok(FenceOutcome::TransientRefusal),
             FenceOutcome::Superseded => return Ok(FenceOutcome::Superseded),
@@ -1184,6 +1213,8 @@ impl SearchEngine {
         root: &Path,
         progress: Option<&Arc<IndexProgress>>,
     ) -> Result<usize, SearchError> {
+        let lifecycle_batch = Batch::new(self.store.db_path(), Reason::ExplicitRebuild);
+        let lifecycle_result = lifecycle_batch.context().in_scope(|| {
         let bsl_files = self.boot_ingest_files(root);
 
         info!(total_files = bsl_files.len(), "scanning BSL files");
@@ -1201,6 +1232,7 @@ impl SearchEngine {
             let content = match std::fs::read_to_string(file_path) {
                 Ok(c) => c,
                 Err(e) => {
+                    lifecycle::decision(self.store.db_path(), key, Reason::ReadError, None, None);
                     warn!(?file_path, "failed to read file: {e}");
                     continue;
                 }
@@ -1208,11 +1240,8 @@ impl SearchEngine {
 
             let hash = blake3::hash(content.as_bytes());
 
-            if let Some(stored_hash) = self.store.file_hash(&key.root_id, &key.path)? {
-                if stored_hash == hash.as_bytes() {
-                    continue;
-                }
-            }
+            let (_, reason) = self.observed_file_hash(key, hash.as_bytes())?;
+            if reason == Reason::Unchanged { continue; }
 
             let chunks = Chunker::chunk(&content);
             if chunks.is_empty() {
@@ -1232,6 +1261,7 @@ impl SearchEngine {
             total_chunks += chunks.len();
             tasks.push(FileTask {
                 key: key.clone(),
+                reason,
                 hash: hash.as_bytes().to_vec(),
                 chunks,
                 texts,
@@ -1276,7 +1306,8 @@ impl SearchEngine {
                 let bs = batch_size;
                 let prog = progress.cloned();
 
-                std::thread::spawn(move || {
+                let context = lifecycle_batch.context();
+                std::thread::spawn(move || context.in_scope(|| {
                     while let Ok(task) = rx.recv() {
                         let mut embeddings = Vec::with_capacity(task.texts.len());
                         let mut error = None;
@@ -1300,6 +1331,7 @@ impl SearchEngine {
 
                         let _ = tx.send(FileResult {
                             key: task.key,
+                            reason: task.reason,
                             hash: task.hash,
                             chunks: task.chunks,
                             graph_contexts: task.graph_contexts,
@@ -1309,7 +1341,7 @@ impl SearchEngine {
                             },
                         });
                     }
-                })
+                }))
             })
             .collect();
 
@@ -1329,14 +1361,14 @@ impl SearchEngine {
         while let Ok(result) = result_rx.recv() {
             match result.embeddings {
                 Ok(embeddings) => {
-                    self.store.reindex_file_with_context(
+                    lifecycle::with_reason(result.reason, || self.store.reindex_file_with_context(
                         &result.key.root_id,
                         &result.key.path,
                         &result.hash,
                         &result.chunks,
                         Some(&embeddings),
                         Some(&result.graph_contexts),
-                    )?;
+                    ))?;
                     indexed += 1;
                     debug!(file = %result.key.path, chunks = result.chunks.len(), "file indexed");
                 }
@@ -1357,6 +1389,7 @@ impl SearchEngine {
         }
 
         self.index = Self::build_persisted_index(&self.store, self.dim, self.embedder.as_ref())?;
+        self.observe_live_index("live_index_replaced", Reason::ExplicitRebuild, Outcome::Completed);
 
         if errors > 0 {
             info!(
@@ -1369,6 +1402,11 @@ impl SearchEngine {
             info!(indexed, total_vectors = self.index.len(), "indexing complete");
         }
         Ok(indexed)
+        });
+        let lifecycle_outcome =
+            if lifecycle_result.is_ok() { Outcome::Completed } else { Outcome::Failed };
+        lifecycle_batch.finish(lifecycle_outcome);
+        lifecycle_result
     }
 
     /// Ingest one file's chunks produced by the fused graph pass: writes chunk text,
@@ -1534,6 +1572,13 @@ impl SearchEngine {
     /// index, never a torn one.
     pub fn set_vector_index(&mut self, index: VectorIndex) {
         self.index = index;
+        self.observe_live_index("live_index_replaced", Reason::Embedding, Outcome::Completed);
+    }
+
+    fn observe_live_index(&self, kind: &'static str, reason: Reason, outcome: Outcome) {
+        let mut observed = lifecycle::Record::new(self.store.db_path(), kind, reason);
+        observed.outcome = outcome;
+        observed.emit(kind == "live_index_evicted" && lifecycle::Context::current().is_some());
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1655,23 +1700,201 @@ impl SearchEngine {
         ) -> FenceOutcome<Result<(), SearchError>>,
         mut retry_transient: Option<&mut dyn FnMut() -> bool>,
     ) -> Result<(VectorIndex, FenceOutcome<()>), SearchError> {
-        let pending = store.load_pending_embedding_documents("code")?;
-        if pending.is_empty() {
+        let lifecycle_batch = Batch::new(store.db_path(), Reason::Embedding);
+        let mut embedding_failed = false;
+        let mut embedding_skipped = false;
+        let lifecycle_result = lifecycle_batch.context().in_scope(|| {
+            let pending = store.load_pending_embedding_documents("code")?;
+            lifecycle_batch.pending(pending.len() as u64);
+            if pending.is_empty() {
+                embedding_skipped = true;
+                let (generation, data) = store.load_all_embeddings_with_generation(dim)?;
+                let index = VectorIndex::build(dim, &data)?;
+                // The sidecar is a shared artifact like any other; a caller that may no longer
+                // write leaves it to whoever may.
+                if should_continue.is_some_and(|keep_going| !keep_going()) {
+                    return Ok((index, FenceOutcome::Released));
+                }
+                let persisted = if let Some(mut prepared) =
+                    Self::prepare_built(store, dim, Some(embedder), &index, generation)
+                {
+                    let mut persist = || Self::install_prepared_built(store, &mut prepared);
+                    let outcome = match retry_transient.as_deref_mut() {
+                        Some(retry) => Self::fenced_value_retrying(apply, &mut persist, retry)?,
+                        None => Self::fenced_value(apply, persist)?,
+                    };
+                    if matches!(outcome, FenceOutcome::Applied(())) {
+                        prepared.finish();
+                    }
+                    outcome
+                } else {
+                    FenceOutcome::Applied(())
+                };
+                return Ok((index, persisted));
+            }
+
+            let items: Vec<(i64, String)> = pending
+                .into_iter()
+                .map(|(id, doc)| (id, crate::document::semantic_text_for_indexed_document(&doc)))
+                .collect();
+            let total = items.len();
+
+            let total_batches = total.div_ceil(batch_size);
+            let _pass = progress.map(IndexProgress::begin_pass);
+            if let Some(p) = &progress {
+                p.total_files.store(0, Ordering::Relaxed);
+                p.total_chunks.store(total, Ordering::Relaxed);
+                p.total_batches.store(total_batches, Ordering::Relaxed);
+                p.done_batches.store(0, Ordering::Relaxed);
+                p.done_chunks.store(0, Ordering::Relaxed);
+            }
+
+            let concurrency = concurrency.min(total_batches.max(1));
+            info!(chunks = total, batches = total_batches, concurrency, "embedding fused chunks");
+
+            if let Some(retry_transient) = retry_transient {
+                return Self::run_fenced_embedding_pass(
+                    store,
+                    embedder,
+                    dim,
+                    batch_size,
+                    &items,
+                    progress,
+                    should_continue,
+                    apply,
+                    retry_transient,
+                );
+            }
+
+            // Fan batches of (chunk_id, text) out to embedder workers; the main thread
+            // applies each batch's vectors (SQLite is single-writer). Nothing larger than
+            // one batch is held per worker, so peak RAM stays bounded by the batch size.
+            let (task_tx, task_rx) =
+                crossbeam_channel::bounded::<Vec<(i64, String)>>(concurrency * 2);
+            #[allow(clippy::type_complexity)]
+            let (result_tx, result_rx) = crossbeam_channel::bounded::<
+                Result<Vec<(i64, Vec<f32>)>, SearchError>,
+            >(concurrency * 2);
+
+            let workers: Vec<std::thread::JoinHandle<()>> = (0..concurrency)
+                .map(|_| {
+                    let rx = task_rx.clone();
+                    let tx = result_tx.clone();
+                    let emb = embedder.clone();
+                    let prog = progress.cloned();
+                    let context = lifecycle_batch.context();
+                    std::thread::spawn(move || {
+                        context.in_scope(|| {
+                            while let Ok(batch) = rx.recv() {
+                                let refs: Vec<&str> =
+                                    batch.iter().map(|(_, t)| t.as_str()).collect();
+                                let out = match emb.embed_batch(&refs) {
+                                    Ok(embs) => {
+                                        if let Some(p) = &prog {
+                                            p.done_chunks.fetch_add(batch.len(), Ordering::Relaxed);
+                                            p.done_batches.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        Ok(batch.iter().map(|(id, _)| *id).zip(embs).collect())
+                                    }
+                                    Err(e) => Err(e),
+                                };
+                                if tx.send(out).is_err() {
+                                    break;
+                                }
+                            }
+                        })
+                    })
+                })
+                .collect();
+
+            drop(task_rx);
+            drop(result_tx);
+
+            let producer = {
+                let batches: Vec<Vec<(i64, String)>> =
+                    items.chunks(batch_size).map(<[(i64, String)]>::to_vec).collect();
+                std::thread::spawn(move || {
+                    for batch in batches {
+                        if task_tx.send(batch).is_err() {
+                            break;
+                        }
+                    }
+                })
+            };
+
+            let mut embedded = 0usize;
+            let mut errors = 0usize;
+            let mut stopped = None;
+            while let Ok(result) = result_rx.recv() {
+                // Asked between batches, never inside one: a pass over a large configuration runs
+                // for hours, and the caller's right to write may not outlive it.
+                if should_continue.is_some_and(|keep_going| !keep_going()) {
+                    stopped = Some(FenceOutcome::Released);
+                    break;
+                }
+                match result {
+                    Ok(pairs) => {
+                        let batch_len = pairs.len();
+                        match Self::fenced_value(apply, || store.set_chunk_embeddings(&pairs))? {
+                            FenceOutcome::Applied(()) => {}
+                            FenceOutcome::TransientRefusal => {
+                                stopped = Some(FenceOutcome::TransientRefusal);
+                                break;
+                            }
+                            FenceOutcome::Superseded => {
+                                stopped = Some(FenceOutcome::Superseded);
+                                break;
+                            }
+                            FenceOutcome::Released => {
+                                stopped = Some(FenceOutcome::Released);
+                                break;
+                            }
+                        }
+                        embedded += batch_len;
+                    }
+                    Err(e) => {
+                        warn!("embedding batch failed after retries, skipping: {e}");
+                        errors += 1;
+                        embedding_failed = true;
+                    }
+                }
+            }
+            // Closed before the joins in every path: a worker parked on a send into a channel
+            // nobody reads any more would never finish, and the stop path leaves exactly that.
+            drop(result_rx);
+
+            let _ = producer.join();
+            for w in workers {
+                let _ = w.join();
+            }
+            if let Some(p) = &progress {
+                p.active.store(false, Ordering::Relaxed);
+            }
+
             let (generation, data) = store.load_all_embeddings_with_generation(dim)?;
             let index = VectorIndex::build(dim, &data)?;
-            // The sidecar is a shared artifact like any other; a caller that may no longer
-            // write leaves it to whoever may.
-            if should_continue.is_some_and(|keep_going| !keep_going()) {
-                return Ok((index, FenceOutcome::Released));
+            // Asked once more before the sidecar: a takeover landing after the last batch would
+            // otherwise still leave this pass's index description behind for the new owner.
+            let stopped = stopped.or_else(|| {
+                should_continue
+                    .is_some_and(|keep_going| !keep_going())
+                    .then_some(FenceOutcome::Released)
+            });
+            if let Some(outcome) = stopped {
+                // The vectors already written stay — they were written while the caller still had
+                // the right to. What is skipped is the persisted sidecar, the one artifact a
+                // stopped pass would leave behind for whoever writes this database next; the index
+                // itself is still returned, so this process keeps answering semantic queries from
+                // what it has.
+                warn!(embedded, errors, "embedding pass stopped early; sidecar not persisted");
+                return Ok((index, outcome));
             }
             let persisted = if let Some(mut prepared) =
                 Self::prepare_built(store, dim, Some(embedder), &index, generation)
             {
-                let mut persist = || Self::install_prepared_built(store, &mut prepared);
-                let outcome = match retry_transient.as_deref_mut() {
-                    Some(retry) => Self::fenced_value_retrying(apply, &mut persist, retry)?,
-                    None => Self::fenced_value(apply, persist)?,
-                };
+                let outcome = Self::fenced_value(apply, || {
+                    Self::install_prepared_built(store, &mut prepared)
+                })?;
                 if matches!(outcome, FenceOutcome::Applied(())) {
                     prepared.finish();
                 }
@@ -1679,180 +1902,28 @@ impl SearchEngine {
             } else {
                 FenceOutcome::Applied(())
             };
-            return Ok((index, persisted));
-        }
-
-        let items: Vec<(i64, String)> = pending
-            .into_iter()
-            .map(|(id, doc)| (id, crate::document::semantic_text_for_indexed_document(&doc)))
-            .collect();
-        let total = items.len();
-
-        let total_batches = total.div_ceil(batch_size);
-        let _pass = progress.map(IndexProgress::begin_pass);
-        if let Some(p) = &progress {
-            p.total_files.store(0, Ordering::Relaxed);
-            p.total_chunks.store(total, Ordering::Relaxed);
-            p.total_batches.store(total_batches, Ordering::Relaxed);
-            p.done_batches.store(0, Ordering::Relaxed);
-            p.done_chunks.store(0, Ordering::Relaxed);
-        }
-
-        let concurrency = concurrency.min(total_batches.max(1));
-        info!(chunks = total, batches = total_batches, concurrency, "embedding fused chunks");
-
-        if let Some(retry_transient) = retry_transient {
-            return Self::run_fenced_embedding_pass(
-                store,
-                embedder,
-                dim,
-                batch_size,
-                &items,
-                progress,
-                should_continue,
-                apply,
-                retry_transient,
-            );
-        }
-
-        // Fan batches of (chunk_id, text) out to embedder workers; the main thread
-        // applies each batch's vectors (SQLite is single-writer). Nothing larger than
-        // one batch is held per worker, so peak RAM stays bounded by the batch size.
-        let (task_tx, task_rx) = crossbeam_channel::bounded::<Vec<(i64, String)>>(concurrency * 2);
-        #[allow(clippy::type_complexity)]
-        let (result_tx, result_rx) = crossbeam_channel::bounded::<
-            Result<Vec<(i64, Vec<f32>)>, SearchError>,
-        >(concurrency * 2);
-
-        let workers: Vec<std::thread::JoinHandle<()>> = (0..concurrency)
-            .map(|_| {
-                let rx = task_rx.clone();
-                let tx = result_tx.clone();
-                let emb = embedder.clone();
-                let prog = progress.cloned();
-                std::thread::spawn(move || {
-                    while let Ok(batch) = rx.recv() {
-                        let refs: Vec<&str> = batch.iter().map(|(_, t)| t.as_str()).collect();
-                        let out = match emb.embed_batch(&refs) {
-                            Ok(embs) => {
-                                if let Some(p) = &prog {
-                                    p.done_chunks.fetch_add(batch.len(), Ordering::Relaxed);
-                                    p.done_batches.fetch_add(1, Ordering::Relaxed);
-                                }
-                                Ok(batch.iter().map(|(id, _)| *id).zip(embs).collect())
-                            }
-                            Err(e) => Err(e),
-                        };
-                        if tx.send(out).is_err() {
-                            break;
-                        }
-                    }
-                })
-            })
-            .collect();
-
-        drop(task_rx);
-        drop(result_tx);
-
-        let producer = {
-            let batches: Vec<Vec<(i64, String)>> =
-                items.chunks(batch_size).map(<[(i64, String)]>::to_vec).collect();
-            std::thread::spawn(move || {
-                for batch in batches {
-                    if task_tx.send(batch).is_err() {
-                        break;
-                    }
+            match persisted {
+                FenceOutcome::Applied(()) => {}
+                FenceOutcome::TransientRefusal => {
+                    return Ok((index, FenceOutcome::TransientRefusal))
                 }
-            })
-        };
-
-        let mut embedded = 0usize;
-        let mut errors = 0usize;
-        let mut stopped = None;
-        while let Ok(result) = result_rx.recv() {
-            // Asked between batches, never inside one: a pass over a large configuration runs
-            // for hours, and the caller's right to write may not outlive it.
-            if should_continue.is_some_and(|keep_going| !keep_going()) {
-                stopped = Some(FenceOutcome::Released);
-                break;
+                FenceOutcome::Superseded => return Ok((index, FenceOutcome::Superseded)),
+                FenceOutcome::Released => return Ok((index, FenceOutcome::Released)),
             }
-            match result {
-                Ok(pairs) => {
-                    let batch_len = pairs.len();
-                    match Self::fenced_value(apply, || store.set_chunk_embeddings(&pairs))? {
-                        FenceOutcome::Applied(()) => {}
-                        FenceOutcome::TransientRefusal => {
-                            stopped = Some(FenceOutcome::TransientRefusal);
-                            break;
-                        }
-                        FenceOutcome::Superseded => {
-                            stopped = Some(FenceOutcome::Superseded);
-                            break;
-                        }
-                        FenceOutcome::Released => {
-                            stopped = Some(FenceOutcome::Released);
-                            break;
-                        }
-                    }
-                    embedded += batch_len;
-                }
-                Err(e) => {
-                    warn!("embedding batch failed after retries, skipping: {e}");
-                    errors += 1;
-                }
-            }
-        }
-        // Closed before the joins in every path: a worker parked on a send into a channel
-        // nobody reads any more would never finish, and the stop path leaves exactly that.
-        drop(result_rx);
 
-        let _ = producer.join();
-        for w in workers {
-            let _ = w.join();
-        }
-        if let Some(p) = &progress {
-            p.active.store(false, Ordering::Relaxed);
-        }
-
-        let (generation, data) = store.load_all_embeddings_with_generation(dim)?;
-        let index = VectorIndex::build(dim, &data)?;
-        // Asked once more before the sidecar: a takeover landing after the last batch would
-        // otherwise still leave this pass's index description behind for the new owner.
-        let stopped = stopped.or_else(|| {
-            should_continue
-                .is_some_and(|keep_going| !keep_going())
-                .then_some(FenceOutcome::Released)
+            info!(embedded, errors, total_vectors = index.len(), "fused embedding complete");
+            Ok((index, FenceOutcome::Applied(())))
         });
-        if let Some(outcome) = stopped {
-            // The vectors already written stay — they were written while the caller still had
-            // the right to. What is skipped is the persisted sidecar, the one artifact a
-            // stopped pass would leave behind for whoever writes this database next; the index
-            // itself is still returned, so this process keeps answering semantic queries from
-            // what it has.
-            warn!(embedded, errors, "embedding pass stopped early; sidecar not persisted");
-            return Ok((index, outcome));
-        }
-        let persisted = if let Some(mut prepared) =
-            Self::prepare_built(store, dim, Some(embedder), &index, generation)
-        {
-            let outcome =
-                Self::fenced_value(apply, || Self::install_prepared_built(store, &mut prepared))?;
-            if matches!(outcome, FenceOutcome::Applied(())) {
-                prepared.finish();
-            }
-            outcome
-        } else {
-            FenceOutcome::Applied(())
+        let lifecycle_outcome = match &lifecycle_result {
+            Ok((_, FenceOutcome::Applied(()))) if embedding_failed => Outcome::Failed,
+            Ok((_, FenceOutcome::Applied(()))) if embedding_skipped => Outcome::Skipped,
+            Ok((_, FenceOutcome::Applied(()))) => Outcome::Completed,
+            Ok((_, FenceOutcome::TransientRefusal)) => Outcome::Refused,
+            Ok((_, FenceOutcome::Superseded | FenceOutcome::Released)) => Outcome::Interrupted,
+            Err(_) => Outcome::Failed,
         };
-        match persisted {
-            FenceOutcome::Applied(()) => {}
-            FenceOutcome::TransientRefusal => return Ok((index, FenceOutcome::TransientRefusal)),
-            FenceOutcome::Superseded => return Ok((index, FenceOutcome::Superseded)),
-            FenceOutcome::Released => return Ok((index, FenceOutcome::Released)),
-        }
-
-        info!(embedded, errors, total_vectors = index.len(), "fused embedding complete");
-        Ok((index, FenceOutcome::Applied(())))
+        lifecycle_batch.finish(lifecycle_outcome);
+        lifecycle_result
     }
 
     /// The files a boot ingest must write, each under the key the store knows it by.
@@ -1962,6 +2033,26 @@ impl SearchEngine {
         self.ingest_files_fts(&files)
     }
 
+    fn observed_file_hash(
+        &self,
+        key: &FileKey,
+        hash: &[u8],
+    ) -> Result<(Option<Vec<u8>>, Reason), SearchError> {
+        let stored = self.store.file_hash(&key.root_id, &key.path);
+        let reason = lifecycle::hash_reason(
+            stored.as_ref().map(|value| value.as_deref()).map_err(|_| ()),
+            hash,
+        );
+        lifecycle::decision(
+            self.store.db_path(),
+            key,
+            reason,
+            stored.as_ref().ok().and_then(|value| value.as_deref()),
+            Some(hash),
+        );
+        stored.map(|value| (value, reason))
+    }
+
     fn prepare_boot_file(
         &self,
         key: &FileKey,
@@ -1971,12 +2062,14 @@ impl SearchEngine {
         let content = match std::fs::read_to_string(file_path) {
             Ok(content) => content,
             Err(error) => {
+                lifecycle::decision(self.store.db_path(), key, Reason::ReadError, None, None);
                 warn!(?file_path, "failed to read file: {error}");
                 return Ok(PreparedBootFile::Unread);
             }
         };
         let hash = blake3::hash(content.as_bytes());
-        let had_prior = match self.store.file_hash(&key.root_id, &key.path)? {
+        let (stored_hash, reason) = self.observed_file_hash(key, hash.as_bytes())?;
+        let had_prior = match stored_hash {
             Some(stored_hash) if stored_hash == hash.as_bytes() => {
                 return Ok(PreparedBootFile::Unchanged)
             }
@@ -1986,7 +2079,7 @@ impl SearchEngine {
         let chunks = Chunker::chunk(&content);
         if chunks.is_empty() {
             return Ok(if had_prior {
-                PreparedBootFile::Remove(key.clone())
+                PreparedBootFile::Remove(key.clone(), reason)
             } else {
                 PreparedBootFile::Unchanged
             });
@@ -2002,6 +2095,7 @@ impl SearchEngine {
         });
         Ok(PreparedBootFile::Reindex {
             key: key.clone(),
+            reason,
             hash: hash.as_bytes().to_vec(),
             chunks,
             graph_contexts,
@@ -2014,30 +2108,42 @@ impl SearchEngine {
         checkpoint: &mut dyn FnMut() -> ControlFlow<()>,
     ) -> ControlFlow<(), Result<(), SearchError>> {
         match prepared {
-            PreparedBootFile::Remove(key) => {
+            PreparedBootFile::Remove(key, reason) => {
                 if checkpoint().is_break() {
                     return ControlFlow::Break(());
                 }
-                ControlFlow::Continue(self.store.remove_file(&key.root_id, &key.path, "code"))
+                ControlFlow::Continue(lifecycle::with_reason(*reason, || {
+                    self.store.remove_file(&key.root_id, &key.path, "code")
+                }))
             }
-            PreparedBootFile::Reindex { key, hash, chunks, graph_contexts: Some(contexts) } => {
-                match self.store.reindex_file_with_context_checkpointed(
-                    key,
-                    hash,
-                    chunks,
-                    None,
-                    Some(contexts),
-                    checkpoint,
-                ) {
+            PreparedBootFile::Reindex {
+                key,
+                hash,
+                chunks,
+                reason,
+                graph_contexts: Some(contexts),
+            } => {
+                match lifecycle::with_reason(*reason, || {
+                    self.store.reindex_file_with_context_checkpointed(
+                        key,
+                        hash,
+                        chunks,
+                        None,
+                        Some(contexts),
+                        checkpoint,
+                    )
+                }) {
                     Ok(ControlFlow::Continue(_)) => ControlFlow::Continue(Ok(())),
                     Ok(ControlFlow::Break(())) => ControlFlow::Break(()),
                     Err(error) => ControlFlow::Continue(Err(error)),
                 }
             }
-            PreparedBootFile::Reindex { key, hash, chunks, graph_contexts: None } => {
-                match self.store.reindex_file_with_context_checkpointed(
-                    key, hash, chunks, None, None, checkpoint,
-                ) {
+            PreparedBootFile::Reindex { key, hash, chunks, reason, graph_contexts: None } => {
+                match lifecycle::with_reason(*reason, || {
+                    self.store.reindex_file_with_context_checkpointed(
+                        key, hash, chunks, None, None, checkpoint,
+                    )
+                }) {
                     Ok(ControlFlow::Continue(_)) => ControlFlow::Continue(Ok(())),
                     Ok(ControlFlow::Break(())) => ControlFlow::Break(()),
                     Err(error) => ControlFlow::Continue(Err(error)),
@@ -2060,31 +2166,42 @@ impl SearchEngine {
             ) -> ControlFlow<(), Result<(), SearchError>>,
         ) -> FenceOutcome<Result<(), SearchError>>,
     {
-        let mut result = FtsIngest { indexed: 0, unread: 0 };
-        for (key, path) in files {
-            let prepared = self.prepare_boot_file(key, path, with_graph_context)?;
-            match prepared {
-                PreparedBootFile::Unchanged => continue,
-                PreparedBootFile::Unread => {
-                    result.unread += 1;
-                    continue;
-                }
-                prepared => {
-                    match Self::fenced_checkpointed_value(apply, |checkpoint| {
-                        self.apply_prepared_boot_file_checkpointed(&prepared, checkpoint)
-                    })? {
-                        FenceOutcome::Applied(()) => {}
-                        FenceOutcome::TransientRefusal => {
-                            return Ok(FenceOutcome::TransientRefusal)
-                        }
-                        FenceOutcome::Superseded => return Ok(FenceOutcome::Superseded),
-                        FenceOutcome::Released => return Ok(FenceOutcome::Released),
+        let lifecycle_batch = Batch::new(self.store.db_path(), Reason::ExplicitRebuild);
+        let lifecycle_result = lifecycle_batch.context().in_scope(|| {
+            let mut result = FtsIngest { indexed: 0, unread: 0 };
+            for (key, path) in files {
+                let prepared = self.prepare_boot_file(key, path, with_graph_context)?;
+                match prepared {
+                    PreparedBootFile::Unchanged => continue,
+                    PreparedBootFile::Unread => {
+                        result.unread += 1;
+                        continue;
                     }
-                    result.indexed += 1;
+                    prepared => {
+                        match Self::fenced_checkpointed_value(apply, |checkpoint| {
+                            self.apply_prepared_boot_file_checkpointed(&prepared, checkpoint)
+                        })? {
+                            FenceOutcome::Applied(()) => {}
+                            FenceOutcome::TransientRefusal => {
+                                return Ok(FenceOutcome::TransientRefusal)
+                            }
+                            FenceOutcome::Superseded => return Ok(FenceOutcome::Superseded),
+                            FenceOutcome::Released => return Ok(FenceOutcome::Released),
+                        }
+                        result.indexed += 1;
+                    }
                 }
             }
-        }
-        Ok(FenceOutcome::Applied(result))
+            Ok(FenceOutcome::Applied(result))
+        });
+        let lifecycle_outcome = match &lifecycle_result {
+            Ok(FenceOutcome::Applied(_)) => Outcome::Completed,
+            Ok(FenceOutcome::TransientRefusal) => Outcome::Refused,
+            Ok(FenceOutcome::Superseded | FenceOutcome::Released) => Outcome::Cancelled,
+            Err(_) => Outcome::Failed,
+        };
+        lifecycle_batch.finish(lifecycle_outcome);
+        lifecycle_result
     }
 
     /// Index workspace files for *deferred* embedding: chunk each changed file, attach
@@ -2227,55 +2344,79 @@ impl SearchEngine {
         &mut self,
         bsl_files: &[(FileKey, std::path::PathBuf)],
     ) -> Result<FtsIngest, SearchError> {
-        info!(total_files = bsl_files.len(), "scanning BSL files (FTS-only)");
+        let lifecycle_batch = Batch::new(self.store.db_path(), Reason::ExplicitRebuild);
+        let lifecycle_result = lifecycle_batch.context().in_scope(|| {
+            info!(total_files = bsl_files.len(), "scanning BSL files (FTS-only)");
 
-        let mut indexed = 0;
-        let mut unread = 0;
-        for (key, file_path) in bsl_files {
-            let content = match std::fs::read_to_string(file_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(?file_path, "failed to read file: {e}");
-                    unread += 1;
-                    continue;
-                }
-            };
-
-            let hash = blake3::hash(content.as_bytes());
-            let rel_path = key.path.clone();
-
-            let had_prior = match self.store.file_hash(&key.root_id, &rel_path)? {
-                Some(stored_hash) => {
-                    if stored_hash == hash.as_bytes() {
+            let mut indexed = 0;
+            let mut unread = 0;
+            for (key, file_path) in bsl_files {
+                let content = match std::fs::read_to_string(file_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        lifecycle::decision(
+                            self.store.db_path(),
+                            key,
+                            Reason::ReadError,
+                            None,
+                            None,
+                        );
+                        warn!(?file_path, "failed to read file: {e}");
+                        unread += 1;
                         continue;
                     }
-                    true
-                }
-                None => false,
-            };
+                };
 
-            let chunks = Chunker::chunk(&content);
-            if chunks.is_empty() {
-                // The content changed (its hash mismatched above) but now yields no chunks — the
-                // file was gutted to comments/blank while the daemon was down. Any prior chunks are
-                // now stale; leaving them makes a Clean boot false-clean (the vanished symbol is
-                // served forever), and the deletion reconcile does NOT cover this — the file still
-                // EXISTS on disk, so it is never "gone". Remove the stored rows. A file that was
-                // never indexed has nothing to remove and must not gain a spurious zero-chunk row,
-                // so only prior-stored files are touched.
-                if had_prior {
-                    self.store.remove_file(&key.root_id, &rel_path, "code")?;
-                    indexed += 1;
+                let hash = blake3::hash(content.as_bytes());
+                let rel_path = key.path.clone();
+
+                let (stored_hash, reason) = self.observed_file_hash(key, hash.as_bytes())?;
+                let had_prior = match stored_hash {
+                    Some(stored_hash) => {
+                        if stored_hash == hash.as_bytes() {
+                            continue;
+                        }
+                        true
+                    }
+                    None => false,
+                };
+
+                let chunks = Chunker::chunk(&content);
+                if chunks.is_empty() {
+                    // The content changed (its hash mismatched above) but now yields no chunks — the
+                    // file was gutted to comments/blank while the daemon was down. Any prior chunks are
+                    // now stale; leaving them makes a Clean boot false-clean (the vanished symbol is
+                    // served forever), and the deletion reconcile does NOT cover this — the file still
+                    // EXISTS on disk, so it is never "gone". Remove the stored rows. A file that was
+                    // never indexed has nothing to remove and must not gain a spurious zero-chunk row,
+                    // so only prior-stored files are touched.
+                    if had_prior {
+                        lifecycle::with_reason(reason, || {
+                            self.store.remove_file(&key.root_id, &rel_path, "code")
+                        })?;
+                        indexed += 1;
+                    }
+                    continue;
                 }
-                continue;
+
+                lifecycle::with_reason(reason, || {
+                    self.store.reindex_file(&key.root_id, &rel_path, hash.as_bytes(), &chunks, None)
+                })?;
+                indexed += 1;
             }
 
-            self.store.reindex_file(&key.root_id, &rel_path, hash.as_bytes(), &chunks, None)?;
-            indexed += 1;
-        }
-
-        info!(indexed, unread, total_chunks = self.store.chunk_count()?, "FTS indexing complete");
-        Ok(FtsIngest { indexed, unread })
+            info!(
+                indexed,
+                unread,
+                total_chunks = self.store.chunk_count()?,
+                "FTS indexing complete"
+            );
+            Ok(FtsIngest { indexed, unread })
+        });
+        let lifecycle_outcome =
+            if lifecycle_result.is_ok() { Outcome::Completed } else { Outcome::Failed };
+        lifecycle_batch.finish(lifecycle_outcome);
+        lifecycle_result
     }
 
     pub fn index_documents(
@@ -2286,32 +2427,48 @@ impl SearchEngine {
         documents: &[Document],
         progress: Option<&Arc<IndexProgress>>,
     ) -> Result<usize, SearchError> {
-        self.invalidate_reference_stamp(collection)?;
-        if let Some(stored_hash) = self.store.file_hash(CONFIGURATION_ROOT_ID, virtual_path)? {
-            if stored_hash == version_hash {
-                info!(collection, documents = documents.len(), "documents unchanged, skipping");
-                return Ok(0);
+        let lifecycle_batch = Batch::new(self.store.db_path(), Reason::ExplicitRebuild);
+        let lifecycle_result = lifecycle_batch.context().in_scope(|| {
+            self.invalidate_reference_stamp(collection)?;
+            let (stored_hash, reason) =
+                self.observed_file_hash(&FileKey::configuration(virtual_path), version_hash)?;
+            if let Some(stored_hash) = stored_hash {
+                if stored_hash == version_hash {
+                    info!(collection, documents = documents.len(), "documents unchanged, skipping");
+                    return Ok(0);
+                }
             }
-        }
 
-        info!(collection, documents = documents.len(), "indexing documents");
+            info!(collection, documents = documents.len(), "indexing documents");
 
-        let embeddings = self.embed_documents(documents, progress)?;
-        self.store.reindex_documents(
-            collection,
-            virtual_path,
-            version_hash,
-            documents,
-            embeddings.as_deref(),
-        )?;
-        if embeddings.is_some() {
-            self.index =
-                Self::build_persisted_index(&self.store, self.dim, self.embedder.as_ref())?;
-        }
+            let embeddings = self.embed_documents(documents, progress)?;
+            lifecycle::with_reason(reason, || {
+                self.store.reindex_documents(
+                    collection,
+                    virtual_path,
+                    version_hash,
+                    documents,
+                    embeddings.as_deref(),
+                )
+            })?;
+            if embeddings.is_some() {
+                self.index =
+                    Self::build_persisted_index(&self.store, self.dim, self.embedder.as_ref())?;
+                self.observe_live_index(
+                    "live_index_replaced",
+                    Reason::ExplicitRebuild,
+                    Outcome::Completed,
+                );
+            }
 
-        let count = documents.len();
-        info!(collection, count, "document indexing complete");
-        Ok(count)
+            let count = documents.len();
+            info!(collection, count, "document indexing complete");
+            Ok(count)
+        });
+        let lifecycle_outcome =
+            if lifecycle_result.is_ok() { Outcome::Completed } else { Outcome::Failed };
+        lifecycle_batch.finish(lifecycle_outcome);
+        lifecycle_result
     }
 
     /// Метка записанного справочного корпуса: сам корпус плюс эмбеддер, которым он
@@ -2358,6 +2515,11 @@ impl SearchEngine {
             if self.loaded_reference_fingerprint != committed && self.embedder.is_some() {
                 self.index =
                     Self::build_persisted_index(&self.store, self.dim, self.embedder.as_ref())?;
+                self.observe_live_index(
+                    "live_index_replaced",
+                    Reason::ExplicitRebuild,
+                    Outcome::Completed,
+                );
             }
             self.loaded_reference_fingerprint = committed;
             return Ok(ReferenceCollectionReplaceOutcome {
@@ -2395,6 +2557,11 @@ impl SearchEngine {
         {
             self.index =
                 Self::build_persisted_index(&self.store, self.dim, self.embedder.as_ref())?;
+            self.observe_live_index(
+                "live_index_replaced",
+                Reason::ExplicitRebuild,
+                Outcome::Completed,
+            );
         }
         self.loaded_reference_fingerprint = Some(outcome.committed_fingerprint.clone());
         Ok(ReferenceCollectionReplaceOutcome {
@@ -2881,6 +3048,7 @@ impl SearchEngine {
             staging.overlay_files,
         );
         self.index = staging.next_index;
+        self.observe_live_index("live_index_replaced", Reason::RootTransition, Outcome::Completed);
         self.workspace_roots = Some(plan.next_roots.clone());
         self.workspace_roots_epoch += 1;
         ControlFlow::Continue(Ok(WorkspaceRootsTransitionOutcome::Applied {
@@ -2979,10 +3147,16 @@ impl SearchEngine {
         if let Some(seq) = context_mark_seq {
             self.store.observe_committed_mark_seq(seq);
         }
+        let mut eviction_outcome = Outcome::Completed;
+        let evicted_any = !removed_chunk_ids.is_empty();
         for chunk_id in removed_chunk_ids {
             if let Err(error) = self.index.remove(chunk_id) {
+                eviction_outcome = Outcome::Failed;
                 tracing::warn!(chunk_id, "failed to evict a committed drift removal: {error}");
             }
+        }
+        if evicted_any {
+            self.observe_live_index("live_index_evicted", Reason::FileDeleted, eviction_outcome);
         }
         cache.enable_watcher_mode();
         for key in dirty_keys {
@@ -3245,22 +3419,27 @@ impl SearchEngine {
         &mut self,
         candidates: Vec<FileKey>,
     ) -> Result<usize, SearchError> {
-        let carriers = self.carrier_keys()?;
-        let hidden = match self.workspace_overlay_cache.lock() {
-            Ok(cache) => cache.hidden_keys(),
-            Err(error) => {
-                tracing::warn!("failed to read overlay hidings for a removal batch: {error}");
-                HashSet::new()
+        let lifecycle_batch = Batch::new(self.store.db_path(), Reason::FileDeleted);
+        let result = lifecycle_batch.context().in_scope(|| {
+            let carriers = self.carrier_keys()?;
+            let hidden = match self.workspace_overlay_cache.lock() {
+                Ok(cache) => cache.hidden_keys(),
+                Err(error) => {
+                    tracing::warn!("failed to read overlay hidings for a removal batch: {error}");
+                    HashSet::new()
+                }
+            };
+            let batch = self.remove_key_batch(candidates, &carriers, &hidden);
+            if let Some(error) = batch.first_error {
+                return Err(SearchError::Index(format!(
+                    "removal batch cleared {} keys and failed on {}; first failure: {error}",
+                    batch.removed, batch.failed
+                )));
             }
-        };
-        let batch = self.remove_key_batch(candidates, &carriers, &hidden);
-        if let Some(error) = batch.first_error {
-            return Err(SearchError::Index(format!(
-                "removal batch cleared {} keys and failed on {}; first failure: {error}",
-                batch.removed, batch.failed
-            )));
-        }
-        Ok(batch.removed)
+            Ok(batch.removed)
+        });
+        lifecycle_batch.finish(if result.is_ok() { Outcome::Completed } else { Outcome::Failed });
+        result
     }
 
     /// Snapshot every known workspace key from all carriers for an external reconcile plan.
@@ -3326,8 +3505,12 @@ impl SearchEngine {
             if FORCE_VECTOR_REMOVE_ERROR.with(std::cell::Cell::get) {
                 return Err(SearchError::Index("forced vector removal failure".to_owned()));
             }
-            self.index.remove(id)?;
+            if let Err(error) = self.index.remove(id) {
+                self.observe_live_index("live_index_evicted", Reason::FileDeleted, Outcome::Failed);
+                return Err(error);
+            }
         }
+        self.observe_live_index("live_index_evicted", Reason::FileDeleted, Outcome::Completed);
         self.store.remove_file(&key.root_id, &key.path, "code")?;
         Ok(())
     }
@@ -3407,66 +3590,76 @@ impl SearchEngine {
             &mut dyn FnMut() -> Result<(), SearchError>,
         ) -> FenceOutcome<Result<(), SearchError>>,
     {
-        if self.workspace_roots.is_none() {
-            return Ok(FenceOutcome::Applied(0));
-        }
-        // The present files under the same keying the `code` collection uses, so
-        // a file of one root never answers for the same relative path in another.
-        let present: HashSet<FileKey> =
-            present_abs.iter().filter_map(|p| self.workspace_file_key(p)).collect();
-        let carriers = self.carrier_keys()?;
-        // A manifest-only key survives its own removal — the row belongs to someone else's
-        // corpus and only its hiding is ours to write — so without this the next reconcile
-        // would select it again, and every pass would report a removal that changes nothing.
-        // Read once, and only for that case: hiding elsewhere proves absence from disk, not
-        // a settled key (a clean full pass hides a baseline key while its row lives on).
-        let hidden = match self.workspace_overlay_cache.lock() {
-            Ok(cache) => cache.hidden_keys(),
-            Err(error) => {
-                tracing::warn!("failed to read overlay hidings for a reconcile: {error}");
-                HashSet::new()
+        let lifecycle_batch = Batch::new(self.store.db_path(), Reason::FileDeleted);
+        let result = lifecycle_batch.context().in_scope(|| {
+            if self.workspace_roots.is_none() {
+                return Ok(FenceOutcome::Applied(0));
             }
-        };
-        let mut candidates: Vec<_> =
-            carriers.all_keys().into_iter().filter(|key| !present.contains(key)).collect();
-        candidates.sort();
-        let mut batch = RemovedBatch::default();
-        for key in candidates {
-            if carriers.manifest_is_sole_carrier(&key) && hidden.contains(&key) {
-                continue;
-            }
-            let has_baseline = carriers.manifest.contains(&key);
-            let mut removal = None;
-            let admitted = Self::fenced_value(&mut apply, || {
-                removal = Some(self.remove_workspace_key_with(&key, has_baseline));
-                Ok(())
-            })?;
-            match admitted {
-                FenceOutcome::Applied(()) => {}
-                FenceOutcome::TransientRefusal => return Ok(FenceOutcome::TransientRefusal),
-                FenceOutcome::Superseded => return Ok(FenceOutcome::Superseded),
-                FenceOutcome::Released => return Ok(FenceOutcome::Released),
-            }
-            match removal.expect("an admitted reconcile operation runs once") {
-                Ok(()) => batch.removed += 1,
+            // The present files under the same keying the `code` collection uses, so
+            // a file of one root never answers for the same relative path in another.
+            let present: HashSet<FileKey> =
+                present_abs.iter().filter_map(|p| self.workspace_file_key(p)).collect();
+            let carriers = self.carrier_keys()?;
+            // A manifest-only key survives its own removal — the row belongs to someone else's
+            // corpus and only its hiding is ours to write — so without this the next reconcile
+            // would select it again, and every pass would report a removal that changes nothing.
+            // Read once, and only for that case: hiding elsewhere proves absence from disk, not
+            // a settled key (a clean full pass hides a baseline key while its row lives on).
+            let hidden = match self.workspace_overlay_cache.lock() {
+                Ok(cache) => cache.hidden_keys(),
                 Err(error) => {
-                    tracing::warn!(
-                        root = %key.root_id,
-                        path = %key.path,
-                        "failed to remove a deleted file from the index: {error}"
-                    );
-                    batch.failed += 1;
-                    batch.first_error.get_or_insert(error);
+                    tracing::warn!("failed to read overlay hidings for a reconcile: {error}");
+                    HashSet::new()
+                }
+            };
+            let mut candidates: Vec<_> =
+                carriers.all_keys().into_iter().filter(|key| !present.contains(key)).collect();
+            candidates.sort();
+            let mut batch = RemovedBatch::default();
+            for key in candidates {
+                if carriers.manifest_is_sole_carrier(&key) && hidden.contains(&key) {
+                    continue;
+                }
+                let has_baseline = carriers.manifest.contains(&key);
+                let mut removal = None;
+                let admitted = Self::fenced_value(&mut apply, || {
+                    removal = Some(self.remove_workspace_key_with(&key, has_baseline));
+                    Ok(())
+                })?;
+                match admitted {
+                    FenceOutcome::Applied(()) => {}
+                    FenceOutcome::TransientRefusal => return Ok(FenceOutcome::TransientRefusal),
+                    FenceOutcome::Superseded => return Ok(FenceOutcome::Superseded),
+                    FenceOutcome::Released => return Ok(FenceOutcome::Released),
+                }
+                match removal.expect("an admitted reconcile operation runs once") {
+                    Ok(()) => batch.removed += 1,
+                    Err(error) => {
+                        tracing::warn!(
+                            root = %key.root_id,
+                            path = %key.path,
+                            "failed to remove a deleted file from the index: {error}"
+                        );
+                        batch.failed += 1;
+                        batch.first_error.get_or_insert(error);
+                    }
                 }
             }
-        }
-        if let Some(error) = batch.first_error {
-            return Err(SearchError::Index(format!(
-                "reconcile removed {} keys and failed on {}; first failure: {error}",
-                batch.removed, batch.failed
-            )));
-        }
-        Ok(FenceOutcome::Applied(batch.removed))
+            if let Some(error) = batch.first_error {
+                return Err(SearchError::Index(format!(
+                    "reconcile removed {} keys and failed on {}; first failure: {error}",
+                    batch.removed, batch.failed
+                )));
+            }
+            Ok(FenceOutcome::Applied(batch.removed))
+        });
+        lifecycle_batch.finish(match &result {
+            Ok(FenceOutcome::Applied(_)) => Outcome::Completed,
+            Ok(FenceOutcome::TransientRefusal) => Outcome::Refused,
+            Ok(FenceOutcome::Superseded | FenceOutcome::Released) => Outcome::Interrupted,
+            Err(_) => Outcome::Failed,
+        });
+        result
     }
 
     /// Remove a chosen set of keys, with the carrier reading and the hiding reading already
@@ -3575,85 +3768,111 @@ impl SearchEngine {
             ) -> ControlFlow<(), Result<(), SearchError>>,
         ) -> FenceOutcome<Result<(), SearchError>>,
     {
-        let bounded = self.store.context_dirty_paths_bounded("code", seq_bound)?;
-        let mut keys = bounded.clone();
-        if topology_changed {
-            let all_dirty = self.store.context_dirty_paths("code")?;
-            for (key, _) in self.store.all_files_in_collection("code")? {
-                if !all_dirty.contains(&key) || bounded.contains(&key) {
-                    keys.insert(key);
+        let lifecycle_batch = Batch::new(self.store.db_path(), Reason::ContextChanged);
+        let lifecycle_result = lifecycle_batch.context().in_scope(|| {
+            let bounded = self.store.context_dirty_paths_bounded("code", seq_bound)?;
+            let mut keys = bounded.clone();
+            if topology_changed {
+                let all_dirty = self.store.context_dirty_paths("code")?;
+                for (key, _) in self.store.all_files_in_collection("code")? {
+                    if !all_dirty.contains(&key) || bounded.contains(&key) {
+                        keys.insert(key);
+                    }
                 }
             }
-        }
-        let mut keys: Vec<_> = keys.into_iter().collect();
-        keys.sort();
+            let mut keys: Vec<_> = keys.into_iter().collect();
+            keys.sort();
 
-        let mut mutations = Vec::new();
-        if topology_changed {
-            mutations.extend(
-                keys.iter()
-                    .cloned()
-                    .map(|key| ContextRefreshMutation::Mark { key, seq: seq_bound }),
-            );
-        }
-        for key in keys {
-            // A render error for ANY method of this path keeps the mark: the failure is
-            // transient (the graph DB could not be read), so the next publish must retry
-            // the whole path rather than clearing it against a half-failed render. A
-            // legitimate `Ok(None)` (a method with no graph presence, or a file entirely
-            // gone from the graph) is not an error and clears normally.
-            let mut render_failed = false;
-            let mut updates = Vec::new();
-            for (id, symbol_name, kind, stored) in
-                self.store.chunks_with_context_for_file("code", &key.root_id, &key.path)?
-            {
-                match provider.try_graph_context(&key.path, &symbol_name, &kind) {
-                    Ok(rendered) => {
-                        if rendered.as_deref() != stored.as_deref() {
-                            updates.push(ContextRefreshMutation::Update {
-                                chunk_id: id,
-                                graph_context: rendered,
-                            });
+            let mut mutations = Vec::new();
+            if topology_changed {
+                mutations.extend(
+                    keys.iter()
+                        .cloned()
+                        .map(|key| ContextRefreshMutation::Mark { key, seq: seq_bound }),
+                );
+            }
+            for key in keys {
+                // A render error for ANY method of this path keeps the mark: the failure is
+                // transient (the graph DB could not be read), so the next publish must retry
+                // the whole path rather than clearing it against a half-failed render. A
+                // legitimate `Ok(None)` (a method with no graph presence, or a file entirely
+                // gone from the graph) is not an error and clears normally.
+                let mut render_failed = false;
+                let mut updates = Vec::new();
+                for (id, symbol_name, kind, stored) in
+                    self.store.chunks_with_context_for_file("code", &key.root_id, &key.path)?
+                {
+                    match provider.try_graph_context(&key.path, &symbol_name, &kind) {
+                        Ok(rendered) => {
+                            if rendered.as_deref() != stored.as_deref() {
+                                updates.push(ContextRefreshMutation::Update {
+                                    chunk_id: id,
+                                    graph_context: rendered,
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            render_failed = true;
+                            tracing::warn!(
+                                root = %key.root_id,
+                                path = %key.path,
+                                method = %symbol_name,
+                                "graph context render failed; keeping dirty mark for retry: {e}"
+                            );
                         }
                     }
-                    Err(e) => {
-                        render_failed = true;
-                        tracing::warn!(
-                            root = %key.root_id,
-                            path = %key.path,
-                            method = %symbol_name,
-                            "graph context render failed; keeping dirty mark for retry: {e}"
-                        );
-                    }
                 }
+                lifecycle::decision(
+                    self.store.db_path(),
+                    &key,
+                    if render_failed {
+                        Reason::ReadError
+                    } else if updates.is_empty() {
+                        Reason::Unchanged
+                    } else {
+                        Reason::ContextChanged
+                    },
+                    None,
+                    None,
+                );
+                if render_failed {
+                    continue;
+                }
+                mutations.extend(updates);
+                mutations.push(ContextRefreshMutation::Clear { key, seq_bound });
             }
-            if render_failed {
-                continue;
-            }
-            mutations.extend(updates);
-            mutations.push(ContextRefreshMutation::Clear { key, seq_bound });
-        }
 
-        let mut stats = ContextRefreshStats::default();
-        for batch in mutations.chunks(WORKSPACE_APPLY_BATCH_ROWS) {
-            let outcome = Self::fenced_checkpointed_value(apply, |checkpoint| {
-                self.store.apply_context_refresh_batch(batch, checkpoint)
-            })?;
-            match outcome {
-                FenceOutcome::Applied((marked, updated, cleared)) => {
-                    stats.paths_marked += marked;
-                    stats.paths_cleared += cleared;
-                    stats.chunks_updated += updated;
-                    stats.cleared_embeddings += updated;
+            let mut stats = ContextRefreshStats::default();
+            for batch in mutations.chunks(WORKSPACE_APPLY_BATCH_ROWS) {
+                let outcome = Self::fenced_checkpointed_value(apply, |checkpoint| {
+                    lifecycle::with_reason(Reason::ContextChanged, || {
+                        self.store.apply_context_refresh_batch(batch, checkpoint)
+                    })
+                })?;
+                match outcome {
+                    FenceOutcome::Applied((marked, updated, cleared)) => {
+                        stats.paths_marked += marked;
+                        stats.paths_cleared += cleared;
+                        stats.chunks_updated += updated;
+                        stats.cleared_embeddings += updated;
+                    }
+                    FenceOutcome::TransientRefusal => {
+                        return Ok((stats, FenceOutcome::TransientRefusal));
+                    }
+                    FenceOutcome::Superseded => return Ok((stats, FenceOutcome::Superseded)),
+                    FenceOutcome::Released => return Ok((stats, FenceOutcome::Released)),
                 }
-                FenceOutcome::TransientRefusal => {
-                    return Ok((stats, FenceOutcome::TransientRefusal));
-                }
-                FenceOutcome::Superseded => return Ok((stats, FenceOutcome::Superseded)),
-                FenceOutcome::Released => return Ok((stats, FenceOutcome::Released)),
             }
-        }
-        Ok((stats, FenceOutcome::Applied(())))
+            Ok((stats, FenceOutcome::Applied(())))
+        });
+        let lifecycle_outcome = match &lifecycle_result {
+            Ok((_, FenceOutcome::Applied(()))) => Outcome::Completed,
+            Ok((_, FenceOutcome::TransientRefusal)) => Outcome::Refused,
+            Ok((_, FenceOutcome::Superseded | FenceOutcome::Released)) => Outcome::Interrupted,
+            Err(_) => Outcome::Failed,
+        };
+        lifecycle_batch.finish(lifecycle_outcome);
+        lifecycle_result
     }
 
     /// Declare whether this engine serves an external (remote) baseline. `false`
@@ -3674,20 +3893,37 @@ impl SearchEngine {
         serves: bool,
         checkpoint: &mut dyn FnMut() -> ControlFlow<()>,
     ) -> ControlFlow<(), Result<(), SearchError>> {
-        if serves && self.serves_external_baseline {
-            return ControlFlow::Continue(Ok(()));
-        }
-        if !serves {
-            match self.store.clear_overlay_fingerprint_cache_checkpointed(checkpoint) {
-                Ok(ControlFlow::Continue(())) => {}
-                Ok(ControlFlow::Break(())) => return ControlFlow::Break(()),
-                Err(error) => return ControlFlow::Continue(Err(error)),
+        let mut observation =
+            lifecycle::Record::new(self.store.db_path(), "mode_transition", Reason::ModeTransition);
+        observation.snapshot = Some(lifecycle::Snapshot {
+            state: "configured",
+            mode: Some(if serves { "external_baseline" } else { "local" }.to_owned()),
+            ..lifecycle::Snapshot::default()
+        });
+        observation.emit(false);
+        let result = (|| {
+            if serves && self.serves_external_baseline {
+                return ControlFlow::Continue(Ok(()));
             }
-        } else if checkpoint().is_break() {
-            return ControlFlow::Break(());
-        }
-        self.serves_external_baseline = serves;
-        ControlFlow::Continue(Ok(()))
+            if !serves {
+                match self.store.clear_overlay_fingerprint_cache_checkpointed(checkpoint) {
+                    Ok(ControlFlow::Continue(())) => {}
+                    Ok(ControlFlow::Break(())) => return ControlFlow::Break(()),
+                    Err(error) => return ControlFlow::Continue(Err(error)),
+                }
+            } else if checkpoint().is_break() {
+                return ControlFlow::Break(());
+            }
+            self.serves_external_baseline = serves;
+            ControlFlow::Continue(Ok(()))
+        })();
+        observation.outcome = match &result {
+            ControlFlow::Break(()) => Outcome::Cancelled,
+            ControlFlow::Continue(Ok(())) => Outcome::Completed,
+            ControlFlow::Continue(Err(_)) => Outcome::Failed,
+        };
+        observation.emit(false);
+        result
     }
 
     /// The manifest fingerprints IF this engine serves an external baseline, `None` otherwise.
@@ -4789,115 +5025,130 @@ impl SearchEngine {
         shared_embeddings: Option<&HashMap<String, Vec<f32>>>,
         progress: Option<&Arc<IndexProgress>>,
     ) -> Result<usize, SearchError> {
-        use std::collections::{BTreeMap, HashSet};
+        let lifecycle_batch = Batch::new(self.store.db_path(), Reason::ExplicitRebuild);
+        let lifecycle_result = lifecycle_batch.context().in_scope(|| {
+            use std::collections::{BTreeMap, HashSet};
 
-        self.invalidate_reference_stamp(collection)?;
+            self.invalidate_reference_stamp(collection)?;
 
-        let mut grouped = BTreeMap::<FileKey, Vec<crate::IndexedDocument>>::new();
-        for document in documents {
-            grouped
-                .entry(FileKey::new(&document.root_id, &document.path))
-                .or_default()
-                .push(document.clone());
-        }
-
-        let desired: HashSet<&FileKey> = grouped.keys().collect();
-        for (existing, _) in self.store.all_files_in_collection(collection)? {
-            if !desired.contains(&existing) {
-                self.store.remove_file(&existing.root_id, &existing.path, collection)?;
-            }
-        }
-
-        let total_chunks = documents.len();
-        let _pass = progress.map(IndexProgress::begin_pass);
-        if let Some(p) = progress {
-            p.total_files.store(grouped.len(), Ordering::Relaxed);
-            p.total_chunks.store(total_chunks, Ordering::Relaxed);
-            p.total_batches.store(total_chunks.div_ceil(self.batch_size.max(1)), Ordering::Relaxed);
-            p.done_batches.store(0, Ordering::Relaxed);
-            p.done_chunks.store(0, Ordering::Relaxed);
-        }
-
-        let mut indexed = 0usize;
-        for (key, mut file_documents) in grouped {
-            file_documents.sort_by(|lhs, rhs| {
-                (lhs.line_start, lhs.line_end, lhs.symbol_name.as_str()).cmp(&(
-                    rhs.line_start,
-                    rhs.line_end,
-                    rhs.symbol_name.as_str(),
-                ))
-            });
-
-            let file_hash = normalized_file_hash_for_indexed_documents(&file_documents);
-            if self.store.file_hash(&key.root_id, &key.path)?.as_deref()
-                == Some(file_hash.as_slice())
-            {
-                continue;
+            let mut grouped = BTreeMap::<FileKey, Vec<crate::IndexedDocument>>::new();
+            for document in documents {
+                grouped
+                    .entry(FileKey::new(&document.root_id, &document.path))
+                    .or_default()
+                    .push(document.clone());
             }
 
-            let embeddings = if let Some(embedder) = &self.embedder {
-                let mut vectors = vec![Vec::<f32>::new(); file_documents.len()];
-                let mut missing_indices = Vec::new();
-                let mut missing_texts = Vec::new();
+            let desired: HashSet<&FileKey> = grouped.keys().collect();
+            for (existing, _) in self.store.all_files_in_collection(collection)? {
+                if !desired.contains(&existing) {
+                    self.store.remove_file(&existing.root_id, &existing.path, collection)?;
+                }
+            }
 
-                for (idx, document) in file_documents.iter().enumerate() {
-                    let embedding_key = semantic_key_for_indexed_document(document);
-                    if let Some(shared_embedding) =
-                        shared_embeddings.and_then(|items| items.get(&embedding_key))
-                    {
-                        vectors[idx] = shared_embedding.clone();
-                        if let Some(p) = progress {
-                            p.done_chunks.fetch_add(1, Ordering::Relaxed);
+            let total_chunks = documents.len();
+            let _pass = progress.map(IndexProgress::begin_pass);
+            if let Some(p) = progress {
+                p.total_files.store(grouped.len(), Ordering::Relaxed);
+                p.total_chunks.store(total_chunks, Ordering::Relaxed);
+                p.total_batches
+                    .store(total_chunks.div_ceil(self.batch_size.max(1)), Ordering::Relaxed);
+                p.done_batches.store(0, Ordering::Relaxed);
+                p.done_chunks.store(0, Ordering::Relaxed);
+            }
+
+            let mut indexed = 0usize;
+            for (key, mut file_documents) in grouped {
+                file_documents.sort_by(|lhs, rhs| {
+                    (lhs.line_start, lhs.line_end, lhs.symbol_name.as_str()).cmp(&(
+                        rhs.line_start,
+                        rhs.line_end,
+                        rhs.symbol_name.as_str(),
+                    ))
+                });
+
+                let file_hash = normalized_file_hash_for_indexed_documents(&file_documents);
+                let (stored_hash, reason) = self.observed_file_hash(&key, &file_hash)?;
+                if stored_hash.as_deref() == Some(file_hash.as_slice()) {
+                    continue;
+                }
+
+                let embeddings = if let Some(embedder) = &self.embedder {
+                    let mut vectors = vec![Vec::<f32>::new(); file_documents.len()];
+                    let mut missing_indices = Vec::new();
+                    let mut missing_texts = Vec::new();
+
+                    for (idx, document) in file_documents.iter().enumerate() {
+                        let embedding_key = semantic_key_for_indexed_document(document);
+                        if let Some(shared_embedding) =
+                            shared_embeddings.and_then(|items| items.get(&embedding_key))
+                        {
+                            vectors[idx] = shared_embedding.clone();
+                            if let Some(p) = progress {
+                                p.done_chunks.fetch_add(1, Ordering::Relaxed);
+                            }
+                        } else {
+                            missing_indices.push(idx);
+                            missing_texts.push(semantic_text_for_indexed_document(document));
                         }
-                    } else {
-                        missing_indices.push(idx);
-                        missing_texts.push(semantic_text_for_indexed_document(document));
-                    }
-                }
-
-                let mut cursor = 0usize;
-                for batch in missing_texts.chunks(self.batch_size.max(1)) {
-                    let refs = batch.iter().map(String::as_str).collect::<Vec<_>>();
-                    let batch_vectors = embedder.embed_batch(&refs)?;
-                    if let Some(p) = progress {
-                        p.done_chunks.fetch_add(batch.len(), Ordering::Relaxed);
-                        p.done_batches.fetch_add(1, Ordering::Relaxed);
                     }
 
-                    for (offset, embedding) in batch_vectors.into_iter().enumerate() {
-                        let idx = missing_indices[cursor + offset];
-                        vectors[idx] = embedding;
+                    let mut cursor = 0usize;
+                    for batch in missing_texts.chunks(self.batch_size.max(1)) {
+                        let refs = batch.iter().map(String::as_str).collect::<Vec<_>>();
+                        let batch_vectors = embedder.embed_batch(&refs)?;
+                        if let Some(p) = progress {
+                            p.done_chunks.fetch_add(batch.len(), Ordering::Relaxed);
+                            p.done_batches.fetch_add(1, Ordering::Relaxed);
+                        }
+
+                        for (offset, embedding) in batch_vectors.into_iter().enumerate() {
+                            let idx = missing_indices[cursor + offset];
+                            vectors[idx] = embedding;
+                        }
+                        cursor += batch.len();
                     }
-                    cursor += batch.len();
-                }
 
-                Some(vectors)
-            } else {
-                None
-            };
+                    Some(vectors)
+                } else {
+                    None
+                };
 
-            self.store.reindex_indexed_documents_in_collection(
-                &key.root_id,
-                &key.path,
-                &file_hash,
-                collection,
-                &file_documents,
-                embeddings.as_deref(),
-            )?;
-            indexed += 1;
-        }
+                lifecycle::with_reason(reason, || {
+                    self.store.reindex_indexed_documents_in_collection(
+                        &key.root_id,
+                        &key.path,
+                        &file_hash,
+                        collection,
+                        &file_documents,
+                        embeddings.as_deref(),
+                    )
+                })?;
+                indexed += 1;
+            }
 
-        if let Some(p) = progress {
-            p.active.store(false, Ordering::Relaxed);
-        }
+            if let Some(p) = progress {
+                p.active.store(false, Ordering::Relaxed);
+            }
 
-        // Метка снимается и ПОСЛЕ записи, не только до неё: запись идёт файл за файлом,
-        // отдельными транзакциями, и другой процесс успевает опубликовать локальный корпус
-        // в середине — его метка описывала бы содержимое, которого здесь уже нет.
-        self.invalidate_reference_stamp(collection)?;
+            // Метка снимается и ПОСЛЕ записи, не только до неё: запись идёт файл за файлом,
+            // отдельными транзакциями, и другой процесс успевает опубликовать локальный корпус
+            // в середине — его метка описывала бы содержимое, которого здесь уже нет.
+            self.invalidate_reference_stamp(collection)?;
 
-        self.index = Self::build_persisted_index(&self.store, self.dim, self.embedder.as_ref())?;
-        Ok(indexed)
+            self.index =
+                Self::build_persisted_index(&self.store, self.dim, self.embedder.as_ref())?;
+            self.observe_live_index(
+                "live_index_replaced",
+                Reason::ExplicitRebuild,
+                Outcome::Completed,
+            );
+            Ok(indexed)
+        });
+        let lifecycle_outcome =
+            if lifecycle_result.is_ok() { Outcome::Completed } else { Outcome::Failed };
+        lifecycle_batch.finish(lifecycle_outcome);
+        lifecycle_result
     }
 
     pub fn chunk_count(&self) -> Result<usize, SearchError> {
@@ -4938,6 +5189,7 @@ impl SearchEngine {
         self.store.remove_file(CONFIGURATION_ROOT_ID, rel_path, collection)?;
         self.invalidate_reference_stamp(collection)?;
         self.index = Self::build_persisted_index(&self.store, self.dim, self.embedder.as_ref())?;
+        self.observe_live_index("live_index_replaced", Reason::ExplicitRebuild, Outcome::Completed);
         Ok(())
     }
 }
@@ -5034,9 +5286,10 @@ pub struct FtsIngest {
 enum PreparedBootFile {
     Unchanged,
     Unread,
-    Remove(FileKey),
+    Remove(FileKey, Reason),
     Reindex {
         key: FileKey,
+        reason: Reason,
         hash: Vec<u8>,
         chunks: Vec<code_chunk::Chunk>,
         graph_contexts: Option<Vec<Option<String>>>,
@@ -5045,6 +5298,7 @@ enum PreparedBootFile {
 
 struct FileTask {
     key: FileKey,
+    reason: Reason,
     hash: Vec<u8>,
     chunks: Vec<code_chunk::Chunk>,
     texts: Vec<String>,
@@ -5055,6 +5309,7 @@ struct FileTask {
 
 struct FileResult {
     key: FileKey,
+    reason: Reason,
     hash: Vec<u8>,
     chunks: Vec<code_chunk::Chunk>,
     graph_contexts: Vec<Option<String>>,
@@ -5177,6 +5432,9 @@ mod index_progress_ownership {
         );
     }
 }
+
+#[cfg(test)]
+mod lifecycle_tests;
 
 #[cfg(test)]
 mod tests {
@@ -9534,7 +9792,7 @@ mod tests {
                     ControlFlow::Break(()) => FenceOutcome::Released,
                 }
             };
-            SearchEngine::open_store_fenced(&db_path, &mut apply).unwrap()
+            SearchEngine::open_store_fenced(&db_path, "test", &mut apply).unwrap()
         };
         holder.join().unwrap();
 
@@ -9571,7 +9829,7 @@ mod tests {
                         ControlFlow::Break(()) => FenceOutcome::Released,
                     }
                 };
-                SearchEngine::open_store_fenced(db_path, &mut apply).unwrap()
+                SearchEngine::open_store_fenced(db_path, "test", &mut apply).unwrap()
             };
             crate::store::FORCE_BOOTSTRAP_RETRIES.with(|left| left.set(0));
             (admissions, matches!(opened, FenceOutcome::Applied(_)))

@@ -11,6 +11,7 @@ mod hybrid;
 mod index;
 mod key_carriers;
 mod lexical;
+pub mod lifecycle;
 mod local_baseline;
 mod merge;
 mod point_refresh;

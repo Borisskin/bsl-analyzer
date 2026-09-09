@@ -22,6 +22,13 @@ where
     T: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
 {
     pub fn init(self) -> anyhow::Result<()> {
+        self.init_with_layer(tracing_subscriber::layer::Identity::new())
+    }
+
+    pub fn init_with_layer<L>(self, layer: L) -> anyhow::Result<()>
+    where
+        L: Layer<Registry> + Send + Sync + 'static,
+    {
         let targets_filter: Targets = self
             .filter
             .parse()
@@ -43,7 +50,7 @@ where
             .as_ref()
             .map(|spec| json::TimingLayer::new(spec, std::io::stderr));
 
-        Registry::default().with(fmt_layer).with(hprof_layer).with(json_layer).init();
+        Registry::default().with(layer).with(fmt_layer).with(hprof_layer).with(json_layer).init();
 
         Ok(())
     }

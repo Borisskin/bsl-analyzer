@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::SearchError;
 use crate::index::VectorIndex;
+use crate::lifecycle::{Outcome, Reason, Record};
 use crate::store::{Store, EMBED_TEXT_VERSION};
 
 const SIDECAR_SCHEMA: u32 = 2;
@@ -60,6 +61,7 @@ pub struct PersistKey<'a> {
 
 /// Fully written, fsynced and hashed vector artifacts awaiting only their two atomic replaces.
 pub struct PreparedPersist {
+    db_path: PathBuf,
     index_tmp: Option<PathBuf>,
     index_path: PathBuf,
     sidecar_tmp: Option<PathBuf>,
@@ -75,12 +77,29 @@ impl PreparedPersist {
 
     /// Publish already prepared files. No work here scales with the workspace.
     pub fn install(&mut self) -> Result<(), SearchError> {
-        fs::rename(self.index_tmp.as_ref().expect("prepared index temp"), &self.index_path)
-            .map_err(|e| SearchError::Index(format!("install vector index: {e}")))?;
-        self.index_tmp = None;
-        fs::rename(self.sidecar_tmp.as_ref().expect("prepared sidecar temp"), &self.sidecar_path)
-            .map_err(|e| SearchError::Index(format!("install index sidecar: {e}")))?;
-        self.sidecar_tmp = None;
+        for (temporary, destination, kind, error_label) in [
+            (
+                &mut self.index_tmp,
+                &self.index_path,
+                "artifact_install_index",
+                "install vector index",
+            ),
+            (
+                &mut self.sidecar_tmp,
+                &self.sidecar_path,
+                "artifact_install_sidecar",
+                "install index sidecar",
+            ),
+        ] {
+            let mut record = Record::new(&self.db_path, kind, Reason::ExplicitRebuild);
+            record.emit(false);
+            let result =
+                fs::rename(temporary.as_ref().expect("prepared artifact temp"), destination);
+            record.outcome = if result.is_ok() { Outcome::Committed } else { Outcome::Failed };
+            record.emit(false);
+            result.map_err(|e| SearchError::Index(format!("{error_label}: {e}")))?;
+            *temporary = None;
+        }
         self.installed = true;
         Ok(())
     }
@@ -121,19 +140,34 @@ fn sidecar_path(db_path: &Path) -> PathBuf {
 /// already-absent sidecar is success. The index file is harmless without a sidecar, so its removal
 /// stays best-effort.
 pub(crate) fn remove_artifacts(db_path: &Path) -> Result<(), SearchError> {
-    remove_file_if_exists(&sidecar_path(db_path))?;
-    let _ = fs::remove_file(index_path(db_path));
+    remove_file_if_exists(db_path, &sidecar_path(db_path), "artifact_remove_sidecar")?;
+    let _ = remove_file_if_exists(db_path, &index_path(db_path), "artifact_remove_index");
     Ok(())
 }
 
-fn remove_file_if_exists(path: &Path) -> Result<(), SearchError> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+fn remove_file_if_exists(
+    db_path: &Path,
+    path: &Path,
+    kind: &'static str,
+) -> Result<(), SearchError> {
+    let mut record = Record::new(db_path, kind, Reason::GenerationMissing);
+    record.emit(false);
+    let result = match fs::remove_file(path) {
+        Ok(()) => {
+            record.outcome = Outcome::Committed;
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            record.outcome = Outcome::NoOp;
+            Ok(())
+        }
         Err(e) => {
+            record.outcome = Outcome::Failed;
             Err(SearchError::Index(format!("remove stale vector sidecar {}: {e}", path.display())))
         }
-    }
+    };
+    record.emit(false);
+    result
 }
 
 /// `<db_path>.<ext>` (kept beside the database so it shares the project's `.build` dir).
@@ -144,51 +178,64 @@ fn sibling(db_path: &Path, ext: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn file_blake3(path: &Path) -> Result<String, SearchError> {
+fn file_blake3(path: &Path) -> Result<String, (SearchError, Reason)> {
     let mut hasher = blake3::Hasher::new();
     let mut file = fs::File::open(path)
-        .map_err(|e| SearchError::Index(format!("open index for hashing: {e}")))?;
+        .map_err(|e| (SearchError::Index(format!("open index for hashing: {e}")), io_reason(&e)))?;
     std::io::copy(&mut file, &mut hasher)
-        .map_err(|e| SearchError::Index(format!("hash index file: {e}")))?;
+        .map_err(|e| (SearchError::Index(format!("hash index file: {e}")), io_reason(&e)))?;
     Ok(hasher.finalize().to_hex().to_string())
 }
 
 /// Try to load a persisted index consistent with the current embeddings. `None` means the
 /// caller must rebuild and prepare a new publication. Never returns a stale/wrong index.
 pub fn try_load(store: &Store, key: &PersistKey) -> Option<VectorIndex> {
-    let sidecar = read_sidecar(&sidecar_path(key.db_path))?;
+    let result = (|| {
+        let sidecar =
+            read_sidecar(&sidecar_path(key.db_path)).map_err(|reason| (reason, "sidecar"))?;
 
-    // Cheap scalar gates first — fail fast when configuration plainly changed.
-    if sidecar.schema != SIDECAR_SCHEMA
-        || sidecar.usearch_version != usearch::version()
-        || sidecar.options != VectorIndex::options_signature(key.dim)
-        || sidecar.model_id != key.model_id
-        || sidecar.dim != key.dim
-        || sidecar.embed_text_version != EMBED_TEXT_VERSION
-    {
-        return None;
+        // Existing scalar gates remain ahead of every database/hash read.
+        if sidecar.schema != SIDECAR_SCHEMA
+            || sidecar.usearch_version != usearch::version()
+            || sidecar.options != VectorIndex::options_signature(key.dim)
+            || sidecar.model_id != key.model_id
+            || sidecar.dim != key.dim
+            || sidecar.embed_text_version != EMBED_TEXT_VERSION
+        {
+            return Err((Reason::ArtifactStale, "compatibility_mismatch"));
+        }
+        // The generation is still the sole O(1) content gate; diagnostics adds no scan.
+        let generation =
+            store.embedding_generation().map_err(|_| (Reason::ReadError, "generation_read"))?;
+        if generation != sidecar.generation {
+            let reason =
+                if generation == -1 { Reason::GenerationMissing } else { Reason::ArtifactStale };
+            return Err((reason, "generation_mismatch"));
+        }
+        let idx_path = index_path(key.db_path);
+        if file_blake3(&idx_path).map_err(|(_, reason)| (reason, "index_read"))?
+            != sidecar.index_sha
+        {
+            return Err((Reason::ArtifactInvalid, "digest_mismatch"));
+        }
+        let index = VectorIndex::load(key.dim, &idx_path)
+            .map_err(|_| (Reason::ArtifactInvalid, "index_decode"))?;
+        if index.len() != sidecar.count {
+            return Err((Reason::ArtifactInvalid, "count_mismatch"));
+        }
+        Ok(index)
+    })();
+    let (kind, reason, outcome) = match &result {
+        Ok(_) => ("artifact_load", Reason::Unchanged, Outcome::Completed),
+        Err((reason, _)) => ("artifact_reject", *reason, Outcome::Skipped),
+    };
+    let mut record = Record::new(key.db_path, kind, reason);
+    record.outcome = outcome;
+    if let Err((_, gate)) = &result {
+        record.examples.push((*gate).to_owned());
     }
-
-    // Content gate (O(1)): the `embedding_generation` counter advances on every write that can
-    // change the indexed `(chunks.id, chunks.embedding)` set, so an unchanged counter means the
-    // current embeddings are exactly what this index was built from — no BLOB scan needed. Any
-    // re-embed, in-place vector update, insert, or delete (including a structural wipe, after which
-    // the artifacts are gone) moves it and forces a rebuild.
-    if store.embedding_generation().ok()? != sidecar.generation {
-        return None;
-    }
-
-    // File gate: reject a torn/corrupt index whose bytes do not match this sidecar.
-    let idx_path = index_path(key.db_path);
-    if file_blake3(&idx_path).ok()? != sidecar.index_sha {
-        return None;
-    }
-
-    let index = VectorIndex::load(key.dim, &idx_path).ok()?;
-    if index.len() != sidecar.count {
-        return None;
-    }
-    Some(index)
+    record.emit(false);
+    result.ok()
 }
 
 /// Perform every workspace-sized persistence step before the publication fence.
@@ -205,7 +252,7 @@ pub fn prepare(
     let index_sha = match (|| {
         index.save(&tmp)?;
         fsync_file(&tmp)?;
-        file_blake3(&tmp)
+        file_blake3(&tmp).map_err(|(error, _)| error)
     })() {
         Ok(hash) => hash,
         Err(error) => {
@@ -238,6 +285,7 @@ pub fn prepare(
         }
     };
     Ok(PreparedPersist {
+        db_path: key.db_path.to_path_buf(),
         index_tmp: Some(tmp),
         index_path: idx_path,
         sidecar_tmp: Some(sidecar_tmp),
@@ -255,9 +303,17 @@ pub fn persist(index: &VectorIndex, key: &PersistKey, generation: i64) -> Result
     Ok(())
 }
 
-fn read_sidecar(path: &Path) -> Option<Sidecar> {
-    let bytes = fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+fn io_reason(error: &std::io::Error) -> Reason {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        Reason::ArtifactMissing
+    } else {
+        Reason::ReadError
+    }
+}
+
+fn read_sidecar(path: &Path) -> Result<Sidecar, Reason> {
+    let bytes = fs::read(path).map_err(|error| io_reason(&error))?;
+    serde_json::from_slice(&bytes).map_err(|_| Reason::ArtifactInvalid)
 }
 
 fn write_sidecar_temp(path: &Path, sidecar: &Sidecar) -> Result<PathBuf, SearchError> {
@@ -447,5 +503,169 @@ mod tests {
         // Truncate/garble the index file: its bytes no longer match `index_sha`.
         std::fs::write(index_path(store.db_path()), b"not a usearch index").unwrap();
         assert!(try_load(&store, &key(&store)).is_none());
+    }
+    fn capture(f: impl FnOnce()) -> Vec<serde_json::Value> {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::prelude::*;
+        struct Capture(Arc<Mutex<Vec<serde_json::Value>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Visitor<'a>(&'a mut Vec<serde_json::Value>);
+                impl tracing::field::Visit for Visitor<'_> {
+                    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {
+                    }
+                    fn record_str(&mut self, field: &tracing::field::Field, text: &str) {
+                        if field.name() == "record" {
+                            self.0.push(serde_json::from_str(text).unwrap());
+                        }
+                    }
+                }
+                if event.metadata().target() == crate::lifecycle::TARGET {
+                    event.record(&mut Visitor(&mut self.0.lock().unwrap()));
+                }
+            }
+        }
+        let records = Arc::new(Mutex::new(Vec::new()));
+        crate::lifecycle::test_with_subscriber(
+            tracing_subscriber::registry().with(Capture(records.clone())),
+            f,
+        );
+        Arc::try_unwrap(records).unwrap().into_inner().unwrap()
+    }
+
+    #[test]
+    fn lifecycle_artifact_rejection_reasons_and_warm_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = seeded_store(dir.path(), 2);
+        let records = capture(|| {
+            assert!(try_load(&store, &key(&store)).is_none());
+        });
+        assert_eq!(records[0]["reason"], "artifact_missing");
+        fs::write(sidecar_path(store.db_path()), b"canary-invalid-json").unwrap();
+        let records = capture(|| {
+            assert!(try_load(&store, &key(&store)).is_none());
+        });
+        assert_eq!(records[0]["reason"], "artifact_invalid");
+        assert!(!serde_json::to_string(&records).unwrap().contains("canary-invalid-json"));
+        build_and_persist(&store);
+        let records = capture(|| {
+            assert!(try_load(&store, &key(&store)).is_some());
+        });
+        assert_eq!(records[0]["kind"], "artifact_load");
+        let other = PersistKey { model_id: "other", ..key(&store) };
+        let records = capture(|| {
+            assert!(try_load(&store, &other).is_none());
+        });
+        assert_eq!(records[0]["reason"], "artifact_stale");
+        assert_eq!(records[0]["examples"][0], "compatibility_mismatch");
+        let id = store.load_all_embeddings(DIM).unwrap()[0].0;
+        store.set_chunk_embedding(id, &emb(9.0)).unwrap();
+        let records = capture(|| {
+            assert!(try_load(&store, &key(&store)).is_none());
+        });
+        assert_eq!(records[0]["examples"][0], "generation_mismatch");
+        build_and_persist(&store);
+        fs::write(index_path(store.db_path()), b"invalid index").unwrap();
+        let records = capture(|| {
+            assert!(try_load(&store, &key(&store)).is_none());
+        });
+        assert_eq!(records[0]["reason"], "artifact_invalid");
+        assert_eq!(records[0]["examples"][0], "digest_mismatch");
+        fs::remove_file(index_path(store.db_path())).unwrap();
+        let records = capture(|| {
+            assert!(try_load(&store, &key(&store)).is_none());
+        });
+        assert_eq!(records[0]["reason"], "artifact_missing");
+        fs::remove_file(sidecar_path(store.db_path())).unwrap();
+        fs::create_dir(sidecar_path(store.db_path())).unwrap();
+        let records = capture(|| {
+            assert!(try_load(&store, &key(&store)).is_none());
+        });
+        assert_eq!(records[0]["reason"], "read_error");
+    }
+
+    #[test]
+    fn lifecycle_artifact_removal_reports_partial_results_without_sql_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = seeded_store(dir.path(), 2);
+        build_and_persist(&store);
+        fs::remove_file(index_path(store.db_path())).unwrap();
+        fs::create_dir(index_path(store.db_path())).unwrap();
+        let records = capture(|| remove_artifacts(store.db_path()).unwrap());
+        assert_eq!(
+            records.iter().map(|r| r["outcome"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["started", "committed", "started", "failed"]
+        );
+        for record in &records {
+            assert_eq!(record["counts"]["sqlite_vectors_removed"], 0);
+        }
+        assert_eq!(store.load_all_embeddings(DIM).unwrap().len(), 2);
+        fs::create_dir(sidecar_path(store.db_path())).unwrap();
+        let records = capture(|| assert!(remove_artifacts(store.db_path()).is_err()));
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1]["kind"], "artifact_remove_sidecar");
+        assert_eq!(records[1]["outcome"], "failed");
+    }
+
+    #[test]
+    fn lifecycle_artifact_install_preserves_partial_rename_outcomes() {
+        for fail_index in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = seeded_store(dir.path(), 2);
+            let (generation, data) = store.load_all_embeddings_with_generation(DIM).unwrap();
+            let index = VectorIndex::build(DIM, &data).unwrap();
+            let mut prepared = prepare(&index, &key(&store), generation).unwrap();
+            let blocked = if fail_index {
+                index_path(store.db_path())
+            } else {
+                sidecar_path(store.db_path())
+            };
+            fs::create_dir(&blocked).unwrap();
+            let records = capture(|| assert!(prepared.install().is_err()));
+            let outcomes: Vec<_> = records.iter().map(|r| r["outcome"].as_str().unwrap()).collect();
+            if fail_index {
+                assert_eq!(outcomes, ["started", "failed"]);
+                assert_eq!(records[1]["kind"], "artifact_install_index");
+                assert!(prepared.index_tmp.is_some());
+            } else {
+                assert_eq!(outcomes, ["started", "committed", "started", "failed"]);
+                assert_eq!(records[1]["kind"], "artifact_install_index");
+                assert_eq!(records[3]["kind"], "artifact_install_sidecar");
+                assert!(prepared.index_tmp.is_none());
+                assert!(index_path(store.db_path()).is_file());
+            }
+            assert!(!prepared.installed);
+            assert!(prepared.sidecar_tmp.is_some());
+            assert!(records.iter().all(|r| r["counts"]["sqlite_vectors_removed"] == 0));
+            assert_eq!(store.embedding_generation().unwrap(), generation);
+            assert_eq!(store.load_all_embeddings(DIM).unwrap(), data);
+            fs::remove_dir(blocked).unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = seeded_store(dir.path(), 2);
+        let records = capture(|| build_and_persist(&store));
+        assert_eq!(records.iter().filter(|r| r["outcome"] == "committed").count(), 2);
+        assert!(try_load(&store, &key(&store)).is_some());
+    }
+
+    #[test]
+    fn lifecycle_artifact_removal_survives_sql_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = seeded_store(dir.path(), 2);
+        build_and_persist(&store);
+        let mut connection = rusqlite::Connection::open(store.db_path()).unwrap();
+        let tx = connection.transaction().unwrap();
+        tx.execute("DELETE FROM chunks", []).unwrap();
+        let records = capture(|| remove_artifacts(store.db_path()).unwrap());
+        tx.rollback().unwrap();
+        assert_eq!(store.load_all_embeddings(DIM).unwrap().len(), 2);
+        assert!(!sidecar_path(store.db_path()).exists());
+        assert!(!index_path(store.db_path()).exists());
+        assert_eq!(records.iter().filter(|r| r["outcome"] == "committed").count(), 2);
+        assert!(records.iter().all(|r| r["counts"]["sqlite_vectors_removed"] == 0));
     }
 }

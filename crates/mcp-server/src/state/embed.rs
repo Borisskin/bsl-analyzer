@@ -1,6 +1,10 @@
 use super::retry_window::{RetryDecision, RetryOwner, RetryWindow};
 use super::types::{OverlayWarmupState, SemanticRuntimeStatus, SharedSearchEngine};
 use super::SharedState;
+use bsl_search::lifecycle::{
+    Context as LifecycleContext, Outcome as LifecycleOutcome, Reason as LifecycleReason,
+    Record as LifecycleRecord,
+};
 use bsl_search::{IndexProgress, SearchEngine, WorkspaceRootsTransitionOutcome};
 #[cfg(test)]
 use std::path::Path;
@@ -175,15 +179,18 @@ impl Drop for EmbedClaimGuard {
 /// success/failure suppresses the fallback.
 struct EmbedStatusGuard {
     runtime: Arc<Mutex<SemanticRuntimeStatus>>,
+    record: LifecycleRecord,
     finished: bool,
 }
 
 impl EmbedStatusGuard {
-    fn new(runtime: Arc<Mutex<SemanticRuntimeStatus>>) -> Self {
-        Self { runtime, finished: false }
+    fn new(runtime: Arc<Mutex<SemanticRuntimeStatus>>, record: LifecycleRecord) -> Self {
+        Self { runtime, record, finished: false }
     }
 
-    fn finish(&mut self) {
+    fn finish(&mut self, outcome: LifecycleOutcome) {
+        self.record.outcome = outcome;
+        self.record.emit(false);
         self.finished = true;
     }
 }
@@ -191,6 +198,8 @@ impl EmbedStatusGuard {
 impl Drop for EmbedStatusGuard {
     fn drop(&mut self) {
         if !self.finished {
+            self.record.outcome = LifecycleOutcome::Interrupted;
+            self.record.emit(false);
             SharedState::set_semantic_runtime_status(
                 &self.runtime,
                 SemanticRuntimeStatus::Failed("embedding pass ended without completing".to_owned()),
@@ -1138,8 +1147,14 @@ impl SharedState {
         // unequal ones (a non-NULL row is never re-embedded). Chunks and FTS text stay ungated:
         // both generations derive them from the same files, so duplicating them costs work, not
         // correctness.
+        // Orchestration itself writes no vectors; child embedding_pass records own
+        // committed counts, so this envelope never duplicates their totals.
+        let mut record =
+            LifecycleRecord::new(&db_path, "embedding_orchestration", LifecycleReason::Embedding);
         let _ = lease.owns_caches();
         if lease.is_superseded() || lease.is_released() {
+            record.outcome = LifecycleOutcome::Skipped;
+            record.emit(false);
             tracing::debug!(
                 "another daemon generation owns this workspace's derived caches; \
                  skipping the embedding pass"
@@ -1147,6 +1162,8 @@ impl SharedState {
             return;
         }
         if !embed_flight.claim() {
+            record.outcome = LifecycleOutcome::Skipped;
+            record.emit(false);
             // A pass is already running; it will loop again and absorb these NULL chunks.
             return;
         }
@@ -1174,15 +1191,21 @@ impl SharedState {
         // is an owner a shutdown must still see leave. Without it `owners.live()` could read
         // zero while this pass was mid-batch, and "every owner has gone" would be a count of
         // the owners that had bothered to register.
+        record.emit(false);
+        let worker_record = record.clone();
+        let lifecycle_context = LifecycleContext::current();
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let live = stop.enter();
         let spawned =
             std::thread::Builder::new().name("bsl-search-embed".to_owned()).spawn(move || {
                 let _live = live;
+                let _dispatch = tracing::dispatcher::set_default(&dispatch);
+                let run = || {
                 // Restore the flight claim on any abnormal exit; a clean release calls
                 // `disarm()` first so this never stomps a later owner that already re-claimed.
                 let mut claim_guard = EmbedClaimGuard::new(Arc::clone(&flight));
                 // Restore the runtime status on any abnormal exit so it never sticks `Indexing`.
-                let mut status_guard = EmbedStatusGuard::new(Arc::clone(&runtime));
+                let mut status_guard = EmbedStatusGuard::new(Arc::clone(&runtime), worker_record);
                 #[cfg(test)]
                 let mut apply_count = 0usize;
                 let mut publish_retry =
@@ -1199,7 +1222,7 @@ impl SharedState {
                                 "embedding publication retry budget exhausted".to_owned(),
                             ),
                         );
-                        status_guard.finish();
+                            status_guard.finish(LifecycleOutcome::Failed);
                         return;
                     }
                     flight.begin_pass();
@@ -1294,7 +1317,7 @@ impl SharedState {
                                                     "embedding engine unavailable".to_owned(),
                                                 ),
                                             );
-                                            status_guard.finish();
+                                            status_guard.finish(LifecycleOutcome::Failed);
                                             return;
                                         }
                                     },
@@ -1309,7 +1332,7 @@ impl SharedState {
                                             &runtime,
                                             SemanticRuntimeStatus::Stopped,
                                         );
-                                        status_guard.finish();
+                                        status_guard.finish(LifecycleOutcome::Interrupted);
                                         return;
                                     }
                                     Err(e) => {
@@ -1320,7 +1343,7 @@ impl SharedState {
                                                 "embedding engine lock error: {e}"
                                             )),
                                         );
-                                        status_guard.finish();
+                                        status_guard.finish(LifecycleOutcome::Failed);
                                         return;
                                     }
                                 };
@@ -1364,7 +1387,7 @@ impl SharedState {
                                             &runtime,
                                             SemanticRuntimeStatus::Stopped,
                                         );
-                                        status_guard.finish();
+                                        status_guard.finish(LifecycleOutcome::Interrupted);
                                         return;
                                     }
                                     crate::workspace_lease::LeaseOperationOutcome::Superseded
@@ -1376,7 +1399,7 @@ impl SharedState {
                                                     .to_owned(),
                                             ),
                                         );
-                                        status_guard.finish();
+                                        status_guard.finish(LifecycleOutcome::Interrupted);
                                         return;
                                     }
                                     crate::workspace_lease::LeaseOperationOutcome::OperationError(
@@ -1400,7 +1423,7 @@ impl SharedState {
                                                 "embedding publication failed: {error}"
                                             )),
                                         );
-                                        status_guard.finish();
+                                        status_guard.finish(LifecycleOutcome::Failed);
                                         return;
                                     }
                                 }
@@ -1429,7 +1452,7 @@ impl SharedState {
                                 &runtime,
                                 SemanticRuntimeStatus::Stopped,
                             );
-                            status_guard.finish();
+                            status_guard.finish(LifecycleOutcome::Interrupted);
                             return;
                         }
                         Ok(
@@ -1443,7 +1466,7 @@ impl SharedState {
                                         .to_owned(),
                                 ),
                             );
-                            status_guard.finish();
+                                status_guard.finish(LifecycleOutcome::Interrupted);
                             return;
                         }
                         Err(e) => {
@@ -1454,7 +1477,7 @@ impl SharedState {
                                     "background embedding failed: {e}"
                                 )),
                             );
-                            status_guard.finish();
+                                status_guard.finish(LifecycleOutcome::Failed);
                             return;
                         }
                     }
@@ -1475,7 +1498,7 @@ impl SharedState {
                                         "embedding publication retry budget exhausted".to_owned(),
                                     ),
                                 );
-                                status_guard.finish();
+                                    status_guard.finish(LifecycleOutcome::Failed);
                                 return;
                             }
                         }
@@ -1487,7 +1510,7 @@ impl SharedState {
                         // No rerun requested → the claim was released under the flight lock.
                         claim_guard.disarm();
                         Self::set_semantic_runtime_status(&runtime, SemanticRuntimeStatus::Ready);
-                        status_guard.finish();
+                            status_guard.finish(LifecycleOutcome::Completed);
                         tracing::info!("background embedding pass complete; semantic index live");
                         return;
                     }
@@ -1503,13 +1526,20 @@ impl SharedState {
                                 &runtime,
                                 SemanticRuntimeStatus::Stopped,
                             );
-                            status_guard.finish();
+                            status_guard.finish(LifecycleOutcome::Interrupted);
                             return;
                         }
                     }
                 }
+                };
+                match lifecycle_context {
+                    Some(context) => context.in_scope(run),
+                    None => run(),
+                }
             });
         if let Err(e) = spawned {
+            record.outcome = LifecycleOutcome::Failed;
+            record.emit(false);
             tracing::warn!("failed to spawn embedding thread: {e}");
             embed_flight.release();
             Self::set_semantic_runtime_status(
@@ -1670,6 +1700,122 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tempfile::tempdir;
+
+    #[test]
+    fn vector_lifecycle_embedding_orchestration_preserves_context_and_terminal_states() {
+        use bsl_search::lifecycle::{Batch, Outcome, Reason};
+        use tracing_subscriber::prelude::*;
+        struct Capture(Arc<Mutex<Vec<serde_json::Value>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Visitor<'a>(&'a mut Vec<serde_json::Value>);
+                impl tracing::field::Visit for Visitor<'_> {
+                    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {
+                    }
+                    fn record_str(&mut self, field: &tracing::field::Field, text: &str) {
+                        if field.name() == "record" {
+                            self.0.push(serde_json::from_str(text).unwrap());
+                        }
+                    }
+                }
+                if event.metadata().target() == bsl_search::lifecycle::TARGET {
+                    event.record(&mut Visitor(&mut self.0.lock().unwrap()));
+                }
+            }
+        }
+        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
+        let _env = mock_embedding_env(&mock);
+        let records = Arc::new(Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(Capture(records.clone())),
+            || {
+                let directory = tempdir().unwrap();
+                let path = directory.path().join("unused.db");
+                let flight = super::EmbedFlight::in_flight_for_test();
+                SharedState::spawn_embed_pass(
+                    crate::state::shared_engine(None),
+                    crate::state::OwnerStop::default(),
+                    Arc::new(Mutex::new(super::SemanticRuntimeStatus::Ready)),
+                    bsl_search::IndexProgress::new(),
+                    flight,
+                    crate::workspace_lease::WorkspaceLease::unmanaged(),
+                    path.clone(),
+                    mock_semantic_config(&mock),
+                    Duration::ZERO,
+                );
+                let released = crate::workspace_lease::WorkspaceLease::unmanaged();
+                released.release();
+                SharedState::spawn_embed_pass(
+                    crate::state::shared_engine(None),
+                    crate::state::OwnerStop::default(),
+                    Arc::new(Mutex::new(super::SemanticRuntimeStatus::Ready)),
+                    bsl_search::IndexProgress::new(),
+                    super::EmbedFlight::new(),
+                    released,
+                    path.clone(),
+                    mock_semantic_config(&mock),
+                    Duration::ZERO,
+                );
+                for fail in [false, true] {
+                    let parent = Batch::new(&path, Reason::Embedding);
+                    let cache = crate::cache::WorkspaceCacheLayout::for_workspace(
+                        &directory.path().join(if fail { "fail" } else { "ok" }),
+                    );
+                    let _reset = ResetEmbeddingRefusals;
+                    if fail {
+                        super::FORCE_EMBED_PREFLIGHT_REFUSALS.store(1, Ordering::SeqCst);
+                    }
+                    parent.context().in_scope(|| {
+                        let (_, _, flight) = start_test_embed(
+                            &cache,
+                            &mock,
+                            if fail { Duration::ZERO } else { Duration::from_secs(2) },
+                        );
+                        wait_for_embed_flight(&flight);
+                    });
+                    parent.finish(Outcome::Completed);
+                }
+                // The existing status guard also emits an honest interruption on unwind.
+                let record = super::LifecycleRecord::new(
+                    &path,
+                    "embedding_orchestration",
+                    Reason::Embedding,
+                );
+                drop(super::EmbedStatusGuard::new(
+                    Arc::new(Mutex::new(super::SemanticRuntimeStatus::Indexing)),
+                    record,
+                ));
+            },
+        );
+        let values = records.lock().unwrap();
+        let orchestration: Vec<_> =
+            values.iter().filter(|v| v["kind"] == "embedding_orchestration").collect();
+        for outcome in ["skipped", "completed", "failed", "interrupted"] {
+            assert!(
+                orchestration.iter().any(|v| v["outcome"] == outcome),
+                "missing {outcome}: {orchestration:?}"
+            );
+        }
+        assert_eq!(orchestration.iter().filter(|v| v["outcome"] == "skipped").count(), 2);
+        assert!(orchestration
+            .iter()
+            .filter(|v| v["outcome"] == "started")
+            .all(|v| !v["parent_operation_id"].is_null()));
+        assert!(
+            orchestration
+                .iter()
+                .all(|v| v["counts"]["sqlite_vectors_removed"] == 0
+                    && v["committed_totals"].is_null())
+        );
+        assert!(values
+            .iter()
+            .any(|v| v["kind"] == "embedding_pass" && !v["parent_operation_id"].is_null()));
+    }
 
     struct ResetEmbeddingRefusals;
 

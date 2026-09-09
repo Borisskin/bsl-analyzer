@@ -282,6 +282,19 @@ jobs:
           run_exact mcp-server graph::state::tests::a_walk_refuses_a_snapshot_of_another_publication
           run_exact mcp-server graph::state::tests::a_complete_build_answers_an_address_that_is_gone
           run_exact mcp-server graph::state::tests::a_point_patch_answers_what_it_rewrote_and_nothing_else
+      - name: Vector lifecycle and bounded journal regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_nonempty() {
+            output=$(cargo test "$@" 2>&1)
+            printf '%s\n' "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+          }
+          run_nonempty -p bsl-search --lib lifecycle
+          run_nonempty -p mcp-server --lib vector_lifecycle
+          run_nonempty -p bsl-analyzer --bin bsl-analyzer-app cli::logging
+          run_nonempty -p bsl-analyzer --test vector_journal_cli
       - run: cargo test --all --no-fail-fast
 
   windows-mcp:
@@ -295,6 +308,19 @@ jobs:
         run: cargo build -p bsl-analyzer --bin bsl-analyzer-app
       - name: CLI MCP mode and lifecycle tests
         run: cargo test -p bsl-analyzer --bin bsl-analyzer-app cli::mcp
+      - name: Vector lifecycle and bounded journal regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_nonempty() {
+            output=$(cargo test "$@" 2>&1)
+            printf '%s\n' "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+          }
+          run_nonempty -p bsl-search --lib lifecycle
+          run_nonempty -p mcp-server --lib vector_lifecycle
+          run_nonempty -p bsl-analyzer --bin bsl-analyzer-app cli::logging
+          run_nonempty -p bsl-analyzer --bin bsl-analyzer-app cli::logging::journal::windows::tests::private_dacl_and_unprivileged_junction_rejection -- --exact
       - name: Diagnostics baseline atomic create
         run: cargo test -p bsl-analyzer diagnostics_baseline_create
       - name: Diagnostics baseline atomic update

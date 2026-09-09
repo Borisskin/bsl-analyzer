@@ -4378,27 +4378,6 @@ mod tests {
         assert!(!cache.needs_full_rescan(), "a published clean plan clears it");
     }
 
-    /// Keeps every WARN callsite answerable for the scoped subscribers below.
-    ///
-    /// Interest in a callsite is decided by the first thread to reach it and then cached
-    /// process-wide. A thread running with no subscriber at all decides "never interested",
-    /// and from then on the macro drops that event before any subscriber is consulted — so a
-    /// scoped subscriber installed later, on another thread, captures nothing. Tests run in
-    /// parallel, so which test reaches a callsite first is a race. A global default that
-    /// discards everything keeps the verdict "ask every time"; each event still goes to the
-    /// thread-local subscriber wherever one is installed.
-    #[cfg(unix)]
-    fn keep_warn_callsites_live() {
-        static INSTALLED: std::sync::Once = std::sync::Once::new();
-        INSTALLED.call_once(|| {
-            let subscriber = tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::WARN)
-                .with_writer(std::io::sink)
-                .finish();
-            let _ = tracing::subscriber::set_global_default(subscriber);
-        });
-    }
-
     /// Runs `f` under a thread-local subscriber capturing WARN-and-up output; returns the
     /// closure's result and the captured lines.
     #[cfg(unix)]
@@ -4427,8 +4406,7 @@ mod tests {
             .with_writer(buf.clone())
             .without_time()
             .finish();
-        keep_warn_callsites_live();
-        let result = tracing::subscriber::with_default(subscriber, f);
+        let result = crate::lifecycle::test_with_subscriber(subscriber, f);
         let bytes = buf.0.lock().unwrap().clone();
         (result, String::from_utf8_lossy(&bytes).lines().map(str::to_owned).collect())
     }

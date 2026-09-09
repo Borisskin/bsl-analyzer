@@ -1450,12 +1450,15 @@ impl SharedState {
                     "workspace baseline is unavailable".to_owned(),
                 ));
             };
-            let Some(mut engine) =
-                Self::open_workspace_overlay_search_engine_fenced(&db_path, lease, stop)?
+            let roots = Self::roots_of(&project, &excluded);
+            let Some(mut engine) = bsl_search::lifecycle::with_startup_roots(
+                "postgres_remote_overlay",
+                roots.entries().map(|(_, path)| path.to_path_buf()).collect(),
+                || Self::open_workspace_overlay_search_engine_fenced(&db_path, lease, stop),
+            )?
             else {
                 return Ok(None);
             };
-            let roots = Self::roots_of(&project, &excluded);
             let Some(()) = Self::configure_and_declare_baseline(
                 &mut engine,
                 roots,
@@ -1593,7 +1596,13 @@ impl SharedState {
             }));
         }
 
-        let Some(mut engine) = Self::open_search_engine_fenced(&db_path, lease, stop)? else {
+        let roots = Self::roots_of(&project, &excluded);
+        let Some(mut engine) = bsl_search::lifecycle::with_startup_roots(
+            "sqlite_local",
+            roots.entries().map(|(_, path)| path.to_path_buf()).collect(),
+            || Self::open_search_engine_fenced(&db_path, lease, stop),
+        )?
+        else {
             return Ok(None);
         };
 
@@ -1605,7 +1614,6 @@ impl SharedState {
         // embeddings, throwing away vectors already paid for — the opposite of resume.
         // Changed files are still detected and re-embedded via their content-hash mismatch.
 
-        let roots = Self::roots_of(&project, &excluded);
         // Declaring the local mode also clears inherited fingerprint rows: they claim
         // "verified against the manifest", which this mode can neither honour nor refresh —
         // a row surviving the local period would suppress a same-stat edit after a switch
