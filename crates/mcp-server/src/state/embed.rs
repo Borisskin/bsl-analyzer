@@ -1731,7 +1731,7 @@ mod tests {
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
         let _env = mock_embedding_env(&mock);
         let records = Arc::new(Mutex::new(Vec::new()));
-        tracing::subscriber::with_default(
+        test_utils::with_subscriber(
             tracing_subscriber::registry().with(Capture(records.clone())),
             || {
                 let directory = tempdir().unwrap();

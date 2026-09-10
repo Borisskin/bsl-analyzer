@@ -605,21 +605,7 @@ impl Drop for Mutation {
 }
 
 #[cfg(test)]
-pub(crate) fn test_with_subscriber<S, F, T>(subscriber: S, f: F) -> T
-where
-    S: tracing::Subscriber + Send + Sync + 'static,
-    F: FnOnce() -> T,
-{
-    // Keep tracing-core's single-dispatch fast path off: a parallel thread without
-    // a scoped subscriber must not cache a newly registered callsite as disabled.
-    static DISPATCHES: std::sync::OnceLock<[tracing::Dispatch; 2]> = std::sync::OnceLock::new();
-    DISPATCHES.get_or_init(|| {
-        std::array::from_fn(
-            |_| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()),
-        )
-    });
-    tracing::subscriber::with_default(subscriber, f)
-}
+pub(crate) use test_utils::with_subscriber as test_with_subscriber;
 
 #[cfg(test)]
 mod tests {

@@ -507,6 +507,7 @@ dependencies = [
  "serde_json",
  "syntax",
  "tempfile",
+ "test-utils",
  "thiserror 1.0.69",
  "tracing",
  "tracing-subscriber",

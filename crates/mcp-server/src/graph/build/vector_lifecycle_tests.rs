@@ -29,11 +29,36 @@ fn capture(f: impl FnOnce()) -> Vec<Value> {
         }
     }
     let records = Arc::new(Mutex::new(Vec::new()));
-    tracing::subscriber::with_default(
-        tracing_subscriber::registry().with(Capture(records.clone())),
-        f,
-    );
+    test_utils::with_subscriber(tracing_subscriber::registry().with(Capture(records.clone())), f);
     Arc::try_unwrap(records).unwrap().into_inner().unwrap()
+}
+
+#[test]
+fn vector_lifecycle_capture_survives_first_callsite_on_unsubscribed_thread() {
+    const CHILD: &str = "BSL_MCP_LIFECYCLE_CAPTURE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "graph::build::vector_lifecycle_tests::vector_lifecycle_capture_survives_first_callsite_on_unsubscribed_thread"])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    let probe = || {
+        bsl_search::lifecycle::Record::new(
+            Path::new("fixture.db"),
+            "capture_probe",
+            bsl_search::lifecycle::Reason::Startup,
+        )
+        .emit(true);
+    };
+    let records = capture(|| {
+        std::thread::spawn(probe).join().unwrap();
+        probe();
+    });
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["kind"], "capture_probe");
 }
 
 fn emit(engine: &mut SearchEngine, source: &Path, rows: &[ide::ChunkRow]) {
