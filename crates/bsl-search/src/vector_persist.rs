@@ -331,7 +331,10 @@ fn write_sidecar_temp(path: &Path, sidecar: &Sidecar) -> Result<PathBuf, SearchE
 }
 
 fn fsync_file(path: &Path) -> Result<(), SearchError> {
-    fs::File::open(path)
+    // Windows FlushFileBuffers requires a writable handle; keep the saved bytes intact.
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
         .and_then(|f| f.sync_all())
         .map_err(|e| SearchError::Index(format!("fsync index temp: {e}")))
 }
