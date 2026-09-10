@@ -137,3 +137,11 @@ R3 correction: tracing-core 0.1.36 single-dispatch callsite registration can con
 All added elements have a current requirement above. Existing tracing, std synchronization/filesystem primitives, installed serialization/SQLite dependencies and native Windows APIs are reused. No speculative service, configuration layer or new external runtime prerequisite was added.
 
 Final review and gates after R3: independent ponytail-review and implementation-vs-plan returned zero mandatory findings. `cargo clippy --all-targets --all-features -- -D warnings`, formatting, strict OpenSpec validation, actionlint and whitespace checks passed after the final test-only change. The earlier full workspace run and final full bsl-search run together cover the final code; no production code changed after the workspace run. All 13 original tasks and R1–R3 are checked, V1–V9 have evidence, and the final cursor is removed. Windows runtime is the sole unexecuted platform boundary and is not claimed as a local result. No commit, push, archive or deployment performed.
+
+### PR #142 CI follow-up (2026-09-10)
+
+User decision: commit/push scoped fixes and continue CI diagnosis and repair until PR #142 passes. Unrelated OpenSpec changes remain excluded.
+
+Run `34365773831` exposed two Linux test races: the rearm counter precedes the completed tick counter, and the resident can finish loading before the first metadata response. The tests now wait for the completed tick and accept immediate readiness; the existing metadata unit test still checks the loading envelope. Windows failed its first lifecycle test command, but `set -e` discarded its captured diagnostics. All four CI test wrappers now print failed output and still reject failed or empty runs; `scripts/test-ci-test-output.py` checks these cases and rejects the original wrappers.
+
+Local evidence: mcp-server library 999 passed / 1 ignored, metadata 6 passed, bsl-search lifecycle 36 passed, tick stress 30/30, metadata stress 20/20, scoped strict Clippy, rustfmt, `actionlint .github/workflows/ci.yml`, and whitespace checks passed. Repository-wide actionlint reports an unrelated existing SC2035 in `release.yml`. Windows root cause and remote CI success remain pending the next run.

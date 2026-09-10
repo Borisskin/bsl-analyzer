@@ -5345,10 +5345,11 @@ mod tests {
 
         project.retarget(&project.second);
         assert!(
-            eventually(Duration::from_secs(10), || hub.self_rearm_count() > 0),
-            "a retarget after the first tick must still be noticed"
+            eventually(Duration::from_secs(10), || {
+                hub.self_rearm_count() > 0 && hub.tick_count() > after_first
+            }),
+            "a retarget after the first tick must still be noticed by a completed tick"
         );
-        assert!(hub.tick_count() > after_first);
     }
 
     /// A target that is simply not there costs nothing at all. It stays in the declared
