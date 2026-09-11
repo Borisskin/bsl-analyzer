@@ -1727,7 +1727,7 @@ mod tests {
                 }
             }
         }
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = env_lock();
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
         let _env = mock_embedding_env(&mock);
         let records = Arc::new(Mutex::new(Vec::new()));
