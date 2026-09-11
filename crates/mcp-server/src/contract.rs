@@ -36,7 +36,7 @@ use crate::{McpProfile, McpServer};
 /// Consumers should require an exact major and a minimum minor. Bump this by hand in the
 /// same commit that changes the surface; the snapshot test over [`document`] puts the
 /// version field next to the change in the diff.
-pub const CONTRACT_VERSION: &str = "2.3";
+pub const CONTRACT_VERSION: &str = "3.0";
 
 /// URI of the MCP resource carrying [`document`].
 pub const CONTRACT_URI: &str = "bsl-analyzer://contract";
@@ -156,14 +156,20 @@ const WORKSPACE_TOOLS: &[ToolDecl] = &[
         name: "search",
         actions: WORKSPACE_SEARCH_ACTIONS,
         note: None,
-        output_schema_version: Some("5"),
+        output_schema_version: Some("6"),
         default_enabled: true,
     },
     tool("query", QUERY_ACTIONS),
     tool("execute", EXECUTE_ACTIONS),
     tool("event_log", &[]),
     tool("debug", DEBUG_ACTIONS),
-    tool("graph", GRAPH_ACTIONS),
+    ToolDecl {
+        name: "graph",
+        actions: GRAPH_ACTIONS,
+        note: None,
+        output_schema_version: Some("34"),
+        default_enabled: true,
+    },
     ToolDecl {
         name: "symbol_info",
         actions: &[],
@@ -200,7 +206,7 @@ const REFERENCE_TOOLS: &[ToolDecl] = &[
         name: "search",
         actions: REFERENCE_SEARCH_ACTIONS,
         note: None,
-        output_schema_version: Some("4"),
+        output_schema_version: Some("5"),
         default_enabled: true,
     },
     SYNTAX_HELP,
@@ -532,6 +538,63 @@ mod tests {
     use crate::ToolGate;
     use expect_test::expect;
 
+    #[test]
+    fn indexing_discovery_contract() {
+        use crate::indexing::{Indexing, Kind, State, Target};
+        assert_eq!(CONTRACT_VERSION, "3.0");
+        let indexing = serde_json::to_value(Indexing::single(Target::new(
+            Kind::Reference,
+            State::Ready,
+            None,
+        )))
+        .unwrap();
+        for profile in [McpProfile::Workspace, McpProfile::Reference] {
+            let schema = output_schema(profile, "search").unwrap();
+            let validator = jsonschema::validator_for(&schema).unwrap();
+            let mut actual = crate::tools::search::docs_not_ready("find_docs");
+            Indexing::single(Target::new(
+                Kind::Reference,
+                State::Waiting,
+                Some(crate::indexing::Reason::Initializing),
+            ))
+            .attach(&mut actual);
+            assert!(validator.is_valid(actual.structured_content.as_ref().unwrap()));
+            for action in ["search_code", "find_docs", "search_docs"] {
+                let version = if action == "search_code" && profile == McpProfile::Workspace {
+                    "6"
+                } else {
+                    "5"
+                };
+                for mut body in [
+                    json!({"action":action,"schema_version":version,"hits":[],"shown":0,"total":0,"indexing":indexing}),
+                    json!({"action":action,"schema_version":version,"status":"not_ready","retry_after_ms":100,"indexing":indexing}),
+                ] {
+                    assert!(validator.is_valid(&body), "{body}");
+                    body.as_object_mut().unwrap().remove("indexing");
+                    assert!(!validator.is_valid(&body));
+                }
+            }
+            let mut status = json!({"action":"status","schema_version":"2","profile":"reference","state":"ready","indexing":indexing});
+            assert!(validator.is_valid(&status));
+            status.as_object_mut().unwrap().remove("indexing");
+            assert!(!validator.is_valid(&status));
+            assert!(validator.is_valid(&json!({"action":"list_platform","schema_version":"1","items":[],"shown":0,"total":0,"budget_exhausted":false})));
+        }
+        let schema = output_schema(McpProfile::Workspace, "graph").unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        for mut body in [
+            json!({"state":"ready","indexing":indexing}),
+            json!({"status":"loading","indexing":indexing}),
+        ] {
+            assert!(validator.is_valid(&body));
+            body.as_object_mut().unwrap().remove("indexing");
+            assert!(!validator.is_valid(&body), "alternative branch must not bypass indexing");
+        }
+        let graph_schema = crate::tools::graph::schema().structured_content.unwrap();
+        assert_eq!(graph_schema["schema_version"], "34");
+        assert!(validator.is_valid(&graph_schema));
+    }
+
     fn schema_props(profile: McpProfile, tool: &str) -> Map<String, Value> {
         let router = McpServer::profile_router(profile);
         let listed = router.list_all();
@@ -839,7 +902,7 @@ mod tests {
         doc.insert("mcp".into(), mcp_surface());
         expect![[r#"
             {
-              "contract_version": "2.3",
+              "contract_version": "3.0",
               "mcp": {
                 "profiles": {
                   "reference": {
@@ -869,8 +932,8 @@ mod tests {
                           }
                         ],
                         "name": "search",
-                        "output_schema_fingerprint": "blake3:4829b5149282d60e71524da2b7b4a1b684b1f8db79d255f962f9063e0aec3adf",
-                        "output_schema_version": "4",
+                        "output_schema_fingerprint": "blake3:4c0fc50e14df483065c4194c7b56af04c06d89afa424b8539ef0bf6b085acb61",
+                        "output_schema_version": "6",
                         "params": [
                           {
                             "name": "action",
@@ -1187,7 +1250,7 @@ mod tests {
                           }
                         ],
                         "name": "search",
-                        "output_schema_fingerprint": "blake3:cba7e909df4a379a514118ba3c6a8795dcafc780dc1beb46a4c3d3097ed48716",
+                        "output_schema_fingerprint": "blake3:4c0fc50e14df483065c4194c7b56af04c06d89afa424b8539ef0bf6b085acb61",
                         "output_schema_version": "5",
                         "params": [
                           {
@@ -1595,6 +1658,8 @@ mod tests {
                           }
                         ],
                         "name": "graph",
+                        "output_schema_fingerprint": "blake3:e08616298c69ac894887fc6d775157a384557828cab4a93f010a001724f5d359",
+                        "output_schema_version": "34",
                         "params": [
                           {
                             "name": "action",

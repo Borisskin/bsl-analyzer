@@ -13,6 +13,7 @@ use std::sync::Arc;
 pub struct Store {
     conn: Connection,
     path: PathBuf,
+    startup_context_pending: AtomicBool,
     /// Monotonic sequence stamped on every `context_dirty` mark. A graph build captures this
     /// value at build start; its post-publish refresh then consumes ONLY marks whose `seq` is
     /// at or below that captured bound, so a drift landing after the build started is never
@@ -57,6 +58,7 @@ pub(crate) struct WorkspaceDriftStoreOutcome {
 /// The embeddings the vector index is built from (`(chunk_id, vector)` rows) paired with the
 /// `embedding_generation` they were read at, as one consistent snapshot.
 pub type EmbeddingsSnapshot = (i64, Vec<(i64, Vec<f32>)>);
+pub(crate) type IndexEmbeddingSnapshot = (i64, Vec<(i64, Vec<f32>)>, usize);
 type OverlayEmbeddingPublication<'a> = (&'a str, usize, &'a HashMap<String, Vec<f32>>);
 
 /// One file prepared off-lock for an atomic workspace-root transition.
@@ -329,6 +331,7 @@ impl Store {
         let store = Self {
             conn,
             path: path.to_path_buf(),
+            startup_context_pending: AtomicBool::new(true),
             mark_seq: Arc::new(AtomicI64::new(0)),
             observed_clears: Arc::new(AtomicU64::new(0)),
             clear_observer_enabled: AtomicBool::new(false),
@@ -402,6 +405,7 @@ impl Store {
         let store = Self {
             conn,
             path: path.to_path_buf(),
+            startup_context_pending: AtomicBool::new(true),
             mark_seq: Arc::new(AtomicI64::new(0)),
             observed_clears: Arc::new(AtomicU64::new(0)),
             clear_observer_enabled: AtomicBool::new(false),
@@ -842,6 +846,7 @@ impl Store {
         let store = Self {
             conn,
             path: PathBuf::from(":memory:"),
+            startup_context_pending: AtomicBool::new(true),
             mark_seq: Arc::new(AtomicI64::new(0)),
             observed_clears: Arc::new(AtomicU64::new(0)),
             clear_observer_enabled: AtomicBool::new(false),
@@ -1336,10 +1341,11 @@ impl Store {
     /// the next allocation above every stamp still on disk instead of re-issuing seqs a
     /// surviving row already holds.
     fn seed_mark_seq(&self) -> Result<(), SearchError> {
-        let rows_max: i64 =
-            self.conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM context_dirty", [], |row| {
-                row.get(0)
-            })?;
+        let (rows_max, context_pending): (i64, bool) = self.conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0), EXISTS(SELECT 1 FROM context_dirty WHERE collection = 'code') FROM context_dirty",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        self.startup_context_pending.store(context_pending, Ordering::Relaxed);
         let seeded: i64 = self.conn.query_row(
             "INSERT INTO meta (key, value) VALUES ('mark_seq', ?1)
              ON CONFLICT(key) DO UPDATE SET value = CAST(MAX(CAST(value AS INTEGER), ?1) AS TEXT)
@@ -1349,6 +1355,10 @@ impl Store {
         )?;
         self.observe_mark_seq(seeded);
         Ok(())
+    }
+
+    pub(crate) fn startup_context_pending(&self) -> bool {
+        self.startup_context_pending.load(Ordering::Relaxed)
     }
 
     /// Raise the local high-water to `seq` (never lower it): concurrent marks through this
@@ -2488,11 +2498,20 @@ impl Store {
         &self,
         dim: usize,
     ) -> Result<EmbeddingsSnapshot, SearchError> {
+        let (generation, data, _) = self.load_index_embedding_snapshot(dim)?;
+        Ok((generation, data))
+    }
+
+    /// Preserve the number of stored BLOBs while reading them anyway, including rejected
+    /// dimensions. An empty filtered vector index alone is not proof of an empty store.
+    pub(crate) fn load_index_embedding_snapshot(
+        &self,
+        dim: usize,
+    ) -> Result<IndexEmbeddingSnapshot, SearchError> {
         let tx = self.conn.unchecked_transaction()?;
         let generation = Self::read_embedding_generation(&tx)?;
-        let data = Self::read_all_embeddings(&tx, dim)?;
-        // Read-only: drop the transaction without committing.
-        Ok((generation, data))
+        let (data, stored) = Self::read_index_embeddings(&tx, dim)?;
+        Ok((generation, data, stored))
     }
 
     /// The current `embedding_generation` counter (O(1) single-row read). `Store::open` always
@@ -2523,6 +2542,14 @@ impl Store {
         conn: &Connection,
         dim: usize,
     ) -> Result<Vec<(i64, Vec<f32>)>, SearchError> {
+        Self::read_index_embeddings(conn, dim).map(|(data, _)| data)
+    }
+
+    #[allow(clippy::type_complexity, reason = "existing vector rows and their native count")]
+    fn read_index_embeddings(
+        conn: &Connection,
+        dim: usize,
+    ) -> Result<(Vec<(i64, Vec<f32>)>, usize), SearchError> {
         let mut stmt =
             conn.prepare("SELECT id, embedding FROM chunks WHERE embedding IS NOT NULL")?;
 
@@ -2533,15 +2560,17 @@ impl Store {
         })?;
 
         let mut result = Vec::new();
+        let mut stored = 0usize;
         for row in rows {
             let (id, blob) = row?;
+            stored += 1;
             if blob.len() == dim * 4 {
                 let embedding: Vec<f32> =
                     blob.as_chunks::<4>().0.iter().copied().map(f32::from_le_bytes).collect();
                 result.push((id, embedding));
             }
         }
-        Ok(result)
+        Ok((result, stored))
     }
 
     pub fn chunk_by_id(&self, chunk_id: i64) -> Result<Option<ChunkInfo>, SearchError> {

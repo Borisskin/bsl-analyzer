@@ -94,6 +94,7 @@ impl Published {
 pub(super) struct Inner {
     pub(super) status: GraphStatus,
     pub(super) published: Option<Published>,
+    pub(super) indexing_unread_files: Option<usize>,
     /// The ticket of the build holding the slot. Written with the grant and cleared with the
     /// outcome, so a slot that reads as taken always names what it was taken for.
     pub(super) claimed: Option<super::debt::BuildTicket>,
@@ -496,6 +497,7 @@ impl GraphState {
                 building: None,
                 carrier: 0,
                 carries: 0,
+                indexing_unread_files: None,
             })),
             scan: Arc::new(Mutex::new(None)),
             workspace_root,
@@ -1764,6 +1766,55 @@ impl GraphState {
         matches!(self.status(), GraphStatus::Loading) || self.reload_running()
     }
 
+    /// A bounded owner sample; no descriptor checkout, SQL, drift scan or blocking lock.
+    pub(crate) fn indexing_snapshot(&self) -> crate::indexing::Target {
+        self.status_report_with_indexing().1
+    }
+
+    fn indexing_from_inner(
+        &self,
+        inner: &Inner,
+        superseded: bool,
+        released: bool,
+    ) -> crate::indexing::Target {
+        use crate::indexing::{Kind, Reason, State, Target};
+        if superseded {
+            return Target::new(Kind::Graph, State::Superseded, Some(Reason::Superseded));
+        }
+        if released {
+            return Target::new(Kind::Graph, State::Cancelled, Some(Reason::Cancelled));
+        }
+        let (state, reason) = match &inner.status {
+            GraphStatus::Idle => (State::Waiting, Some(Reason::Initializing)),
+            GraphStatus::Disabled => (State::Unknown, Some(Reason::SnapshotUnavailable)),
+            GraphStatus::Loading => (State::Running, None),
+            GraphStatus::Failed(_) => (State::Failed, Some(Reason::NativeFailure)),
+            GraphStatus::Ready { .. } => {
+                let Some(published) = &inner.published else { return Target::unknown(Kind::Graph) };
+                match &published.reload {
+                    ReloadState::Running => (State::Running, None),
+                    ReloadState::Failed(_) => (State::Failed, Some(Reason::NativeFailure)),
+                    ReloadState::Idle => {
+                        let Some(unread) = inner.indexing_unread_files else {
+                            return Target::unknown(Kind::Graph);
+                        };
+                        if published.stale
+                            || published.force_stale
+                            || unread > 0
+                            || self.pending_nudge.load(Ordering::SeqCst)
+                            || self.project_reload_pending()
+                        {
+                            (State::Waiting, Some(Reason::StaleGeneration))
+                        } else {
+                            (State::Ready, None)
+                        }
+                    }
+                }
+            }
+        };
+        Target::new(Kind::Graph, state, reason)
+    }
+
     pub(crate) fn status(&self) -> GraphStatus {
         lock_recover(&self.inner).status.clone()
     }
@@ -1837,12 +1888,18 @@ impl GraphState {
         }
     }
 
-    /// Cached lifecycle snapshot for the `status` action. It uses only process-local state and
-    /// the pre-opened descriptor pool; drift detection belongs to background graph owners.
+    #[cfg(test)]
     pub(crate) fn status_report(&self) -> GraphStatusReport {
-        let superseded = self.lease.is_superseded();
+        self.status_report_with_indexing().0
+    }
+
+    /// Legacy report and telemetry share one publication/revision sample.
+    pub(crate) fn status_report_with_indexing(
+        &self,
+    ) -> (GraphStatusReport, crate::indexing::Target) {
+        use crate::indexing::{Kind, Target};
         let drift_watch = self.workspace_root.is_some().then(|| self.drift_watch().as_str());
-        let report = |state: &'static str, superseded: Option<bool>| GraphStatusReport {
+        let report = |state, superseded| GraphStatusReport {
             state,
             files: None,
             unread_files: None,
@@ -1858,53 +1915,48 @@ impl GraphState {
                 .and_then(|hub| hub.poll_report())
                 .map(|(_, cycle)| cycle.as_secs()),
         };
-
-        let status = {
-            let inner = lock_recover(&self.inner);
-            inner.status.clone()
+        let Ok(inner) = self.inner.try_lock() else {
+            return (report("loading", None), Target::unknown(Kind::Graph));
         };
-
-        if superseded {
-            if let GraphStatus::Ready { files } = status {
-                if let Some(snapshot) = self.snapshot() {
-                    let freshness = self.cached_freshness(&snapshot);
-                    return GraphStatusReport {
-                        files: Some(files),
-                        unread_files: Some(snapshot.unread_files()),
-                        revision: Some(freshness.revision),
-                        stale: Some(freshness.stale),
-                        reload: Some(freshness.reload),
-                        ..report("ready", Some(true))
-                    };
+        let superseded = self.lease.is_superseded();
+        let target = self.indexing_from_inner(&inner, superseded, self.lease.is_released());
+        if let GraphStatus::Ready { files } = &inner.status {
+            if let (Some(published), Some(unread)) = (&inner.published, inner.indexing_unread_files)
+            {
+                // Preserve legacy read availability without checking out a descriptor or doing I/O.
+                let available = self.snapshot_pool.try_lock().is_ok_and(|pool| {
+                    pool.iter().any(|entry| entry.generation == published.generation)
+                });
+                if available {
+                    return (
+                        GraphStatusReport {
+                            files: Some(*files),
+                            unread_files: Some(unread),
+                            revision: Some(published.generation),
+                            stale: Some(published.stale || published.force_stale || unread > 0),
+                            reload: Some(published.reload.label()),
+                            ..report("ready", superseded.then_some(true))
+                        },
+                        target,
+                    );
                 }
             }
-            return GraphStatusReport {
+        }
+        let legacy = if superseded {
+            GraphStatusReport {
                 error: Some(SUPERSEDED_GRAPH_ERROR.to_owned()),
                 ..report("failed", Some(true))
-            };
-        }
-
-        match status {
-            GraphStatus::Disabled => report("disabled", None),
-            GraphStatus::Idle | GraphStatus::Loading => report("loading", None),
-            GraphStatus::Failed(msg) => {
-                GraphStatusReport { error: Some(msg), ..report("failed", None) }
             }
-            GraphStatus::Ready { files } => match self.snapshot() {
-                Some(snapshot) => {
-                    let freshness = self.cached_freshness(&snapshot);
-                    GraphStatusReport {
-                        files: Some(files),
-                        unread_files: Some(snapshot.unread_files()),
-                        revision: Some(freshness.revision),
-                        stale: Some(freshness.stale),
-                        reload: Some(freshness.reload),
-                        ..report("ready", None)
-                    }
+        } else {
+            match &inner.status {
+                GraphStatus::Disabled => report("disabled", None),
+                GraphStatus::Failed(msg) => {
+                    GraphStatusReport { error: Some(msg.clone()), ..report("failed", None) }
                 }
-                None => report("loading", None),
-            },
-        }
+                _ => report("loading", None),
+            }
+        };
+        (legacy, target)
     }
 
     /// Start the initial load: `Idle → Loading`, one loader thread, nothing else.
@@ -3938,6 +3990,55 @@ mod tests {
     /// thread once the build completes and publishes — the seam the search context
     /// re-render hangs on. Without the `notify_published()` call at the publish site the
     /// counter stays zero and this fails.
+    #[test]
+    fn indexing_owner_lifecycles_graph() {
+        use crate::indexing::{Reason, State};
+        let graph = GraphState::with_status(GraphStatus::Idle, None);
+        assert_eq!(graph.indexing_snapshot().state, State::Waiting);
+        {
+            let _guard = graph.inner.lock().unwrap();
+            let (report, target) = graph.status_report_with_indexing();
+            assert_eq!(target.state, State::Unknown);
+            assert_eq!(report.state, "loading");
+        }
+        graph.inner.lock().unwrap().status = GraphStatus::Loading;
+        assert_eq!(graph.indexing_snapshot().state, State::Running);
+        {
+            let mut inner = graph.inner.lock().unwrap();
+            inner.status = GraphStatus::Ready { files: 0 };
+            inner.indexing_unread_files = Some(0);
+            inner.published = Some(Published {
+                generation: 7,
+                fingerprint: crate::graph_db::GraphFp::default(),
+                stale: false,
+                reload: ReloadState::Idle,
+                force_stale: false,
+                search_roots: None,
+            });
+        }
+        let (report, target) = graph.status_report_with_indexing();
+        assert_eq!(target.state, State::Ready);
+        assert_eq!(report.revision, None); // no pre-opened descriptor in this owner-only fixture
+        assert_eq!(report.stale, None);
+        graph.inner.lock().unwrap().indexing_unread_files = Some(1);
+        let (report, target) = graph.status_report_with_indexing();
+        assert_eq!(target.reason_code, Some(Reason::StaleGeneration));
+        assert_eq!(report.revision, None); // no pre-opened descriptor in this owner-only fixture
+        assert_eq!(report.stale, None);
+        graph.inner.lock().unwrap().indexing_unread_files = Some(0);
+        graph.inner.lock().unwrap().published.as_mut().unwrap().reload = ReloadState::Running;
+        assert_eq!(graph.indexing_snapshot().state, State::Running);
+        graph.inner.lock().unwrap().published.as_mut().unwrap().reload =
+            ReloadState::Failed("private failure".to_owned());
+        assert_eq!(graph.indexing_snapshot().state, State::Failed);
+        let json = serde_json::to_value(graph.indexing_snapshot()).unwrap();
+        for field in ["phase", "progress", "pass_id"] {
+            assert!(json[field].is_null());
+        }
+        assert!(!json.to_string().contains("private failure"));
+        assert_eq!(graph.scan_count(), 0);
+    }
+
     #[test]
     fn publish_hook_fires_after_a_build_publishes() {
         let dir = tempfile::tempdir().unwrap();

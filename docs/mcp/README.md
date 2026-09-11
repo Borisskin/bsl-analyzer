@@ -347,3 +347,19 @@ EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B \
 - `docs/mcp/CONTRACT.md` — машиночитаемая декларация контракта (`bsl-analyzer contract`,
   ресурс `bsl-analyzer://contract`) для проверки совместимости в чужом CI
 - `docs/central-postgres-search/README.md` — shared baseline и overlay для поиска
+
+
+## Совместимость indexing
+
+Текущий machine contract — `3.0`: успешные ответы поиска и graph lifecycle/loading
+несут структурированный `indexing`. Search hits/not-ready имеют schema `5`,
+search status — `2`, graph descriptor — `34`; list_platform остаётся `1`.
+Готовность lexical, semantic, graph и reference читается отдельно; unknown не
+означает завершение. Точный формат, null/terminal правила и примеры описаны в
+[TOOLS_AND_EXTENSION.md](TOOLS_AND_EXTENSION.md#структурированный-прогресс-индексации).
+
+Бюджетируемые ответы поиска резервируют обязательный конверт; слишком маленький
+`max_output_tokens` возвращает `budget_too_small` с `minimum_output_tokens`.
+Статусы поиска и graph status/schema/resolve сохраняют исключения из бюджета.
+Перед обновлением strict consumer проверяет новый contract и `tools/list`;
+откат использует предыдущий binary вместе с его contract, без конвертации индекса.

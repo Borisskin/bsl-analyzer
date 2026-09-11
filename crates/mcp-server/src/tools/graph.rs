@@ -405,6 +405,7 @@ pub fn loading(detail: Option<&str>) -> CallToolResult {
 fn schema_json() -> Value {
     json!({
         "schema_version": "34",
+        "indexing_contract": "Lifecycle status and loading responses include indexing schema_version 1 with a graph target; data/schema responses do not require indexing. States: waiting|running|ready|disabled|failed|cancelled|superseded|unknown. Phase, progress and pass_id are null for graph targets.",
         "actions": ["overview", "schema", "status", "node", "source", "neighbors", "callers", "callees", "resolve"],
         "status": "`status` returns the graph lifecycle ({state: disabled|loading|ready|failed, and when ready: files, unread_files, revision, stale, reload}; for a workspace graph always `drift_watch`, see the envelope) and kicks the lazy build — poll it instead of reading a flat `loading` envelope from a data action (mirrors `diagnostics status`). `unread_files` counts modules whose bytes could not be read when the artefact was built or last patched: they contributed no nodes and no edges, so the graph is missing them, `stale` is true, and no fingerprint comparison reveals it (stat needs no read permission). A patch never clears an inherited one — only a full rebuild restores the missing rows. `files` here is the module count the artefact COVERS, unread ones included, so `unread_files` is a subset of it — unlike `diagnostics status`, whose `files` counts only what it serves and excludes them; do not apply one arithmetic to both. `superseded: true` (emitted only when it holds) means another daemon generation owns this workspace's derived caches and this server no longer rebuilds. It reports `ready + superseded` and serves data only while one of its own pre-opened SQLite descriptors is available in the pool; otherwise status is `failed + superseded` and every data action returns the same reconnect error, never `loading`. Reconnect to use the current daemon. The static `schema` action remains available without a snapshot.",
         "node_kinds": ["method", "module", "mdo", "attribute", "tabular_section", "form", "form_item", "form_attribute"],
@@ -509,6 +510,25 @@ fn redact_opt(source: &mut Option<String>) {
     if let Some(text) = source {
         *text = redact_secrets(text);
     }
+}
+
+/// Lifecycle/loading responses require indexing; data/schema responses cannot bypass that gate.
+pub(crate) fn graph_output_schema() -> std::sync::Arc<serde_json::Map<String, serde_json::Value>> {
+    let indexing = rmcp::handler::server::tool::schema_for_type::<crate::indexing::Indexing>();
+    let mut indexing = indexing.as_ref().clone();
+    let definitions = indexing.remove("$defs");
+    let condition = serde_json::json!({"anyOf":[
+        {"required":["state"]},
+        {"required":["status"],"properties":{"status":{"const":"loading"}}}
+    ]});
+    let mut schema = serde_json::json!({"type":"object", "anyOf":[
+        {"allOf":[condition.clone(), {"required":["indexing"], "properties":{"indexing":indexing}}]},
+        {"not":condition}
+    ]});
+    if let Some(definitions) = definitions {
+        schema["$defs"] = definitions;
+    }
+    std::sync::Arc::new(schema.as_object().unwrap().clone())
 }
 
 #[cfg(test)]

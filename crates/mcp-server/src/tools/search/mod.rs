@@ -1,6 +1,8 @@
 //! Search tool execution paths and stable public entrypoints.
 
 mod acquire;
+mod budget;
+pub(crate) use budget::finalize_indexed_response;
 mod call;
 #[cfg(test)]
 mod cancel_tests;

@@ -27,9 +27,10 @@ pub(super) const HYBRID_FETCH_MULTIPLIER: usize = 2;
 ///
 /// `5` — `search_code` only — adds `freshness.drift_watch` and the completeness reasons the
 /// overlay's own state gives. The `reference` profile's documentation actions changed nothing
-/// and stay on `4`: their number is theirs from here on, not a shared one.
-pub(super) const SEARCH_CODE_SCHEMA_VERSION: &str = "5";
-pub(super) const DOCS_SCHEMA_VERSION: &str = "4";
+/// stayed on `4`: their number is independent. Structured indexing advances code to `6`
+/// and documentation to `5`.
+pub(super) const SEARCH_CODE_SCHEMA_VERSION: &str = "6";
+pub(super) const DOCS_SCHEMA_VERSION: &str = "5";
 
 /// The schema version an action's answer carries.
 pub(super) fn search_schema_version(action: &str) -> &'static str {
@@ -66,6 +67,7 @@ enum SearchOutput<C> {
         schema_version: StatusSchemaVersion,
         profile: SearchProfile,
         state: SearchState,
+        indexing: crate::indexing::Indexing,
     },
 }
 
@@ -73,6 +75,7 @@ enum SearchOutput<C> {
 struct SearchHits<A, V> {
     action: A,
     schema_version: V,
+    indexing: crate::indexing::Indexing,
     hits: Vec<Value>,
     shown: usize,
     total: usize,
@@ -86,6 +89,7 @@ struct SearchHits<A, V> {
 struct SearchNotReady<A, V> {
     action: A,
     schema_version: V,
+    indexing: crate::indexing::Indexing,
     status: NotReadyStatus,
     retry_after_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -110,10 +114,10 @@ const_enum!(FindDocsAction, FindDocs, "find_docs");
 const_enum!(SearchDocsAction, SearchDocs, "search_docs");
 const_enum!(ListPlatformAction, ListPlatform, "list_platform");
 const_enum!(StatusAction, Status, "status");
-const_enum!(SearchCodeSchemaVersion, V5, "5");
-const_enum!(SearchSchemaVersion, V4, "4");
+const_enum!(SearchCodeSchemaVersion, V6, "6");
+const_enum!(SearchSchemaVersion, V5, "5");
 const_enum!(ListPlatformSchemaVersion, V1, "1");
-const_enum!(StatusSchemaVersion, V1, "1");
+const_enum!(StatusSchemaVersion, V2, "2");
 const_enum!(NotReadyStatus, NotReady, "not_ready");
 
 #[derive(JsonSchema, Serialize)]

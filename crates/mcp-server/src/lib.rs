@@ -10,6 +10,9 @@ mod graph;
 mod graph_db;
 mod graph_query;
 mod http;
+mod indexing;
+#[cfg(test)]
+mod indexing_runtime_tests;
 #[cfg(test)]
 mod inventory;
 pub mod project;
@@ -186,6 +189,34 @@ pub use state::{OnecConnection, SharedState};
 pub use tools::platform::{
     build_reference_documents, reference_documents_fingerprint, REFERENCE_DOCUMENT_SCHEMA_VERSION,
 };
+
+fn indexed_search_budget(command: &SearchCommand) -> Option<usize> {
+    match command {
+        SearchCommand::SearchCode(params) => {
+            Some(params.max_output_tokens.unwrap_or(tools::response::DEFAULT_OUTPUT_BUDGET_TOKENS))
+        }
+        SearchCommand::FindDocs { max_output_tokens, .. }
+        | SearchCommand::SearchDocs { max_output_tokens, .. } => {
+            Some(max_output_tokens.unwrap_or(tools::response::DEFAULT_OUTPUT_BUDGET_TOKENS))
+        }
+        SearchCommand::Status | SearchCommand::ListPlatform(_) => None,
+    }
+}
+
+fn finish_indexed_search(
+    mut response: CallToolResult,
+    indexing: indexing::Indexing,
+    budget: Option<usize>,
+) -> Result<CallToolResult, McpError> {
+    if response.structured_content.as_ref().is_some_and(|body| body["action"] == "list_platform") {
+        return Ok(response);
+    }
+    indexing.attach(&mut response);
+    match budget {
+        Some(budget) => tools::search::finalize_indexed_response(response, budget),
+        None => Ok(response),
+    }
+}
 
 pub async fn serve_stdio(server: McpServer) -> anyhow::Result<()> {
     serve_stream(server, rmcp::transport::stdio()).await
@@ -1339,7 +1370,14 @@ impl McpServer {
         ct: tokio_util::sync::CancellationToken,
     ) -> Result<CallToolResult, McpError> {
         let started = std::time::Instant::now();
-        match SearchCommand::from(params.0) {
+        let command = SearchCommand::from(params.0);
+        let budget = indexed_search_budget(&command);
+        if budget.is_some() && ct.is_cancelled() {
+            return Err(McpError::internal_error("request cancelled", None));
+        }
+        let reference =
+            matches!(&command, SearchCommand::FindDocs { .. } | SearchCommand::SearchDocs { .. });
+        let response = match command {
             SearchCommand::Status => {
                 let engine = self.state.search_engine().clone();
                 let progress = self.state.index_progress().clone();
@@ -1386,9 +1424,7 @@ impl McpServer {
             SearchCommand::SearchCode(params) => {
                 let query = params.query;
                 let limit = params.limit.unwrap_or(10).min(50);
-                let max_output_tokens = params
-                    .max_output_tokens
-                    .unwrap_or(tools::response::DEFAULT_OUTPUT_BUDGET_TOKENS);
+                let max_output_tokens = usize::MAX;
                 let engine = self.state.search_engine().clone();
                 let semantic_runtime = self.state.semantic_runtime();
                 let workspace_search_mode = self.state.workspace_search_mode();
@@ -1403,9 +1439,11 @@ impl McpServer {
                     crate::state::WorkspaceSearchMode::PostgresRemoteOverlay
                 ) && baseline.pending
                 {
-                    return Ok(tools::search::baseline_warming_not_ready(
-                        self.state.index_progress(),
-                    ));
+                    return finish_indexed_search(
+                        tools::search::baseline_warming_not_ready(self.state.index_progress()),
+                        self.state.workspace_indexing(),
+                        budget,
+                    );
                 }
                 let configured_baseline = baseline.configured;
                 let external_baseline = baseline.external;
@@ -1453,7 +1491,7 @@ impl McpServer {
                     ));
                 }
                 let semantic = matches!(&command, SearchCommand::SearchDocs { .. });
-                let (query, limit, max_output_tokens) = match command {
+                let (query, limit, _max_output_tokens) = match command {
                     SearchCommand::FindDocs { query, limit, max_output_tokens }
                     | SearchCommand::SearchDocs { query, limit, max_output_tokens } => {
                         (query, limit, max_output_tokens)
@@ -1465,8 +1503,7 @@ impl McpServer {
                 let configured = baseline.configured;
                 let external = baseline.external;
                 let limit = limit.unwrap_or(10).min(50);
-                let max_output_tokens =
-                    max_output_tokens.unwrap_or(tools::response::DEFAULT_OUTPUT_BUDGET_TOKENS);
+                let max_output_tokens = usize::MAX;
                 let outcome = tools::search::search_call(ct, move |cancel| {
                     if semantic {
                         tools::search::search_docs(
@@ -1496,7 +1533,13 @@ impl McpServer {
                     tools::search::docs_not_ready(action)
                 })
             }
-        }
+        }?;
+        let indexing = if reference {
+            self.state.reference_indexing()
+        } else {
+            self.state.workspace_indexing()
+        };
+        finish_indexed_search(response, indexing, budget)
     }
 
     /// Validate or execute SDBL (the 1C query language) against the configuration schema. Use
@@ -1838,7 +1881,7 @@ impl McpServer {
     /// and flag `budget_exhausted` on truncation. Lazily indexes on first use; while it
     /// builds, traversal returns a retry envelope — but `resolve` answers anyway, from the
     /// name dictionary, and names every source it could not consult.
-    #[tool(name = "graph", annotations(read_only_hint = true))]
+    #[tool(name = "graph", output_schema = tools::graph::graph_output_schema(), annotations(read_only_hint = true))]
     async fn graph(
         &self,
         params: Parameters<GraphParams>,
@@ -1846,6 +1889,20 @@ impl McpServer {
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let graph = self.state.graph().clone();
+        let loading_budget = match p.action.as_str() {
+            "source" => Some(p.max_output_tokens.unwrap_or(4000)),
+            "node" | "neighbors" | "callers" | "callees" => {
+                Some(p.max_output_tokens.unwrap_or(tools::graph::DEFAULT_BODY_BUDGET_TOKENS))
+            }
+            _ => None,
+        };
+        let finish_loading = |response| {
+            finish_indexed_search(
+                response,
+                indexing::Indexing::single(graph.indexing_snapshot()),
+                loading_budget,
+            )
+        };
 
         // `schema` is static and needs no loaded graph.
         if p.action == "schema" {
@@ -1856,8 +1913,12 @@ impl McpServer {
         // it and poll progress instead of reading a flat `loading` envelope from a data action.
         if p.action == "status" {
             graph.ensure_first_build();
-            let report = graph.status_report();
-            return Ok(tools::graph::status(&report));
+            let (report, target) = graph.status_report_with_indexing();
+            return finish_indexed_search(
+                tools::graph::status(&report),
+                indexing::Indexing::single(target),
+                None,
+            );
         }
 
         // Lazily trigger the background load on first use.
@@ -1873,7 +1934,16 @@ impl McpServer {
         if p.action == "resolve" {
             let query = require(p.query, "query", "resolve")?;
             let limit = p.top.unwrap_or(tools::graph::DEFAULT_RESOLVE_LIMIT);
-            return self.resolve_names(query, limit, ct).await;
+            let response = self.resolve_names(query, limit, ct).await?;
+            return if response
+                .structured_content
+                .as_ref()
+                .is_some_and(|body| body["status"] == "loading")
+            {
+                finish_loading(response)
+            } else {
+                Ok(response)
+            };
         }
 
         match graph.status() {
@@ -1887,7 +1957,7 @@ impl McpServer {
                 ))
             }
             GraphStatus::Idle | GraphStatus::Loading => {
-                return Ok(tools::graph::loading(Some(
+                return finish_loading(tools::graph::loading(Some(
                     "call graph is still indexing; retry shortly",
                 )))
             }
@@ -1901,7 +1971,7 @@ impl McpServer {
             if graph.superseded_latched() {
                 return Err(McpError::internal_error(crate::graph::SUPERSEDED_GRAPH_ERROR, None));
             }
-            return Ok(tools::graph::loading(None));
+            return finish_loading(tools::graph::loading(None));
         };
 
         tokio::task::spawn_blocking(move || {
@@ -2665,7 +2735,12 @@ impl McpServer {
         ct: tokio_util::sync::CancellationToken,
     ) -> Result<CallToolResult, McpError> {
         let started = std::time::Instant::now();
-        match SearchCommand::from(params.0) {
+        let command = SearchCommand::from(params.0);
+        let budget = indexed_search_budget(&command);
+        if budget.is_some() && ct.is_cancelled() {
+            return Err(McpError::internal_error("request cancelled", None));
+        }
+        let response = match command {
             SearchCommand::Status => {
                 let engine = self.state.search_engine().clone();
                 let progress = self.state.index_progress().clone();
@@ -2700,7 +2775,7 @@ impl McpServer {
                     ));
                 }
                 let semantic = matches!(&command, SearchCommand::SearchDocs { .. });
-                let (query, limit, max_output_tokens) = match command {
+                let (query, limit, _max_output_tokens) = match command {
                     SearchCommand::FindDocs { query, limit, max_output_tokens }
                     | SearchCommand::SearchDocs { query, limit, max_output_tokens } => {
                         (query, limit, max_output_tokens)
@@ -2708,8 +2783,7 @@ impl McpServer {
                     _ => unreachable!(),
                 };
                 let limit = limit.unwrap_or(10).min(50);
-                let max_output_tokens =
-                    max_output_tokens.unwrap_or(tools::response::DEFAULT_OUTPUT_BUDGET_TOKENS);
+                let max_output_tokens = usize::MAX;
                 let engine = self.state.search_engine().clone();
                 let baseline = self.state.baseline_view();
                 let configured_baseline = baseline.configured;
@@ -2749,7 +2823,9 @@ impl McpServer {
                 params.max_output_tokens.unwrap_or(tools::response::DEFAULT_OUTPUT_BUDGET_TOKENS),
             ),
             SearchCommand::SearchCode(_) => unreachable!("reference schema excludes search_code"),
-        }
+        }?;
+        let indexing = self.state.reference_indexing();
+        finish_indexed_search(response, indexing, budget)
     }
 
     /// Ask the ITS expert-help knowledge base a natural-language question about the 1C platform
@@ -4070,6 +4146,87 @@ mod graph_supersession_contract {
         release_the_lock.send(()).expect("the lock holder is still there to be released");
         lock.join().unwrap();
         server.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "serialize environment-dependent fixture across its async calls"
+    )]
+    async fn indexing_graph_responses() {
+        let env = crate::state::test_support::env_lock();
+        let _model = crate::state::test_support::EnvVarGuard::unset("EMBEDDING_MODEL");
+        let dir = tempfile::tempdir().unwrap();
+        crate::graph::test_support::sample_workspace(dir.path());
+        std::fs::write(dir.path().join("Configuration.xml"), "<Configuration/>").unwrap();
+        let state = SharedState::workspace(dir.path().to_path_buf()).unwrap();
+        let graph = state.graph().clone();
+        graph.ensure_loading();
+        crate::graph::test_support::wait_ready(&graph);
+        let server = McpServer::new(McpProfile::Workspace, state);
+        let token = tokio_util::sync::CancellationToken::new;
+        let schema =
+            serde_json::Value::Object(tools::graph::graph_output_schema().as_ref().clone());
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        for action in ["status", "schema", "overview"] {
+            let mut request = params(action, None);
+            request.0.max_output_tokens = Some(0);
+            let body = server.graph(request, token()).await.unwrap().structured_content.unwrap();
+            assert!(validator.is_valid(&body), "{body}");
+            assert_eq!(body.get("indexing").is_some(), action == "status");
+            if action == "status" {
+                assert_eq!(body["indexing"]["targets"][0]["kind"], "graph");
+                assert_eq!(body["indexing"]["targets"][0]["state"], "ready");
+                let mut missing = body.clone();
+                missing.as_object_mut().unwrap().remove("indexing");
+                assert!(!validator.is_valid(&missing));
+            }
+        }
+        let held: Vec<_> =
+            (0..crate::graph::SNAPSHOT_POOL_CAP).map(|_| graph.snapshot().unwrap()).collect();
+        for action in ["overview", "node", "source", "neighbors", "callers", "callees"] {
+            let request = params(action, Some("method/common/Сервер/Считать"));
+            let body = server.graph(request, token()).await.unwrap().structured_content.unwrap();
+            assert_eq!(body["status"], "loading");
+            // Pool exhaustion is a retry cause, not evidence that the native graph is loading.
+            assert_eq!(body["indexing"]["targets"][0]["state"], "ready");
+            assert!(validator.is_valid(&body), "{body}");
+            let mut missing = body;
+            missing.as_object_mut().unwrap().remove("indexing");
+            assert!(!validator.is_valid(&missing));
+            let mut tiny = params(action, Some("method/common/Сервер/Считать"));
+            tiny.0.max_output_tokens = Some(0);
+            let result = server.graph(tiny, token()).await;
+            if action == "overview" {
+                assert!(result.is_ok());
+            } else {
+                assert_eq!(result.unwrap_err().message, "budget_too_small");
+            }
+        }
+        drop(held);
+        // PendingWrite is a defensive resident-call outcome (normal reads hold its writer
+        // lock). Exercise its actual retry renderer and the graph boundary with live graph evidence.
+        let retry = cancellable_answer(
+            crate::diagnostics_state::CallOutcome::Superseded,
+            "graph resolve",
+            std::time::Instant::now(),
+            || tools::metadata::loading(&server.state.diagnostics().status_report()),
+        )
+        .unwrap();
+        let retry = finish_indexed_search(
+            retry,
+            indexing::Indexing::single(graph.indexing_snapshot()),
+            None,
+        )
+        .unwrap();
+        let body = retry.structured_content.unwrap();
+        assert_eq!(body["status"], "loading");
+        assert_eq!(body["indexing"]["targets"][0]["state"], "ready");
+        assert!(validator.is_valid(&body));
+        let response = server.graph(resolve_params("Массив"), token()).await.unwrap();
+        assert!(response.structured_content.unwrap().get("indexing").is_none());
+        server.shutdown();
+        drop(env);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

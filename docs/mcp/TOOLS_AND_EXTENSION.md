@@ -52,13 +52,13 @@
 
 ### Версии и lifecycle справочной поверхности
 
-`search` публикует tool-wide `outputSchema`: `search_code` (включая `not_ready`) — версии `5`,
-`find_docs` и `search_docs` (включая `not_ready`) — версии `4`; варианты различаются по
-`action` и `schema_version`. С контракта `2.3` у `search_code` свой номер: он вырос из-за
-`freshness.drift_watch`, а справочные действия не менялись и остались на `4` — схема `search`
-справочного профиля та же, что прежде;
+`search` публикует tool-wide `outputSchema`: `search_code` (включая `not_ready`) — версии `6`,
+`find_docs` и `search_docs` (включая `not_ready`) — версии `5`; варианты различаются по
+`action` и `schema_version`. Номера действий независимы: `search_code` ранее получил версию `5` из-за
+`freshness.drift_watch`. Контракт `3.0` добавляет indexing и повышает версии
+`search_code` до `6`, справочных действий до `5`;
 `list_platform` имеет версию `1`; `status` обоих профилей имеет точную форму
-`{action:"status",schema_version:"1",profile,state}`, где `state` —
+`{action:"status",schema_version:"2",profile,state,indexing}`, где `state` —
 `ready|loading|busy|failed`. `syntax_help` имеет версию `2`, а все успешные варианты
 `symbol_info`, включая transient `status="loading"`, — версию `1`.
 
@@ -453,15 +453,22 @@ MCP error с `reasonCode`; `list_platform` и `syntax_help` читают вст�
   как «не найдено»), перечни методов и конструкторов типа могут опустеть —
   нужный метод дешевле запросить точечно через `reference_id` (legacy-вход
   `name` + необязательный `type_name` также сохраняется);
-- `search` делает и то и другое: режет по границе находки, дописывает строку
-  `-- showing N of M results … --` и ставит `budget_exhausted: true` в `structuredContent`.
-  В отличие от `syntax_help`, одну запись «через силу» он не сохраняет: находка, которая
-  не влезает в бюджет целиком, не показывается, и ответ выглядит как `hits: []` при
-  `total` больше нуля — отличать такой ответ от настоящего нуля нужно по
-  `budget_exhausted`, а не по длине `hits`.
-  Бюджет считается по паре «текст + структура», потому что ответ несёт обе; если бы
-  считался только текст, фактический размер ответа превышал бы заявленный потолок примерно
-  на размер JSON.
+- `search` удаляет целые находки с хвоста, обновляет `shown`, `budget_exhausted`
+  и причину `output_budget` в `freshness`. Если исходный текст не помещается,
+  он заменяется компактным JSON-зеркалом без потери обязательных полей.
+  `hits: []` при `total > 0` означает усечение, а не отсутствие совпадений.
+  Для `search_code`, `find_docs`, `search_docs` размер B — UTF-8 байты всех текстовых
+  блоков плюс байты компактного `structuredContent`, без протокольного framing;
+  соблюдается B <= 4 * max_output_tokens. Сначала резервируется обязательный
+  пустой конверт с `indexing`, legacy/detail/degraded/freshness полями.
+  Если он не помещается, возвращается MCP invalid_params (-32602),
+  `message: "budget_too_small"`, `data: {reason: "budget_too_small",
+  minimum_output_tokens: ceil(B/4)}`. JSON и `indexing` не обрезаются.
+  Это же правило действует на graph loading для уже бюджетируемых действий
+  с исходным кодом. `search status`, `graph status/schema/resolve` сохраняют
+  исключения из бюджета. Hard errors и отмена запроса имеют прежний приоритет.
+  По умолчанию остаётся 6000 токенов; отказ на слишком маленьком бюджете требует
+  machine contract `3.0`.
 
 Где помимо бюджета действует ещё и счётчик (`limit` у `event_log` и `query execute`,
 `max_findings` у `diagnostics file`), при срабатывании обоих ограничений подсказка прямо
@@ -832,11 +839,10 @@ config reload.
 `{status: "not_ready", detail, retry_after_ms, progress: {active, …}}` в `structuredContent`
 плюс зеркало в виде JSON-текста — программный потребитель читает машиночитаемое состояние,
 а не разбирает строку. Флаг `progress.active` есть всегда (идёт сборка vs ещё не считает),
-а числовые счётчики (`pct`, `batches`, `chunks`) добавляются только при `active: true` —
-неактивный объект прогресса может держать устаревшие итоги прошлой попытки (он не
-сбрасывается), и показывать их как текущие было бы враньём. `search(action=status)` ведёт
-себя так же: при активной индексации печатает `Indexing in progress` со счётчиками, а в фазе
-инициализации — честную строку `Indexing pending: initializing`, а не голую «building».
+а числовые счётчики (`batches`, `chunks`) доступны только для согласованного sample
+активной running-фазы; `pct` — только при total > 0. В persistence без счётчиков,
+waiting и terminal состояниях устаревшие числа не публикуются. Текст, legacy progress
+и `indexing` строятся из одного sample; готовность каждой цели читается из `indexing`.
 
 ### Структурная выдача поиска
 
@@ -844,7 +850,7 @@ config reload.
 `structuredContent`. Машинный потребитель читает поля, а не разбирает колонки:
 
 ```json tool=search
-{"action":"search_code","schema_version":"5",
+{"action":"search_code","schema_version":"6",
  "hits":[{"rank":1,"modality":"L","root_id":"","path":"CommonModules/Утилиты/Ext/Module.bsl",
           "line_start":181,"line_end":201,"symbol":"ПроверитьИНН","kind":"procedure",
           "graph_id":"method/common/Утилиты/ПроверитьИНН",
@@ -853,7 +859,10 @@ config reload.
                                          "end_line":201,"end_character":0},
                       "position_encoding":"utf-16","schema_version":"1"},
           "snippet":"Процедура ПроверитьИНН(…)\n…","snippet_truncated_lines":16}],
- "shown":10,"total":10,
+ "shown":1,"total":1,
+ "indexing":{"schema_version":"1","targets":[
+   {"kind":"lexical","state":"ready","phase":null,"progress":null,"pass_id":null,"reason_code":null},
+   {"kind":"semantic","state":"ready","phase":null,"progress":null,"pass_id":null,"reason_code":null}]},
  "freshness":{"source":"search-index","revision":null,"topology_fingerprint":null,
               "stale":null,"drift_watch":"watching",
               "completeness":{"status":"complete","reasons":[]}}}
@@ -1100,3 +1109,82 @@ connection URL и учётные данные не записывают.
 - `docs/mcp/SETUP.md` — установка с нуля (бинарник, PATH, LSP-плагин, верификация)
 - `docs/mcp/README.md` — установка профилей, scope'ы и `mcp install`
 - `docs/central-postgres-search/README.md` — centralized baseline для поиска
+
+
+### Структурированный прогресс индексации
+
+Machine contract `3.0` публикуется через `bsl-analyzer contract` и ресурс
+`bsl-analyzer://contract`; схемы доступны в `tools/list`. Версии: search hits/not-ready
+`5`, search status `2`, graph schema descriptor `34`, indexing `1`;
+`list_platform` остаётся `1`. У legacy graph status/loading нет нового корневого
+`schema_version`.
+
+| Успешный ответ | Цели в `indexing.targets` |
+| --- | --- |
+| Workspace `search status`, `search_code`, включая fallback/not-ready/пустую выдачу | lexical, semantic |
+| `find_docs`, `search_docs` обоих профилей; reference `search status` | reference |
+| `graph status` и graph loading, включая resolve retry | graph |
+
+Обычные graph data/schema, `list_platform` и ответы других инструментов вне этого
+контракта. Hard RPC errors остаются ошибками. Отмена одного запроса не отменяет
+общий worker. Ответы не добавляют provider/SQL probes ради telemetry; неизвестное
+состояние не запускает восстановление индекса.
+
+Каждая цель содержит ровно шесть ключей `kind`, `state`, `phase`, `progress`,
+`pass_id`, `reason_code`, включая явные null. Цели уникальны, порядок
+`graph`, `lexical`, `semantic`, `reference`, максимум четыре.
+
+- `state`: `waiting|running|ready|disabled|failed|cancelled|superseded|unknown`.
+- `phase`: `initializing|parsing|lexical_indexing|embedding|persisting` или null;
+  только native-фаза. У graph/reference phase, counters и pass_id — null.
+- `progress`: null либо `{completed: unsigned, total: unsigned|null,
+  unit: files|chunks|batches}`. Только согласованные счётчики активного running;
+  для embedding предпочтительны chunks, затем batches. Completed не больше total;
+  противоречивый sample даёт null. Нет общей процентной шкалы; total=0/null
+  не даёт процента. Счётчики монотонны только внутри одного pass/phase/unit.
+- `pass_id`: null либо 32 lowercase hex, двоеточие, положительный u64 sequence,
+  максимум 53 ASCII байта. Завершённый ID сохраняется до нового begin;
+  загруженный с диска ready может иметь null.
+- `reason_code`: null либо `initializing`, `pending_work`, `semantic_disabled`,
+  `coverage_unverified`, `identity_unverified`, `baseline_unavailable`,
+  `overlay_pending`, `stale_generation`, `snapshot_unavailable`, `native_failure`,
+  `cancelled`, `superseded`. Raw errors и пути не попадают в это поле.
+  Ready и native running имеют null; failed/cancelled/superseded имеют одноимённую
+  причину (для failed — native_failure); disabled — semantic_disabled.
+
+Пример: lexical уже готов, semantic ещё считает chunks. Legacy progress и текст
+используют тот же sample; counter equality сама по себе не доказывает ready.
+
+```json tool=search
+{"action":"search_code","schema_version":"6","status":"not_ready",
+ "detail":"semantic indexing","retry_after_ms":1500,
+ "progress":{"active":true,"chunks":{"done":12,"total":48},"batches":{"done":1,"total":4},"pct":25},
+ "indexing":{"schema_version":"1","targets":[
+  {"kind":"lexical","state":"ready","phase":null,"progress":null,"pass_id":null,"reason_code":null},
+  {"kind":"semantic","state":"running","phase":"embedding",
+   "progress":{"completed":12,"total":48,"unit":"chunks"},
+   "pass_id":"0123456789abcdef0123456789abcdef:4","reason_code":null}]}}
+```
+
+```json tool=graph
+{"status":"loading","indexing":{"schema_version":"1","targets":[
+ {"kind":"graph","state":"running","phase":null,"progress":null,"pass_id":null,"reason_code":null}]}}
+```
+
+Semantic ready требует текущих coverage и model/dimension identity, успешной
+финальной persistence/publication и отсутствия dirty/rerun/overlay debt.
+Конфигурация provider, успешная query embedding или равенство счётчиков этого
+не доказывают. Непроверенный SQLite BLOB fallback остаётся unknown/identity_unverified;
+пустая область готова только после успешной публикации. Ошибка query provider
+не отменяет уже доказанную готовность индекса, а сохраняет fallback/degraded semantics.
+
+Remote evidence использует существующий publication marker того же snapshot и
+fingerprint, подходящий model/dimension и свежий cache (TTL 60 секунд), плюс
+опубликованный overlay без pending/unembedded/unread debt. Истёкший cache,
+смена generation и probe in flight дают unknown/stale_generation; отсутствие
+coverage/identity — соответствующий unknown. Graph stale — waiting/stale_generation,
+reload — running; ошибки и terminal outcomes сохраняются до нового запуска.
+
+Strict consumers квалифицируют `3.0` перед своим развёртыванием. Rollback — предыдущий
+квалифицированный binary и соответствующий contract, без конвертации индекса.
+Отсутствие `indexing` у старого контракта означает недоступную telemetry, не готовность.
