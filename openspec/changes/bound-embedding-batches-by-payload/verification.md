@@ -1,6 +1,6 @@
 ## Status
 
-Architecture readiness: GO. D1 was accepted and final independent re-review completed without mandatory findings on 2026-09-11. Implementation, independent review/remediation and final verification are complete as of 2026-09-11. All mandatory local acceptance passed; executed checks and their limits are recorded below.
+Architecture readiness: GO. D1 was accepted and final independent re-review completed without mandatory findings on 2026-09-11. Implementation, independent review/remediation and local final verification completed on 2026-09-11. The subsequent PR #148 Windows CI failure is being corrected under the user's 2026-09-12 instruction; its current evidence is recorded below.
 
 ## Source-backed baseline before implementation
 
@@ -189,3 +189,9 @@ CRITICAL/mandatory findings: zero. Unverified mandatory risks: zero. Optional su
 ## Publication handoff — 2026-09-12
 
 The user requested a PR, authorizing one scoped commit and publication of `feat/bound-embedding-batches-by-payload`. The reviewed 30-file Rust manifest is unchanged, so the final implementation checks above apply to the published code. Live `upstream/develop` remains `7133432d`; the current parent `fa4693c0` is the open draft PR #142, which itself includes the earlier PR #119 changes. Publish this change as a draft against `itrous/bsl-analyzer:develop`, explicitly identifying #142 as its landing dependency and linking the payload-only diff from `fa4693c0`. No archive or release is part of this publication.
+
+## PR #148 CI repair — 2026-09-12
+
+Run `34686984149` on `047744180e7df064b482d5035b3e93e772598a82` passed Linux Check but failed Windows lifecycle tests. The shared native `PayloadServer` accepted from a nonblocking listener, then attempted blocking-style reads without resetting the accepted stream mode. Windows reported `WouldBlock` (10035) at `payload_tests.rs:44`; the server thread panicked and the reference recovery test later failed `recovered.written`. All native payload callers share this fixture. The separate MCP endpoint uses a blocking listener and does not have this mode mismatch.
+
+G6 explicitly sets the accepted native stream to blocking mode before applying the existing two-second read/write timeouts. Listener polling, shutdown, the watchdog, assertions and production transport/retry/publication behavior remain unchanged. The user authorized scoped fixes and repeated commit/push until CI succeeds. Local correction checks PASS: exact reference recovery (1), all native payload tests (19), Windows-job lifecycle selection (44), fmt and `cargo clippy -p bsl-search --all-targets --all-features -- -D warnings`. Independent read-only ponytail and implementation-versus-plan reviews returned GO with zero mandatory findings. New remote CI is still pending; these Linux results are not represented as Windows acceptance.

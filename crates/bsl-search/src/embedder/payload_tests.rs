@@ -36,6 +36,8 @@ impl PayloadServer {
                     }
                     Err(e) => panic!("loopback accept: {e}"),
                 };
+                // Use timeout-bounded blocking I/O even when accept inherits the listener mode.
+                stream.set_nonblocking(false).unwrap();
                 stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
                 stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
                 let mut bytes = Vec::new();
