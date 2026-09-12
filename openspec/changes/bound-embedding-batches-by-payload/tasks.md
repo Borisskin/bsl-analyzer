@@ -32,9 +32,4 @@ After T12's repository gates pass, keep the cursor at T12 with stage `ревью
 - [x] G3 Align overlay embedding-failure status prose with the existing search_code lexical fallback. Optional P3 from MCP review; verify status tests preserve the structured failure.
 - [x] G4 Make the new standalone invalid-config regression satisfy the mandatory clippy err_expect lint without adding Debug requirements to production types. Verify the regression and workspace clippy.
 - [x] G5 Correct verification totals to count only each Cargo target's final summary, excluding child-test summaries, and finish the bounded MCP evidence collection. Verify the collector against nested-summary and incomplete-target cases; production source remains unchanged.
-<!-- GOAL_CURSOR -->
-- [ ] G6 Restore blocking, timeout-bounded reads in the shared native payload HTTP fixture after nonblocking accept. Verify the failed reference recovery test, payload/lifecycle suites and Linux/Windows CI on the pushed PR head.
-  - Этап цикла: финальная проверка
-  - Состояние шага: socket fix прошёл exact reference recovery, payload 19/19, lifecycle 44/44, fmt и strict bsl-search clippy; оба независимых ревью GO.
-  - Следующее действие: опубликовать исправление и дождаться Linux/Windows CI на новом SHA; G6 остаётся открытым до remote success.
-  - Файлы шага: crates/bsl-search/src/embedder/payload_tests.rs, openspec/changes/bound-embedding-batches-by-payload/tasks.md, openspec/changes/bound-embedding-batches-by-payload/verification.md.
+- [x] G6 Restore blocking, timeout-bounded reads in the shared native payload HTTP fixture after nonblocking accept. Exact reference recovery, payload/lifecycle suites, independent reviews and Linux/Windows CI passed on pushed commit `64f43f61`; run `34690117313` completed successfully.

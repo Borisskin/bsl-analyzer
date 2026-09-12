@@ -1,6 +1,6 @@
 ## Status
 
-Architecture readiness: GO. D1 was accepted and final independent re-review completed without mandatory findings on 2026-09-11. Implementation, independent review/remediation and local final verification completed on 2026-09-11. The subsequent PR #148 Windows CI failure is being corrected under the user's 2026-09-12 instruction; its current evidence is recorded below.
+Architecture readiness: GO. D1 was accepted and final independent re-review completed without mandatory findings on 2026-09-11. Implementation, independent review/remediation and local final verification completed on 2026-09-11. The subsequent PR #148 Windows CI failure was corrected under the user's 2026-09-12 instruction; Linux and Windows CI passed on `64f43f61`, with evidence recorded below.
 
 ## Source-backed baseline before implementation
 
@@ -164,7 +164,7 @@ Repeat read-only ponytail-review returned zero mandatory findings. Repeat native
 
 ## Final verification
 
-Completeness: all 12 original tasks and G1–G5 are checked; all 5 requirements and 13 scenarios have the executed Code/Test mappings above. Correctness: independent reviews and targeted regressions found no unresolved requirement divergence. Coherence: the implementation follows the locked planner, existing execution/runtime owners, exact version and budget policies; no new dependency or persistent infrastructure. The final repository gates passed on the unchanged reviewed source; their corrected totals and bounded runtime evidence are recorded below.
+Completeness: all 12 original tasks and G1–G6 are checked; all 5 requirements and 13 scenarios have the executed Code/Test mappings above. Correctness: independent reviews and targeted regressions found no unresolved requirement divergence. Coherence: the implementation follows the locked planner, existing execution/runtime owners, exact version and budget policies; no new dependency or persistent infrastructure. The final implementation gates passed on the reviewed source; their corrected totals and bounded runtime evidence are recorded below. The later G6 fixture correction and remote CI evidence are recorded in the CI repair section.
 
 G4: final clippy rejected `err().expect()` in the new G2 standalone regression. A direct `let Err(error) = result else { panic!(...) }` preserves the assertion without adding a Debug implementation solely for tests. No production behavior changed. Configuration regressions PASS (3); fmt PASS; full workspace/all-targets/all-features clippy with `-D warnings` PASS (4.75 s). Repeat reviews cover this final test-only correction.
 
@@ -178,7 +178,7 @@ Final bounded MCP acceptance: both exact current-binary cases PASS under externa
 
 | Dimension | Verified result |
 | --- | --- |
-| Completeness | 17/17 tasks: 12 original plus G1–G5; 5/5 requirements and 13/13 scenarios mapped to current Code/Test evidence. |
+| Completeness | 18/18 tasks: 12 original plus G1–G6; 5/5 requirements and 13/13 scenarios mapped to current Code/Test evidence. |
 | Correctness | Native/CLI and MCP independent reviews are clean after corrections; all required positive/negative fixture families ran nonzero tests. |
 | Coherence | Locked D1, linear shared planner, existing worker/publication/lifecycle owners, compatible schemas and minimum budget policy preserved. |
 
@@ -194,4 +194,6 @@ The user requested a PR, authorizing one scoped commit and publication of `feat/
 
 Run `34686984149` on `047744180e7df064b482d5035b3e93e772598a82` passed Linux Check but failed Windows lifecycle tests. The shared native `PayloadServer` accepted from a nonblocking listener, then attempted blocking-style reads without resetting the accepted stream mode. Windows reported `WouldBlock` (10035) at `payload_tests.rs:44`; the server thread panicked and the reference recovery test later failed `recovered.written`. All native payload callers share this fixture. The separate MCP endpoint uses a blocking listener and does not have this mode mismatch.
 
-G6 explicitly sets the accepted native stream to blocking mode before applying the existing two-second read/write timeouts. Listener polling, shutdown, the watchdog, assertions and production transport/retry/publication behavior remain unchanged. The user authorized scoped fixes and repeated commit/push until CI succeeds. Local correction checks PASS: exact reference recovery (1), all native payload tests (19), Windows-job lifecycle selection (44), fmt and `cargo clippy -p bsl-search --all-targets --all-features -- -D warnings`. Independent read-only ponytail and implementation-versus-plan reviews returned GO with zero mandatory findings. New remote CI is still pending; these Linux results are not represented as Windows acceptance.
+G6 explicitly sets the accepted native stream to blocking mode before applying the existing two-second read/write timeouts. Listener polling, shutdown, the watchdog, assertions and production transport/retry/publication behavior remain unchanged. The user authorized scoped fixes and repeated commit/push until CI succeeds. Local correction checks PASS: exact reference recovery (1), all native payload tests (19), Windows-job lifecycle selection (44), fmt and `cargo clippy -p bsl-search --all-targets --all-features -- -D warnings`. Independent read-only ponytail and implementation-versus-plan reviews returned GO with zero mandatory findings.
+
+[CI run `34690117313`](https://github.com/itrous/bsl-analyzer/actions/runs/34690117313) completed successfully on exact commit `64f43f61fb88c03a50ed1e30c59cab7b2da54ed7`: Linux Check PASS (15m51s), including fmt, clippy, portable lease/lifecycle regressions and the full `cargo test --all --no-fail-fast`; Windows MCP transports + secure broker PASS (21m10s). The Windows log explicitly reports `payload_reference_publication_preserves_lexical_failure_then_retries_in_order ... ok`; all configured Windows test steps passed. The release-only 1.6M gate was skipped as expected for this PR. G6 is closed with no remaining mandatory finding; this remote result supplements the original local qualification without claiming customer/provider/remote SQL acceptance.
