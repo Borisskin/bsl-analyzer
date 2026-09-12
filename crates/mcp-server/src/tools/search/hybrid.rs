@@ -1,11 +1,14 @@
 use super::lexical::lexical_code_hits;
-use super::render::{format_code_hits, hits_response, no_hits_response, Envelope, WorkspaceFacts};
+use super::render::{
+    code_hit_blocks, failure_hits_response, format_code_hits, hits_response, no_hits_response,
+    not_ready_with_failure, Envelope, WorkspaceFacts,
+};
 use super::semantic::semantic_code_hits;
 use super::status::search_not_ready;
-use super::types::{CodeHits, SearchFailure, HYBRID_FETCH_MULTIPLIER};
+use super::types::{CodeHits, SearchFailure, SemanticUnavailable, HYBRID_FETCH_MULTIPLIER};
 use crate::baseline::{ConfiguredBaselineStatus, ExternalBaselineService};
 use crate::state::{SemanticRuntimeStatus, WorkspaceSearchMode};
-use bsl_search::{fuse_smart, FusedHit, IndexProgress};
+use bsl_search::{fuse_smart, EmbeddingFailure, FusedHit, IndexProgress};
 use rmcp::model::CallToolResult;
 use rmcp::ErrorData as McpError;
 use std::fmt::Write;
@@ -52,6 +55,7 @@ pub fn hybrid_code(
         engine,
         &CancellationToken::new(),
         semantic_runtime,
+        None,
         workspace_search_mode,
         configured_baseline,
         external_baseline,
@@ -72,6 +76,7 @@ pub fn hybrid_code_cancellable(
     engine: &crate::state::SharedSearchEngine,
     cancel: &CancellationToken,
     semantic_runtime: &Arc<Mutex<SemanticRuntimeStatus>>,
+    overlay_failure: Option<EmbeddingFailure>,
     workspace_search_mode: WorkspaceSearchMode,
     configured_baseline: Option<&ConfiguredBaselineStatus>,
     external_baseline: Option<Arc<ExternalBaselineService>>,
@@ -81,6 +86,7 @@ pub fn hybrid_code_cancellable(
     max_output_tokens: usize,
     watch: WorkspaceFacts,
 ) -> Result<CallToolResult, SearchFailure> {
+    let mut failure = overlay_failure.or_else(|| semantic_runtime.lock().ok()?.embedding_failure());
     // Over-fetch each modality so a hit ranked just outside `limit` in one but boosted by the
     // other can still surface after fusion.
     let fetch = limit.saturating_mul(HYBRID_FETCH_MULTIPLIER).max(limit);
@@ -100,15 +106,21 @@ pub fn hybrid_code_cancellable(
         // structured not-ready envelope (machine status + live counters + retry hint),
         // matching the graph tool, rather than a bare sentence a poller must parse.
         CodeHits::Pending(message) => {
-            return Ok(search_not_ready(&message, index_progress, "search_code"));
+            return Ok(not_ready_with_failure(
+                search_not_ready(&message, index_progress, "search_code"),
+                failure,
+            ));
         }
         // Lexical search is always available, so it never reports a semantic shortfall; treat
         // it defensively as "still building".
         CodeHits::Unavailable(_) => {
-            return Ok(search_not_ready(
-                "Search index is being built, please try again in a moment.",
-                index_progress,
-                "search_code",
+            return Ok(not_ready_with_failure(
+                search_not_ready(
+                    "Search index is being built, please try again in a moment.",
+                    index_progress,
+                    "search_code",
+                ),
+                failure,
             ));
         }
     };
@@ -118,16 +130,20 @@ pub fn hybrid_code_cancellable(
     if cancel.is_cancelled() {
         return Err(SearchFailure::Cancelled);
     }
-    let semantic = semantic_code_hits(
-        engine,
-        cancel,
-        semantic_runtime,
-        workspace_search_mode,
-        configured_baseline,
-        external_baseline,
-        query,
-        fetch,
-    )?;
+    let semantic = if let Some(failure) = failure {
+        CodeHits::Unavailable(SemanticUnavailable::EmbeddingFailed(failure))
+    } else {
+        semantic_code_hits(
+            engine,
+            cancel,
+            semantic_runtime,
+            workspace_search_mode,
+            configured_baseline,
+            external_baseline,
+            query,
+            fetch,
+        )?
+    };
 
     let (mut hits, note): (Vec<FusedHit>, Option<String>) = match semantic {
         CodeHits::Ready { hits: sem_hits, .. } => {
@@ -139,6 +155,7 @@ pub fn hybrid_code_cancellable(
         // them to one generic note.
         CodeHits::Pending(message) => (fuse_smart(&lex_hits, &[], query, limit), Some(message)),
         CodeHits::Unavailable(reason) => {
+            failure = failure.or(reason.embedding_failure());
             (fuse_smart(&lex_hits, &[], query, limit), Some(reason.note()))
         }
     };
@@ -147,6 +164,19 @@ pub fn hybrid_code_cancellable(
     // Unknown is not zero: an answer served past the overlay cannot vouch for what it owes.
     let overlay_unknown = overlay.is_none() && watch.drift_watch.is_some();
     let facts = WorkspaceFacts { pending, unread, overlay_unknown, ..watch };
+
+    if let Some(failure) = failure {
+        return Ok(failure_hits_response(
+            code_hit_blocks(&hits, roots.as_ref()),
+            MODALITY_LEGEND,
+            note.as_deref(),
+            Envelope::Yes,
+            "search_code",
+            failure,
+            max_output_tokens,
+            Some(&facts),
+        ));
+    }
 
     if hits.is_empty() {
         // The text stays the bare sentence it has always been; the degradation reaches a

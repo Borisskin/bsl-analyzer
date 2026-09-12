@@ -52,14 +52,14 @@
 
 ### Версии и lifecycle справочной поверхности
 
-`search` публикует tool-wide `outputSchema`: `search_code` (включая `not_ready`) — версии `5`,
-`find_docs` и `search_docs` (включая `not_ready`) — версии `4`; варианты различаются по
-`action` и `schema_version`. С контракта `2.3` у `search_code` свой номер: он вырос из-за
-`freshness.drift_watch`, а справочные действия не менялись и остались на `4` — схема `search`
-справочного профиля та же, что прежде;
+`search` публикует tool-wide `outputSchema`: `search_code` (включая `not_ready`) — версии `6`,
+`find_docs` и `search_docs` (включая `not_ready`) — версии `5`.
+Обе поверхности добавляют необязательную диагностику `semantic_failure`;
+`search_code` сохраняет `freshness.drift_watch`.
 `list_platform` имеет версию `1`; `status` обоих профилей имеет точную форму
-`{action:"status",schema_version:"1",profile,state}`, где `state` —
-`ready|loading|busy|failed`. `syntax_help` имеет версию `2`, а все успешные варианты
+`{action:"status",schema_version:"2",profile,state}` с необязательным
+`semantic_failure`, где `state` — `ready|loading|busy|failed`.
+Машинный контракт имеет версию `2.3`. `syntax_help` имеет версию `2`, а все успешные варианты
 `symbol_info`, включая transient `status="loading"`, — версию `1`.
 
 Справочный индекс проходит состояния `Uninitialized → Loading → Ready` либо `Failed`.
@@ -462,6 +462,13 @@ MCP error с `reasonCode`; `list_platform` и `syntax_help` читают вст�
   Бюджет считается по паре «текст + структура», потому что ответ несёт обе; если бы
   считался только текст, фактический размер ответа превышал бы заявленный потолок примерно
   на размер JSON.
+  Для ответа с `semantic_failure` до отбора находок учитываются весь объект отказа,
+  текст, `degraded` и `freshness`: фактические байты UTF-8 текста плюс компактного JSON
+  должны укладываться в `4 * max_output_tokens`. Если даже обязательный пустой конверт
+  не помещается, возвращается именно он с `hits: []` и `budget_exhausted: true`.
+  Поле отказа сохраняется; превышение этого минимума не превращается в новую RPC-ошибку.
+  У `search action=status` параметра token-бюджета нет; RPC-ошибки и существующие
+  `not_ready`-конверты не являются выдачей находок с этим бюджетом.
 
 Где помимо бюджета действует ещё и счётчик (`limit` у `event_log` и `query execute`,
 `max_findings` у `diagnostics file`), при срабатывании обоих ограничений подсказка прямо
@@ -822,7 +829,7 @@ config reload.
 
 Включает семантическую составляющую поиска:
 
-- `search_docs` в `reference`;
+- `search_docs` в профилях `reference` и `workspace`;
 - семантическую ветвь `search_code` в `workspace` (лексическая ветвь работает всегда).
 
 Без этой переменной `search_code` возвращает только лексические результаты с пометкой
@@ -853,7 +860,7 @@ config reload.
                                          "end_line":201,"end_character":0},
                       "position_encoding":"utf-16","schema_version":"1"},
           "snippet":"Процедура ПроверитьИНН(…)\n…","snippet_truncated_lines":16}],
- "shown":10,"total":10,
+ "shown":1,"total":1,
  "freshness":{"source":"search-index","revision":null,"topology_fingerprint":null,
               "stale":null,"drift_watch":"watching",
               "completeness":{"status":"complete","reasons":[]}}}
@@ -901,7 +908,7 @@ config reload.
   адресует ту же карточку в `syntax_help`, `owner` называет владеющий тип. У находки по
   коду этих полей нет: чанк кода в каталоге платформы не опознаётся.
 
-В справочном профиле (`find_docs` / `search_docs`) конверт тот же, но вместо `modality` и
+В справочных действиях обоих профилей (`find_docs` / `search_docs`) конверт тот же, но вместо `modality` и
 `graph_id` — `score` ранкера; `root_id` там нет вовсе — справочный корпус не делится на
 корни рабочего пространства, и различать его находки нечем и незачем. Он сопоставим внутри одного ответа и бессмысленен между
 запросами и бэкендами. Служебные состояния (`not_ready`) остаются структурными и в этом
@@ -913,6 +920,91 @@ config reload.
 секрет-редактируются: строковый литерал маскируется как `***`, только если в той же
 инструкции ему предшествует чувствительный маркер (идентификатор вроде `Токен` или ключ
 `Вставить("Пароль", …)`); структурные литералы и сообщения сохраняются.
+
+### Ошибки эмбеддингов
+
+`semantic_failure` — необязательный объект с обязательным `code` из закрытого
+списка ниже. Только локальный отказ по точно измеренному размеру добавляет пару
+неотрицательных целых `request_bytes` и `max_request_bytes`. HTTP 413 сам по себе
+этих чисел не устанавливает. Других полей, произвольных сообщений, URL, исходного
+текста, credentials и raw body провайдера в объекте и embedding-диагностике нет.
+
+| `code` | Причина |
+| --- | --- |
+| `embedding_invalid_config` | Неверный `EMBEDDING_MAX_REQUEST_BYTES` или нулевой лимит библиотеки |
+| `embedding_input_too_large` | Один документ с полным JSON-конвертом превышает лимит |
+| `embedding_request_too_large` | Прямой multi-input вызов превышает лимит либо получен HTTP 413 |
+| `embedding_response_too_large` | Превышен существующий предел чтения ответа 10 MiB |
+| `embedding_timeout` | Истёк таймаут embedding-запроса |
+| `embedding_transport_error` | Ошибка соединения, I/O, DNS, TLS или протокола |
+| `embedding_provider_error` | Другой ошибочный HTTP status провайдера |
+| `embedding_invalid_response` | Невалидный JSON, число/индексы векторов или их форма |
+| `embedding_failed` | Прочая embedding-ошибка без безопасной точной классификации |
+
+Предел запроса — по умолчанию 1 MiB; [настройка, разбиение, повторы и откат](README.md#размер-embedding-запросов-и-повторные-попытки)
+описаны отдельно. Он не меняет предел чтения ответа.
+
+| Граница ответа | Как виден отказ |
+| --- | --- |
+| `workspace`: `search action=status` | Текущий отказ workspace/overlay в `structuredContent.semantic_failure`, независимо от `state` лексики |
+| `workspace`: `search_code` | Отказ сборки или запроса при лексическом fallback, в том числе при нуле находок; сохраняются `degraded` и `freshness` |
+| `reference`: `search action=status` | Отказ семантической сборки справки; `state=ready` может означать готовую лексику |
+| Оба профиля: `find_docs` | Лексические результаты или прежний `not_ready` с известным отказом семантической сборки справки |
+| Оба профиля: `search_docs` | RPC error с фиксированным сообщением и `data.semantic_failure` при известном отказе сборки или запроса |
+
+Отсутствие поля означает отсутствие известного текущего отказа и не доказывает
+готовность. Отказ сборки хранит её существующий владелец до начала новой попытки
+или успешного завершения; отказ отдельного query остаётся только в его ответе.
+Успешный транспортный retry не оставляет предшествующую transient-ошибку.
+Если одновременно известны отказы overlay и основной workspace-сборки, выбирается
+overlay; состояние другого владельца не сбрасывается. Чтение статуса не вызывает
+провайдера и не сканирует хранилище. Отмена и terminal baseline/policy ошибки
+сохраняют свой приоритет и прежний формат; `graph` и `list_platform` поля не получают.
+
+Например, сборка справки сохранила лексический корпус, но получила HTTP 413.
+Статус `reference` остаётся лексически готовым:
+
+```json tool=search
+{"action":"status","schema_version":"2","profile":"reference","state":"ready",
+ "semantic_failure":{"code":"embedding_request_too_large"}}
+```
+
+`find_docs` в любом профиле продолжает отвечать, даже если лексических совпадений нет:
+
+```json tool=search
+{"action":"find_docs","schema_version":"5","hits":[],"shown":0,"total":0,
+ "semantic_failure":{"code":"embedding_request_too_large"}}
+```
+
+Локальный отказ workspace-сборки сообщает измеренные байты:
+
+```json tool=search
+{"action":"status","schema_version":"2","profile":"workspace","state":"ready",
+ "semantic_failure":{"code":"embedding_input_too_large",
+                     "request_bytes":1048577,"max_request_bytes":1048576}}
+```
+
+После timeout query `search_code` может вернуть пустой лексический fallback;
+этот отказ не меняет состояние уже построенного индекса:
+
+```json tool=search
+{"action":"search_code","schema_version":"5","hits":[],"shown":0,"total":0,
+ "degraded":"semantic skipped: embedding failed",
+ "semantic_failure":{"code":"embedding_timeout"},
+ "freshness":{"source":"search-index","revision":null,"topology_fingerprint":null,
+              "stale":null,"completeness":{"status":"partial",
+                "reasons":[{"code":"modality_degraded","detail":"semantic skipped: embedding failed"}]}}}
+```
+
+Для `search_docs` в обоих профилях timeout возвращает RPC `error` ниже, а не пустой
+успешный результат. Это объект ошибки, не `structuredContent`; его `data` проверяется
+отдельно от успешной `outputSchema`. Не связанные с embeddings ошибки сохраняют
+свои существующие `reasonCode`.
+
+```json tool=search:error
+{"code":-32603,"message":"Semantic embedding failed; use lexical search or retry.",
+ "data":{"semantic_failure":{"code":"embedding_timeout"}}}
+```
 
 ### `EMBEDDING_API_KEY`
 

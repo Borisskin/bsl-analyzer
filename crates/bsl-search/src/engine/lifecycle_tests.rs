@@ -88,6 +88,7 @@ fn server(requests: usize) -> (Embedder, std::thread::JoinHandle<Vec<String>>) {
             dim: Some(3),
             api_key: None,
             provider: None,
+            ..Default::default()
         }),
         thread,
     )
@@ -258,6 +259,464 @@ fn vector_lifecycle_refusal_and_failure_retain_earlier_committed_batch() {
         assert_eq!(terminal["committed_totals"]["embeddings_written"], 1);
         assert_eq!(terminal["pending"], 1);
     }
+}
+
+#[test]
+fn payload_pending_publication_retains_commits_and_recovers_in_both_paths() {
+    use crate::embedder::payload_tests::{success, vector, PayloadServer};
+    for fenced in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("search.db");
+        let store = seed(&path, 1, 3);
+        let preserved = store.load_all_embeddings(3).unwrap()[0].clone();
+        let pending = store.load_pending_embedding_documents("code").unwrap();
+        let texts: Vec<_> = pending
+            .iter()
+            .map(|(_, doc)| crate::document::semantic_text_for_indexed_document(doc))
+            .collect();
+        let limit = texts
+            .iter()
+            .map(|text| {
+                serde_json::json!({"model":"fixture","input":[text],"dimensions":3})
+                    .to_string()
+                    .len()
+            })
+            .max()
+            .unwrap();
+        let server =
+            PayloadServer::new(
+                |i, body| if i == 1 { (413, "rejected".into()) } else { success(i, body) },
+            );
+        let embedder = Embedder::new(server.config(limit));
+        let progress = IndexProgress::new();
+        let mut retry = || false;
+        let error = SearchEngine::run_embedding_pass(
+            &store,
+            &embedder,
+            3,
+            32,
+            2,
+            Some(&progress),
+            None,
+            &mut |op| FenceOutcome::Applied(op()),
+            if fenced { Some(&mut retry) } else { None },
+        )
+        .err()
+        .expect("known later failure");
+        assert_eq!(error.to_string(), "embedding_request_too_large");
+        assert!(!progress.active.load(Ordering::Relaxed));
+        assert_eq!(progress.total_batches.load(Ordering::Relaxed), 3);
+        let committed = store.load_all_embeddings(3).unwrap();
+        assert!(committed.contains(&preserved));
+        assert_eq!(committed.len(), if fenced { 2 } else { 3 });
+        for (id, embedding) in committed.iter().filter(|row| row.0 != preserved.0) {
+            let i = pending.iter().position(|(key, _)| key == id).unwrap();
+            assert_eq!(*embedding, vector(&texts[i]));
+        }
+        assert!(!path.with_extension("db.usearch.json").exists());
+        let remaining = store.load_pending_embedding_documents("code").unwrap().len();
+        assert_eq!(remaining, 4 - committed.len());
+        assert!(server.requests().iter().all(|body| body.len() <= limit));
+        let before = server.requests().len();
+        let (index, outcome) = SearchEngine::run_embedding_pass(
+            &store,
+            &embedder,
+            3,
+            32,
+            2,
+            Some(&progress),
+            None,
+            &mut |op| FenceOutcome::Applied(op()),
+            if fenced { Some(&mut retry) } else { None },
+        )
+        .unwrap();
+        assert!(matches!(outcome, FenceOutcome::Applied(())));
+        assert_eq!(index.len(), 4);
+        assert!(store.load_pending_embedding_documents("code").unwrap().is_empty());
+        assert_eq!(server.requests().len() - before, remaining);
+        assert!(path.with_extension("db.usearch.json").exists());
+    }
+}
+
+#[test]
+fn payload_pending_publication_owner_and_cancel_win_after_failed_request() {
+    use crate::embedder::payload_tests::PayloadServer;
+    use std::sync::atomic::AtomicBool;
+    for fenced in [false, true] {
+        for outcome in 0..4 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("search.db");
+            let store = seed(&path, 0, 1);
+            let completed_request = Arc::new(AtomicBool::new(false));
+            let completed = completed_request.clone();
+            let server = PayloadServer::new(move |_, _| {
+                completed.store(true, Ordering::Release);
+                (413, "refused".into())
+            });
+            let embedder = Embedder::new(server.config(4096));
+            let keep_going = || outcome != 3 || !completed_request.load(Ordering::Acquire);
+            let mut retry = || false;
+            let (_, actual) = SearchEngine::run_embedding_pass(
+                &store,
+                &embedder,
+                3,
+                32,
+                1,
+                None,
+                Some(&keep_going),
+                &mut |op| {
+                    if !completed_request.load(Ordering::Acquire) {
+                        return FenceOutcome::Applied(op());
+                    }
+                    match outcome {
+                        0 => FenceOutcome::Released,
+                        1 => FenceOutcome::Superseded,
+                        2 => FenceOutcome::TransientRefusal,
+                        _ => FenceOutcome::Applied(op()),
+                    }
+                },
+                if fenced { Some(&mut retry) } else { None },
+            )
+            .unwrap();
+            assert!(match outcome {
+                0 | 3 => matches!(actual, FenceOutcome::Released),
+                1 => matches!(actual, FenceOutcome::Superseded),
+                _ => matches!(actual, FenceOutcome::TransientRefusal),
+            });
+            assert_eq!(server.requests().len(), 1);
+            assert_eq!(store.load_pending_embedding_documents("code").unwrap().len(), 1);
+            assert!(!path.with_extension("db.usearch.json").exists());
+        }
+    }
+}
+
+fn payload_documents() -> (String, Vec<crate::IndexedDocument>, usize) {
+    let content = (0..4)
+        .map(|i| {
+            format!(
+                "Процедура Метод{i}() Экспорт\n    Сообщить(\"данные{i}\");\nКонецПроцедуры\n\n"
+            )
+        })
+        .collect::<String>();
+    let key = crate::FileKey::configuration("Module.bsl");
+    let docs: Vec<_> = crate::Chunker::chunk(&content)
+        .iter()
+        .map(|chunk| crate::document::indexed_document_for_chunk(&key, chunk, None))
+        .collect();
+    assert_eq!(docs.len(), 4);
+    let limit = docs.iter().map(|doc| serde_json::json!({"model":"fixture","input":[crate::document::semantic_text_for_indexed_document(doc)],"dimensions":3}).to_string().len()).max().unwrap();
+    (content, docs, limit)
+}
+
+#[test]
+fn payload_file_collection_mapping_cached_gaps_and_batch_totals() {
+    use crate::embedder::payload_tests::{success, vector, PayloadServer};
+    for collection_sync in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (content, mut docs, limit) = payload_documents();
+        std::fs::write(dir.path().join("Module.bsl"), content).unwrap();
+        let server = PayloadServer::new(success);
+        let config = SearchConfig {
+            embedder: server.config(limit),
+            execution: crate::EmbeddingExecutionPolicy::default(),
+        };
+        let mut engine = SearchEngine::new(&dir.path().join("search.db"), config).unwrap();
+        let progress = IndexProgress::new();
+        if collection_sync {
+            let cached = [1, 3]
+                .into_iter()
+                .map(|i| {
+                    (
+                        semantic_key_for_indexed_document(&docs[i]),
+                        vector(&semantic_text_for_indexed_document(&docs[i])),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            docs.reverse();
+            assert_eq!(
+                engine
+                    .sync_indexed_documents_in_collection_with_embeddings(
+                        "code",
+                        &docs,
+                        Some(&cached),
+                        Some(&progress)
+                    )
+                    .unwrap(),
+                1
+            );
+        } else {
+            assert_eq!(engine.index_directory(dir.path(), Some(&progress)).unwrap(), 1);
+        }
+        let requests = server.requests();
+        assert_eq!(requests.len(), if collection_sync { 2 } else { 4 });
+        assert!(requests.iter().all(|body| body.len() <= limit));
+        assert_eq!(progress.total_batches.load(Ordering::Relaxed), requests.len());
+        assert_eq!(progress.done_chunks.load(Ordering::Relaxed), 4);
+        for (id, actual) in engine.store.load_all_embeddings(3).unwrap() {
+            let chunk = engine.store.chunk_by_id(id).unwrap().unwrap();
+            let doc = docs.iter().find(|d| d.symbol_name == chunk.symbol_name).unwrap();
+            assert_eq!(actual, vector(&semantic_text_for_indexed_document(doc)));
+        }
+        assert_eq!(engine.store.load_all_embeddings(3).unwrap().len(), 4);
+    }
+}
+
+#[test]
+fn payload_file_collection_failed_file_keeps_its_previous_atomic_version() {
+    use crate::embedder::payload_tests::{success, PayloadServer};
+    for collection_sync in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("search.db");
+        let (content, docs, limit) = payload_documents();
+        std::fs::write(dir.path().join("Module.bsl"), content).unwrap();
+        let server =
+            PayloadServer::new(
+                |i, body| if i == 1 { (413, "refused".into()) } else { success(i, body) },
+            );
+        let mut engine = SearchEngine::new(
+            &path,
+            SearchConfig {
+                embedder: server.config(limit),
+                execution: crate::EmbeddingExecutionPolicy { concurrency: 1, ..Default::default() },
+            },
+        )
+        .unwrap();
+        let old = &docs[..1];
+        engine
+            .store
+            .reindex_indexed_documents_in_collection(
+                CONFIGURATION_ROOT_ID,
+                "Module.bsl",
+                b"old",
+                "code",
+                old,
+                Some(&[vec![1.0, 2.0, 3.0]]),
+            )
+            .unwrap();
+        let previous = engine.store.load_all_embeddings(3).unwrap();
+        let error = if collection_sync {
+            engine.sync_indexed_documents_in_collection("code", &docs, None)
+        } else {
+            engine.index_directory(dir.path(), None)
+        }
+        .unwrap_err();
+        assert_eq!(error.to_string(), "embedding_request_too_large");
+        assert_eq!(server.requests().len(), 2);
+        assert_eq!(engine.store.load_all_embeddings(3).unwrap(), previous);
+        assert_eq!(engine.store.load_indexed_documents(Some("code")).unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn payload_reference_publication_preserves_lexical_failure_then_retries_in_order() {
+    use crate::embedder::payload_tests::{success, vector, PayloadServer};
+    let dir = tempfile::tempdir().unwrap();
+    let documents: Vec<_> = (0..5)
+        .map(|i| Document {
+            title: format!("Справка{i}"),
+            body: format!("uniquemarker{i} {}", "я".repeat(i + 1)),
+            kind: "type".into(),
+        })
+        .collect();
+    let limit = documents
+        .iter()
+        .map(|d| {
+            serde_json::json!({"model":"fixture","input":[d.body],"dimensions":3}).to_string().len()
+        })
+        .max()
+        .unwrap();
+    let server =
+        PayloadServer::new(
+            |i, body| if i == 1 { (413, "refused".into()) } else { success(i, body) },
+        );
+    let mut engine = SearchEngine::new(
+        &dir.path().join("reference.db"),
+        SearchConfig {
+            embedder: server.config(limit),
+            execution: crate::EmbeddingExecutionPolicy { concurrency: 2, ..Default::default() },
+        },
+    )
+    .unwrap();
+    let progress = IndexProgress::new();
+    let failed = engine
+        .replace_reference_collection_if_stale(
+            "platform",
+            "platform://docs",
+            "fp",
+            &documents,
+            Some(&progress),
+        )
+        .unwrap();
+    assert!(failed.written);
+    assert_eq!(
+        failed.embedding_failure.unwrap().code,
+        crate::EmbeddingFailureCode::EmbeddingRequestTooLarge
+    );
+    assert!(failed.committed_fingerprint.ends_with(":fts"));
+    assert!(!progress.active.load(Ordering::Relaxed));
+    assert_eq!(engine.vector_count(), 0);
+    assert_eq!(engine.text_search("uniquemarker0", 10, Some("platform")).unwrap().len(), 1);
+
+    let before = server.requests().len();
+    let recovered = engine
+        .replace_reference_collection_if_stale(
+            "platform",
+            "platform://docs",
+            "fp",
+            &documents,
+            Some(&progress),
+        )
+        .unwrap();
+    assert!(recovered.written);
+    assert!(recovered.embedding_failure.is_none());
+    assert!(recovered.committed_fingerprint.ends_with(":fixture:3"));
+    assert_eq!(server.requests().len() - before, documents.len());
+    assert_eq!(progress.total_batches.load(Ordering::Relaxed), documents.len());
+    for (id, actual) in engine.store.load_all_embeddings(3).unwrap() {
+        let chunk = engine.store.chunk_by_id(id).unwrap().unwrap();
+        assert_eq!(actual, vector(&chunk.text));
+    }
+    assert_eq!(engine.vector_count(), documents.len());
+    let before = server.requests().len();
+    let unchanged = engine
+        .replace_reference_collection_if_stale(
+            "platform",
+            "platform://docs",
+            "fp",
+            &documents,
+            None,
+        )
+        .unwrap();
+    assert!(!unchanged.written && unchanged.embedding_failure.is_none());
+    assert_eq!(server.requests().len(), before);
+    assert!(server.requests().iter().all(|body| body.len() <= limit));
+}
+
+#[test]
+fn payload_configuration_standalone_rejects_zero_for_empty_or_cached_work() {
+    use crate::embedder::payload_tests::{success, vector, PayloadServer};
+    let server = PayloadServer::new(success);
+    for cached in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        if cached {
+            std::fs::write(dir.path().join("Cached.bsl"), "Процедура Кэш()\nКонецПроцедуры")
+                .unwrap();
+        }
+        let db = dir.path().join("overlay.db");
+        let store = Store::open(&db).unwrap();
+        let roots = WorkspaceRoots::build(dir.path(), dir.path(), &[]).0;
+        let plan = WorkspaceOverlayCache::plan_full_refresh_from_manifest(
+            &HashMap::new(),
+            &roots,
+            &store,
+            &HashMap::new(),
+            None,
+            &HashSet::new(),
+        )
+        .unwrap();
+        let warm: HashMap<_, _> = plan
+            .missing_embeddings()
+            .iter()
+            .map(|(key, text)| (key.clone(), vector(text)))
+            .collect();
+        assert_eq!(!warm.is_empty(), cached);
+        for limit in [0, 4096] {
+            let result = SearchEngine::prime_workspace_overlay_standalone(
+                &db,
+                server.config(limit),
+                &roots,
+                warm.clone(),
+                None,
+                &|| true,
+                |op| FenceOutcome::Applied(op()),
+                &HashSet::new(),
+            );
+            if limit == 0 {
+                let Err(error) = result else { panic!("invalid configuration must fail") };
+                assert_eq!(error.to_string(), "embedding_invalid_config");
+            } else {
+                assert!(matches!(result.unwrap(), FenceOutcome::Applied(_)));
+            }
+        }
+    }
+    assert!(server.requests().is_empty());
+}
+
+#[test]
+fn payload_overlay_offlock_preserves_paid_cache_and_checks_between_requests() {
+    use crate::embedder::payload_tests::{success, vector, PayloadServer};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("overlay.db")).unwrap();
+    let missing: HashMap<_, _> =
+        (0..4).map(|i| (format!("key{i}"), format!("Текст запроса {i}"))).collect();
+    let limit = serde_json::json!({"model":"fixture","input":["Текст запроса 0"],"dimensions":3})
+        .to_string()
+        .len();
+    let server =
+        PayloadServer::new(
+            |i, body| if i == 1 { (413, "refused".into()) } else { success(i, body) },
+        );
+    let embedder = Embedder::new(server.config(limit));
+    let error = SearchEngine::embed_missing_overlay_chunks(
+        &store,
+        &embedder,
+        &missing,
+        32,
+        &|| true,
+        &mut |op| FenceOutcome::Applied(op()),
+        &mut || false,
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "embedding_request_too_large");
+    let retained = store.load_overlay_embedding_cache("fixture", 3).unwrap();
+    assert_eq!(retained.len(), 1);
+    for (key, actual) in &retained {
+        assert_eq!(*actual, vector(&missing[key]));
+    }
+    let remaining = missing
+        .iter()
+        .filter(|(key, _)| !retained.contains_key(*key))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let recovered = SearchEngine::embed_missing_overlay_chunks(
+        &store,
+        &embedder,
+        &remaining,
+        32,
+        &|| true,
+        &mut |op| FenceOutcome::Applied(op()),
+        &mut || false,
+    )
+    .unwrap();
+    assert!(matches!(recovered, FenceOutcome::Applied(_)));
+    assert_eq!(server.requests().len(), 5);
+    let cached = store.load_overlay_embedding_cache("fixture", 3).unwrap();
+    assert_eq!(cached.len(), missing.len());
+    for (key, actual) in cached {
+        assert_eq!(actual, vector(&missing[&key]));
+    }
+    assert!(server.requests().iter().all(|body| body.len() <= limit));
+
+    let cancelled_store = Store::open(&dir.path().join("cancelled.db")).unwrap();
+    let before = server.requests().len();
+    let completed = std::cell::Cell::new(0);
+    let result = SearchEngine::embed_missing_overlay_chunks(
+        &cancelled_store,
+        &embedder,
+        &missing,
+        32,
+        &|| completed.get() < 2,
+        &mut |op| {
+            let result = op();
+            completed.set(completed.get() + 1);
+            FenceOutcome::Applied(result)
+        },
+        &mut || false,
+    )
+    .unwrap();
+    assert!(matches!(result, FenceOutcome::Released));
+    assert_eq!(server.requests().len() - before, 1);
+    assert_eq!(cancelled_store.load_overlay_embedding_cache("fixture", 3).unwrap().len(), 1);
 }
 
 #[test]

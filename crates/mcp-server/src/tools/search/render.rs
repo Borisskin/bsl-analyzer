@@ -1,7 +1,7 @@
 use super::types::search_schema_version;
 use crate::tools::location as loc;
 use crate::tools::response::structured_with_text;
-use bsl_search::{FusedHit, LexicalHit, SearchHit, SemanticHit};
+use bsl_search::{EmbeddingFailure, FusedHit, LexicalHit, SearchHit, SemanticHit};
 use rmcp::model::CallToolResult;
 use serde_json::{json, Value};
 use std::fmt::Write;
@@ -90,7 +90,7 @@ pub(super) const ENVELOPE_OVERHEAD_WITH_FRESHNESS_BYTES: usize = 352;
 /// reads. Rendering the pair up front lets [`budgeted_hits`] charge the budget for what the
 /// response actually carries, and keeps the two views from ever disagreeing on which hits made
 /// the cut.
-struct HitBlock {
+pub(super) struct HitBlock {
     text: String,
     json: Value,
 }
@@ -220,6 +220,96 @@ fn budgeted_hits(
 /// The text a hit-listing action emits when the ranked list is empty. Kept verbatim: it is
 /// the sentence clients have parsed since before the structured envelope existed.
 const NO_HITS_TEXT: &str = "No results found.";
+
+/// Retry envelopes mirror their JSON in text; keep the two copies identical.
+pub(crate) fn not_ready_with_failure(
+    result: CallToolResult,
+    failure: Option<EmbeddingFailure>,
+) -> CallToolResult {
+    let Some(failure) = failure else { return result };
+    let mut body = result.structured_content.expect("structured retry envelope");
+    body["semantic_failure"] = json!(failure);
+    crate::tools::response::structured(body)
+}
+
+pub(crate) fn embedding_mcp_error(failure: EmbeddingFailure) -> rmcp::ErrorData {
+    rmcp::ErrorData::internal_error(
+        "Semantic embedding failed; use lexical search or retry.",
+        Some(json!({"semantic_failure": failure})),
+    )
+}
+
+/// Size the actual envelope (including every escaped note copy) before choosing hits.
+/// Only failure responses need this extension of the existing soft minimum.
+#[allow(clippy::too_many_arguments)] // The response carries the same independent fields as hits_response.
+pub(super) fn failure_hits_response(
+    blocks: Vec<HitBlock>,
+    prefix: &str,
+    degraded: Option<&str>,
+    envelope: Envelope,
+    action: &str,
+    failure: EmbeddingFailure,
+    max_output_tokens: usize,
+    facts: Option<&WorkspaceFacts>,
+) -> CallToolResult {
+    let total = blocks.len();
+    let budget = max_output_tokens.saturating_mul(4);
+    let wrap = |shown, budget_exhausted| {
+        let text = if shown == 0 {
+            NO_HITS_TEXT.to_owned()
+        } else {
+            let mut text = prefix.to_owned();
+            if let Some(note) = degraded {
+                let _ = writeln!(text, "-- {note} --");
+            }
+            if budget_exhausted {
+                let _ = writeln!(text, "-- showing {shown} of {total} results (truncated to fit max_output_tokens; raise the budget or narrow the query) --");
+            }
+            text
+        };
+        let mut result = hits_response(
+            text,
+            RenderedHits { text: String::new(), hits: Vec::new(), shown, total, budget_exhausted },
+            degraded,
+            envelope,
+            action,
+            facts,
+        );
+        result.structured_content.as_mut().unwrap()["semantic_failure"] = json!(failure);
+        result
+    };
+    let size = |result: &CallToolResult| {
+        result.content[0].as_text().unwrap().text.len()
+            + serde_json::to_vec(result.structured_content.as_ref().unwrap()).unwrap().len()
+    };
+    let mut shown = 0;
+    let mut hit_bytes = 0usize;
+    for (i, block) in blocks.iter().enumerate() {
+        hit_bytes = hit_bytes
+            .saturating_add(block.text.len())
+            .saturating_add(serde_json::to_vec(&block.json).unwrap().len())
+            .saturating_add(usize::from(i > 0));
+        let candidate = wrap(i + 1, i + 1 < total);
+        if size(&candidate).saturating_add(hit_bytes) <= budget {
+            shown = i + 1;
+        }
+    }
+    let empty = wrap(0, total > 0);
+    let mut result = wrap(shown, shown < total || (shown == 0 && size(&empty) > budget));
+    if shown > 0 {
+        let mut text = prefix.to_owned();
+        let mut hits = Vec::with_capacity(shown);
+        for block in blocks.into_iter().take(shown) {
+            text.push_str(&block.text);
+            hits.push(block.json);
+        }
+        let suffix = result.content[0].as_text().unwrap().text.strip_prefix(prefix).unwrap();
+        text.push_str(suffix);
+        result.content = vec![rmcp::model::ContentBlock::text(text)];
+        result.structured_content.as_mut().unwrap()["hits"] = json!(hits);
+    }
+    result
+}
 
 /// Wrap a rendered listing as a tool result: the text listing stays the content block, and the
 /// same hits go out as `structuredContent` so a consumer reads fields instead of parsing
@@ -458,6 +548,13 @@ pub(super) fn format_code_hits(
     roots: Option<&bsl_search::WorkspaceRoots>,
     max_output_tokens: usize,
 ) -> RenderedHits {
+    budgeted_hits(code_hit_blocks(hits, roots), max_output_tokens, Envelope::Yes)
+}
+
+pub(super) fn code_hit_blocks(
+    hits: &[FusedHit],
+    roots: Option<&bsl_search::WorkspaceRoots>,
+) -> Vec<HitBlock> {
     // The strip base is the root table's, not the daemon's live workspace path: the table came
     // with the index answer being rendered and read the disk once, when that index was
     // registered. Re-reading the workspace spelling here would strip an indexed generation's
@@ -528,10 +625,14 @@ pub(super) fn format_code_hits(
             HitBlock { text, json }
         })
         .collect();
-    budgeted_hits(blocks, max_output_tokens, Envelope::Yes)
+    blocks
 }
 
 pub(super) fn format_doc_hits(hits: &[SearchHit], max_output_tokens: usize) -> RenderedHits {
+    budgeted_hits(doc_hit_blocks(hits), max_output_tokens, Envelope::No)
+}
+
+pub(super) fn doc_hit_blocks(hits: &[SearchHit]) -> Vec<HitBlock> {
     let blocks = hits
         .iter()
         .enumerate()
@@ -557,13 +658,17 @@ pub(super) fn format_doc_hits(hits: &[SearchHit], max_output_tokens: usize) -> R
             HitBlock { text, json }
         })
         .collect();
-    budgeted_hits(blocks, max_output_tokens, Envelope::No)
+    blocks
 }
 
 pub(super) fn format_lexical_doc_hits(
     hits: &[LexicalHit],
     max_output_tokens: usize,
 ) -> RenderedHits {
+    budgeted_hits(lexical_doc_hit_blocks(hits), max_output_tokens, Envelope::No)
+}
+
+pub(super) fn lexical_doc_hit_blocks(hits: &[LexicalHit]) -> Vec<HitBlock> {
     let blocks = hits
         .iter()
         .enumerate()
@@ -598,7 +703,7 @@ pub(super) fn format_lexical_doc_hits(
             HitBlock { text, json }
         })
         .collect();
-    budgeted_hits(blocks, max_output_tokens, Envelope::No)
+    blocks
 }
 
 pub(super) fn format_semantic_doc_hits(
@@ -670,6 +775,109 @@ mod tests {
 
     fn fused(symbol: &str, modality: Modality) -> FusedHit {
         FusedHit { hit: code_hit("CommonModules/М/Ext/Module.bsl", symbol, "procedure"), modality }
+    }
+
+    #[test]
+    fn payload_mcp_contract_failure_budget_counts_the_complete_escaped_envelope() {
+        use super::{code_hit_blocks, doc_hit_blocks, failure_hits_response};
+        use bsl_search::{EmbeddingFailure, EmbeddingFailureCode};
+        let failure = EmbeddingFailure {
+            code: EmbeddingFailureCode::EmbeddingInputTooLarge,
+            request_bytes: Some(usize::MAX),
+            max_request_bytes: Some(1_048_576),
+        };
+        let mut hits: Vec<_> =
+            (0..5).map(|i| fused(&format!("Проверка{i}"), Modality::Lexical)).collect();
+        for hit in &mut hits {
+            hit.hit.text = "Юникод\\\"\n\t".repeat(8);
+        }
+        // Long notes exercise all three copies and JSON escaping, not just ASCII size.
+        for note in [None, Some("semantic skipped: embedding failed"), Some("\\\"\n\tЮникод")]
+        {
+            for envelope in [Envelope::Yes, Envelope::No] {
+                let docs: Vec<_> = hits.iter().map(|hit| hit.hit.clone()).collect();
+                let blocks = || {
+                    if envelope == Envelope::Yes {
+                        code_hit_blocks(&hits, None)
+                    } else {
+                        doc_hit_blocks(&docs)
+                    }
+                };
+                let action = if envelope == Envelope::Yes { "search_code" } else { "find_docs" };
+                let prefix = if envelope == Envelope::Yes { "Modality: [L] lexical\n" } else { "" };
+                let render = |budget| {
+                    failure_hits_response(
+                        blocks(),
+                        prefix,
+                        note,
+                        envelope,
+                        action,
+                        failure,
+                        budget,
+                        None,
+                    )
+                };
+                let size = |result: &rmcp::model::CallToolResult| {
+                    result.content[0].as_text().unwrap().text.len()
+                        + serde_json::to_vec(result.structured_content.as_ref().unwrap())
+                            .unwrap()
+                            .len()
+                };
+                let minimum = render(0);
+                let floor = size(&minimum);
+                let mut saw_full = false;
+                let mut saw_partial = false;
+                for budget in (0..=2_500).step_by(7) {
+                    let result = render(budget);
+                    let body = result.structured_content.as_ref().unwrap();
+                    assert_eq!(body["semantic_failure"], json!(failure));
+                    assert_eq!(body["shown"], body["hits"].as_array().unwrap().len());
+                    if budget * 4 >= floor {
+                        assert!(size(&result) <= budget * 4, "{action}, {budget}: {body}");
+                    } else {
+                        assert_eq!(body["hits"], json!([]));
+                        assert_eq!(body["budget_exhausted"], true);
+                        assert_eq!(result, minimum);
+                    }
+                    saw_full |= body["shown"] == hits.len();
+                    saw_partial |=
+                        body["shown"].as_u64().unwrap() > 0 && body["budget_exhausted"] == true;
+                }
+                assert!(saw_full && saw_partial);
+            }
+        }
+    }
+
+    #[test]
+    fn payload_mcp_contract_empty_failure_preserves_the_soft_minimum() {
+        use super::failure_hits_response;
+        use bsl_search::{EmbeddingFailure, EmbeddingFailureCode};
+        let failure = EmbeddingFailure::new(EmbeddingFailureCode::EmbeddingProviderError);
+        for action in ["find_docs", "search_code"] {
+            let render = |budget| {
+                failure_hits_response(
+                    Vec::new(),
+                    "",
+                    None,
+                    Envelope::No,
+                    action,
+                    failure,
+                    budget,
+                    None,
+                )
+            };
+            let full = render(usize::MAX);
+            let bytes = full.content[0].as_text().unwrap().text.len()
+                + serde_json::to_vec(full.structured_content.as_ref().unwrap()).unwrap().len();
+            assert!(full.structured_content.as_ref().unwrap().get("budget_exhausted").is_none());
+            assert_eq!(render(bytes.div_ceil(4)), full);
+            let tiny = render(0);
+            let body = tiny.structured_content.as_ref().unwrap();
+            assert_eq!(body["semantic_failure"], json!(failure));
+            assert_eq!(body["budget_exhausted"], true);
+            assert_eq!(body["shown"], 0);
+            assert_eq!(tiny.content[0].as_text().unwrap().text, "No results found.");
+        }
     }
 
     #[test]

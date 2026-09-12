@@ -35,23 +35,29 @@ pub(super) fn build_adapter(
 
 pub(super) fn embedder_config(
     project: &project_model::Project,
-) -> Option<bsl_search::EmbedderConfig> {
+) -> Result<Option<bsl_search::EmbedderConfig>, bsl_search::SearchError> {
     let emb = &project.config.search.baseline.embedding;
 
-    let model = emb.model.clone().or_else(|| env::var("EMBEDDING_MODEL").ok())?;
-    let base_url = env::var("EMBEDDING_URL").ok().or_else(|| emb.url.clone())?;
+    let Some(model) = emb.model.clone().or_else(|| env::var("EMBEDDING_MODEL").ok()) else {
+        return Ok(None);
+    };
+    let Some(base_url) = env::var("EMBEDDING_URL").ok().or_else(|| emb.url.clone()) else {
+        return Ok(None);
+    };
+    let max_request_bytes = bsl_search::EmbedderConfig::request_bytes_from_env()?;
     let dim = emb
         .dimension
         .or_else(|| env::var("EMBEDDING_DIM").ok().and_then(|value| value.parse().ok()))
         .or(Some(1024));
 
-    Some(bsl_search::EmbedderConfig {
+    Ok(Some(bsl_search::EmbedderConfig {
         base_url,
         model,
         dim,
         api_key: env::var("EMBEDDING_API_KEY").ok(),
         provider: emb.provider.clone().or_else(|| env::var("EMBEDDING_PROVIDER").ok()),
-    })
+        max_request_bytes,
+    }))
 }
 
 pub(super) fn embedding_execution_policy_from_env() -> bsl_search::EmbeddingExecutionPolicy {

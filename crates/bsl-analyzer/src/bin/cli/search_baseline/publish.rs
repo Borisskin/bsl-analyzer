@@ -63,6 +63,7 @@ pub(super) fn run(args: SearchBaselinePublishArgs) -> Result<(), Box<dyn Error +
     };
 
     let project = project_model::Project::new(&args.source_dir)?;
+    let embedder = postgres::embedder_config(&project)?.map(Embedder::new);
     let branch = publish_policy::resolve_publish_branch(args.branch.as_deref(), &project.root);
     let commit = publish_policy::resolve_publish_commit(args.commit.as_deref(), &project.root);
     let corpus = match args.corpus {
@@ -160,7 +161,6 @@ pub(super) fn run(args: SearchBaselinePublishArgs) -> Result<(), Box<dyn Error +
         SnapshotPublishMetadata { branch: branch.clone(), commit: commit.clone() };
 
     eprintln!("[3/5] Publishing snapshot ({} chunks)...", indexed_documents.len());
-    let embedder = postgres::embedder_config(&project).map(Embedder::new);
     let has_embedder = embedder.is_some();
     let embedding_progress = |event: EmbeddingProgress| match event {
         EmbeddingProgress::Plan { total_unique, cached, to_compute } => {
@@ -322,6 +322,66 @@ mod tests {
 
     fn project_at(root: &Path) -> project_model::Project {
         project_model::Project::new(root).unwrap()
+    }
+
+    #[test]
+    fn payload_configuration_resolves_cli_settings_and_rejects_invalid_before_publish() {
+        // Isolate process-global environment from concurrently running publish tests.
+        const CHILD: &str = "BSL_PAYLOAD_CONFIGURATION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cli::search_baseline::publish::tests::payload_configuration_resolves_cli_settings_and_rejects_invalid_before_publish",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_at(dir.path());
+        std::env::set_var("EMBEDDING_URL", "http://127.0.0.1:9/v1");
+        std::env::set_var("EMBEDDING_MODEL", "test-model");
+        std::env::remove_var("EMBEDDING_MAX_REQUEST_BYTES");
+        assert_eq!(
+            postgres::embedder_config(&project).unwrap().unwrap().max_request_bytes,
+            1_048_576
+        );
+        std::env::set_var("EMBEDDING_MAX_REQUEST_BYTES", "4096");
+        assert_eq!(postgres::embedder_config(&project).unwrap().unwrap().max_request_bytes, 4096);
+        std::env::set_var("EMBEDDING_BATCH_SIZE", "7");
+        std::env::set_var("EMBEDDING_CONCURRENCY", "3");
+        let execution = postgres::embedding_execution_policy_from_env();
+        assert_eq!(execution.batch_size, 7);
+        assert_eq!(execution.concurrency, 3);
+
+        for invalid in
+            ["0".to_owned(), "private-invalid-value".to_owned(), format!("{}0", usize::MAX)]
+        {
+            std::env::set_var("EMBEDDING_MAX_REQUEST_BYTES", invalid);
+            let error = run(SearchBaselinePublishArgs {
+                corpus: SearchBaselineCorpusCli::WorkspaceCode,
+                source_dir: dir.path().to_path_buf(),
+                snapshot_id: None,
+                branch: None,
+                commit: None,
+                parent_snapshot_id: None,
+                allow_non_policy_branch: false,
+            })
+            .unwrap_err();
+            assert_eq!(error.to_string(), "embedding_invalid_config");
+            let error = error.downcast_ref::<bsl_search::SearchError>().unwrap();
+            assert_eq!(
+                error.embedding_failure().unwrap().code,
+                bsl_search::EmbeddingFailureCode::EmbeddingInvalidConfig
+            );
+        }
+        std::env::remove_var("EMBEDDING_MODEL");
+        assert!(postgres::embedder_config(&project).unwrap().is_none());
     }
 
     /// The report tells the operator how many files went out. Two files at one relative path

@@ -30,8 +30,8 @@ uri: bsl-analyzer://contract
 
 ```jsonc
 {
-  "contract_version": "1.14",
-  "build_version": "0.2.71",
+  "contract_version": "2.3",
+  "build_version": "0.2.79",
   "mcp": {
     "profiles": {
       "workspace": {
@@ -103,7 +103,7 @@ uri: bsl-analyzer://contract
 
 Пояснения к полям:
 
-- В контракте `1.14` `search` публикует `output_schema_version="4"`,
+- В контракте `2.3` `search` публикует `output_schema_version="5"`,
   `syntax_help` — `"2"`, `symbol_info` — `"1"`. `syntax_help` и справочные
   действия `search(action=find_docs|search_docs|list_platform|status)` доступны
   не только в `reference`, но и в `workspace`; отдельный профиль `reference`
@@ -128,9 +128,10 @@ uri: bsl-analyzer://contract
 - `nullable: true` — параметр принимает не только отсутствие, но и явный `null`;
   `required: false` сам по себе говорит только о первом.
 - `output_schema_version` означает, что инструмент публикует стандартный
-  `outputSchema` в `tools/list`, а каждый успешный `structuredContent` несёт
-  совпадающий `schema_version`. Поле отсутствует у инструментов без стабильной
-  структурированной формы ответа.
+  `outputSchema` в `tools/list`. `structuredContent` несёт `schema_version`
+  соответствующего варианта ответа: у `search` это `5` для hits/`not_ready`,
+  `2` для `status` и `1` для `list_platform`. Поле отсутствует у инструментов
+  без стабильной структурированной формы ответа.
 - Описания инструментов и параметров в декларацию **не входят**: это проза для
   агентов, она есть в `tools/list`, и её присутствие здесь означало бы, что
   каждая переформулировка выглядит как изменение контракта — ровно та беда, ради
@@ -206,11 +207,21 @@ uri: bsl-analyzer://contract
 
 ```python
 major, minor = contract["contract_version"].split(".")
-assert major == "1" and int(minor) >= 0
+assert major == "2" and int(minor) >= 3
 ```
 
 `build_version` остаётся в документе, но для feature-detection он не нужен —
 именно ради этого и введена отдельная версия.
+
+В контракте `2.3` инструмент `search` публикует `outputSchema` версии `5`:
+hits и `not_ready` используют `schema_version="5"`, `status` обоих профилей —
+`"2"`, `list_platform` сохраняет `"1"`. Добавлен необязательный закрытый объект
+`semantic_failure` с кодом embedding-ошибки; отсутствие поля не доказывает
+готовность семантики. Версия и `output_schema_fingerprint` доступны через CLI и
+ресурс `bsl-analyzer://contract`; точная форма проверяется через `tools/list`.
+При ошибке `search_docs` этот объект находится в RPC `error.data`, которое
+проверяется отдельно от успешной `outputSchema`. Формы и примеры —
+[«Ошибки эмбеддингов»](TOOLS_AND_EXTENSION.md#ошибки-эмбеддингов).
 
 ## Что заменяет проверку по `--help`
 

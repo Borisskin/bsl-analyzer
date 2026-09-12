@@ -192,6 +192,7 @@ codex mcp list
   | `EMBEDDING_MODEL` | имя модели | `Qwen/Qwen3-Embedding-0.6B` |
   | `EMBEDDING_DIM` | размерность вектора (должна совпасть с моделью) | `1024` |
   | `EMBEDDING_API_KEY` | ключ (для сервисов с Bearer-авторизацией) | — (опц.) |
+  | `EMBEDDING_MAX_REQUEST_BYTES` | положительный предел одного сериализованного HTTP JSON body, байты | `1048576` (1 MiB) |
   | `EMBEDDING_PUBLISH_RETRY_BUDGET_SECS` | общий лимит повторных попыток публикации, секунды | `600` |
 
   Установка с прописыванием env прямо в MCP-конфиг:
@@ -212,6 +213,8 @@ codex mcp list
   - `Semantic: not configured (set EMBEDDING_URL)` — эмбеддинги не подхватились;
   - `Semantic: failed...` / `syncing...` — не готова / строится.
 
+  Настройка размера, ошибки значения, таймауты и откат —
+  [«Размер embedding-запросов и повторные попытки»](README.md#размер-embedding-запросов-и-повторные-попытки).
   Подробности про `EMBEDDING_PROVIDER`, batch/concurrency и выбор модели —
   [`TOOLS_AND_EXTENSION.md`](TOOLS_AND_EXTENSION.md#переменные-окружения-и-prerequisites).
 

@@ -12,7 +12,7 @@ use super::wait::{embed_unless_cancelled, Withdrawn};
 use crate::baseline::{BaselineCall, ConfiguredBaselineStatus, ExternalBaselineService};
 use crate::state::{SemanticRuntimeStatus, WorkspaceSearchMode};
 use bsl_search::{
-    merge_context_for_collection, merge_semantic, SearchEngine, SearchError, SearchHit, SemanticHit,
+    merge_context_for_collection, merge_semantic, SearchEngine, SearchHit, SemanticHit,
 };
 use rmcp::ErrorData as McpError;
 use std::collections::HashSet;
@@ -65,6 +65,9 @@ pub(super) fn semantic_code_hits(
             ));
         };
 
+        if let Some(failure) = semantic_runtime.embedding_failure() {
+            return Ok(CodeHits::Unavailable(SemanticUnavailable::EmbeddingFailed(failure)));
+        }
         if let SemanticRuntimeStatus::Failed(_) | SemanticRuntimeStatus::Stopped = semantic_runtime
         {
             // One answer for both: the semantic runtime is not there. A stopped pass is not a
@@ -202,9 +205,10 @@ pub(super) fn semantic_code_hits(
         // search. When it times out or transiently fails, degrade to the lexical hits the caller
         // already has rather than failing the whole tool. A non-embedder error means something
         // structural is broken, which is worth surfacing as a hard error.
-        Err(SearchError::Embedder(detail)) => {
-            warn!("semantic: query embed failed, degrading to lexical: {detail}");
-            return Ok(CodeHits::Unavailable(SemanticUnavailable::EmbedderUnavailable(detail)));
+        Err(error) if error.embedding_failure().is_some() => {
+            let failure = error.embedding_failure().unwrap();
+            warn!(%failure, "semantic: query embed failed, degrading to lexical");
+            return Ok(CodeHits::Unavailable(SemanticUnavailable::EmbeddingFailed(failure)));
         }
         Err(e) => return Err(McpError::internal_error(format!("search error: {e}"), None).into()),
     };
@@ -527,6 +531,7 @@ mod tests {
                 dim: Some(8),
                 api_key: None,
                 provider: None,
+                ..Default::default()
             },
             ..SearchConfig::default()
         };
@@ -544,9 +549,6 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(
-            outcome,
-            CodeHits::Unavailable(SemanticUnavailable::EmbedderUnavailable(_))
-        ));
+        assert!(matches!(outcome, CodeHits::Unavailable(SemanticUnavailable::EmbeddingFailed(_))));
     }
 }

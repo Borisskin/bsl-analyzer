@@ -880,6 +880,7 @@ impl WorkspaceOverlayCache {
         batch_size: usize,
         hash_mode: BaselineHashMode,
     ) -> Result<(), SearchError> {
+        let mut embedding_failure = None;
         let scan_is_clean = scanned.clean();
         let workspace_files = scanned.files;
         let mut seen_keys = HashSet::new();
@@ -920,10 +921,11 @@ impl WorkspaceOverlayCache {
                                 &mut self.embedding_cache,
                             ) {
                                 Ok(vectors) => entry.vector_documents = vectors,
-                                Err(error) => tracing::warn!(
-                                    "failed to attach overlay vectors; keeping the entry \
-                                     lexical-only: {error}"
-                                ),
+                                Err(error) => {
+                                    embedding_failure =
+                                        embedding_failure.or(error.embedding_failure());
+                                    tracing::warn!("failed to attach overlay vectors; keeping the entry lexical-only: {error}");
+                                }
                             }
                         }
                         continue;
@@ -969,6 +971,7 @@ impl WorkspaceOverlayCache {
                     self.entries.insert(file.key, entry);
                 }
                 Err(error) => {
+                    embedding_failure = embedding_failure.or(error.embedding_failure());
                     // The key's prior entry and hiding survive (like a failed read): the
                     // fault is the builder's, and the pass must still reach its tail.
                     tracing::warn!(
@@ -1015,7 +1018,7 @@ impl WorkspaceOverlayCache {
         // An in-place full publication replaces the whole state: any plan whose Phase A
         // started before this moment must not publish over it.
         self.bump_wholesale();
-        Ok(())
+        embedding_failure.map_or(Ok(()), |failure| Err(failure.into()))
     }
 
     /// The hidden-path merge of an unclean full publication: only a SEEN key may change its
@@ -1283,6 +1286,7 @@ impl WorkspaceOverlayCache {
         batch_size: usize,
         snapshots: &HashMap<FileKey, ModuleSnapshot>,
     ) -> Result<(), SearchError> {
+        let mut embedding_failure = None;
         let RawBaseline { files: baseline_files, hash_mode } = baseline;
         // Each drained key CLASSIFIES into a [`PointSettlement`] and settles at once through
         // [`Self::settle_point`]: a later fault in the same batch never disturbs an earlier
@@ -1305,13 +1309,14 @@ impl WorkspaceOverlayCache {
                 batch_size,
                 &mut self.embedding_cache,
             );
+            embedding_failure = embedding_failure.or(read.embedding_failure);
             if read.resident_fed {
                 self.resident_fed_count += 1;
             }
             let settlement = PointSettlement { action: read.action, store_fault: false };
             self.settle_point(key, settlement, prior_failures);
         }
-        Ok(())
+        embedding_failure.map_or(Ok(()), |failure| Err(failure.into()))
     }
 
     fn full_refresh_from_manifest(
@@ -1340,6 +1345,7 @@ impl WorkspaceOverlayCache {
         batch_size: usize,
         store: &Store,
     ) -> Result<(), SearchError> {
+        let mut embedding_failure = None;
         let manifest_snapshot_id = store
             .load_baseline_manifest()
             .ok()
@@ -1428,10 +1434,11 @@ impl WorkspaceOverlayCache {
                                 &mut self.embedding_cache,
                             ) {
                                 Ok(vectors) => entry.vector_documents = vectors,
-                                Err(error) => tracing::warn!(
-                                    "failed to attach overlay vectors; keeping the entry \
-                                     lexical-only: {error}"
-                                ),
+                                Err(error) => {
+                                    embedding_failure =
+                                        embedding_failure.or(error.embedding_failure());
+                                    tracing::warn!("failed to attach overlay vectors; keeping the entry lexical-only: {error}");
+                                }
                             }
                         }
                         continue;
@@ -1505,6 +1512,7 @@ impl WorkspaceOverlayCache {
                     self.entries.insert(file.key.clone(), entry);
                 }
                 Err(error) => {
+                    embedding_failure = embedding_failure.or(error.embedding_failure());
                     // The key's prior entry and hiding survive (like a failed read): the
                     // fault is the builder's, and the pass must still reach its tail.
                     tracing::warn!(
@@ -1572,7 +1580,7 @@ impl WorkspaceOverlayCache {
             }
         }
 
-        Ok(())
+        embedding_failure.map_or(Ok(()), |failure| Err(failure.into()))
     }
 
     /// Phase A: plan a manifest-driven full refresh without holding any live lock.
@@ -2017,6 +2025,7 @@ impl WorkspaceOverlayCache {
         batch_size: usize,
         snapshots: &HashMap<FileKey, ModuleSnapshot>,
     ) -> Result<(), SearchError> {
+        let mut embedding_failure = None;
         let ManifestBaseline { fingerprints: manifest_fingerprints, store } = baseline;
         // Each drained key CLASSIFIES into a [`PointSettlement`] and settles at once through
         // [`Self::settle_point`]. The key's fingerprint-row obligation (the row claims
@@ -2042,6 +2051,7 @@ impl WorkspaceOverlayCache {
                 batch_size,
                 &mut self.embedding_cache,
             );
+            embedding_failure = embedding_failure.or(read.embedding_failure);
             if read.resident_fed {
                 self.resident_fed_count += 1;
             }
@@ -2058,7 +2068,7 @@ impl WorkspaceOverlayCache {
             );
         }
 
-        Ok(())
+        embedding_failure.map_or(Ok(()), |failure| Err(failure.into()))
     }
 
     /// How many overlay entries have been built from a resident-provided shared parse (rather than
@@ -2321,6 +2331,7 @@ impl PointBaseline {
 
 /// What classifying one dirty key read and decided.
 pub(crate) struct PointRead {
+    pub(crate) embedding_failure: Option<crate::EmbeddingFailure>,
     pub(crate) action: PointAction,
     /// The entry was chunked from the resident's shared parse instead of a parse of its own.
     pub(crate) resident_fed: bool,
@@ -2349,7 +2360,8 @@ pub(crate) fn classify_point(
 ) -> PointRead {
     crate::point_refresh::forbidden_under_a_bounded_publication("reading and parsing a file");
     let has_baseline = baseline.is_present();
-    let settled = |action| PointRead { action, resident_fed: false, bytes: 0 };
+    let settled =
+        |action| PointRead { action, resident_fed: false, bytes: 0, embedding_failure: None };
     // A key whose root is no longer registered resolves to nothing; that is a change of
     // composition, not a filesystem error, and it settles like a deletion.
     let Some(abs_path) = roots.resolve(key) else {
@@ -2399,10 +2411,16 @@ pub(crate) fn classify_point(
         }
     };
     if equal {
-        return PointRead { action: PointAction::BaselineEqual, resident_fed: false, bytes };
+        return PointRead {
+            action: PointAction::BaselineEqual,
+            resident_fed: false,
+            bytes,
+            embedding_failure: None,
+        };
     }
     let parse_root = resident_parse_root(snapshots, key, &content);
     let resident_fed = parse_root.is_some();
+    let mut embedding_failure = None;
     let action = match build_overlay_entry(
         key,
         &content,
@@ -2416,6 +2434,7 @@ pub(crate) fn classify_point(
     ) {
         Ok(entry) => PointAction::Reindexed { entry, has_baseline },
         Err(error) => {
+            embedding_failure = error.embedding_failure();
             tracing::warn!(
                 root = %key.root_id,
                 path = %key.path,
@@ -2424,7 +2443,7 @@ pub(crate) fn classify_point(
             PointAction::BuildFault
         }
     };
-    PointRead { action, resident_fed, bytes }
+    PointRead { action, resident_fed, bytes, embedding_failure }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2709,9 +2728,9 @@ fn build_overlay_vectors(
     }
 
     if let Some(embedder) = embedder {
-        for (batch_indexes, batch_inputs) in
-            missing_indexes.chunks(batch_size.max(1)).zip(missing_inputs.chunks(batch_size.max(1)))
-        {
+        for range in embedder.batch_ranges(&missing_inputs, batch_size)? {
+            let batch_indexes = &missing_indexes[range.clone()];
+            let batch_inputs = &missing_inputs[range];
             // The background warmup runs this off any lock, so it can afford the interactive
             // embed; the hot interactive query path never reaches here (it passes `None`).
             let embeddings = embedder.embed_batch_interactive(batch_inputs)?;
@@ -2795,6 +2814,115 @@ fn cosine_similarity(lhs: &[f32], rhs: &[f32]) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn payload_overlay_builder_maps_cached_gaps_and_retains_partial_work() {
+        use crate::embedder::payload_tests::{success, vector, PayloadServer};
+        let content = (0..4)
+            .map(|i| format!("Процедура Метод{i}()\n    Сообщить(\"{i}\");\nКонецПроцедуры\n\n"))
+            .collect::<String>();
+        let (docs, inputs) = super::build_overlay_documents(
+            &crate::FileKey::configuration("Module.bsl"),
+            &content,
+            None,
+            None,
+        );
+        assert_eq!(docs.len(), 4);
+        let limit = inputs
+            .iter()
+            .map(|t| {
+                serde_json::json!({"model":"fixture","input":[t],"dimensions":3}).to_string().len()
+            })
+            .max()
+            .unwrap();
+        let server =
+            PayloadServer::new(
+                |i, body| if i == 1 { (413, "refused".into()) } else { success(i, body) },
+            );
+        let embedder = crate::Embedder::new(server.config(limit));
+        let mut cache = [1, 3]
+            .into_iter()
+            .map(|i| (super::overlay_embedding_key(&inputs[i]), vector(&inputs[i])))
+            .collect();
+        let error = super::build_overlay_vectors(Some(&embedder), 32, &docs, &inputs, &mut cache)
+            .unwrap_err();
+        assert_eq!(error.to_string(), "embedding_request_too_large");
+        assert_eq!(cache.len(), 3);
+        assert_eq!(server.requests().len(), 2);
+        let result =
+            super::build_overlay_vectors(Some(&embedder), 32, &docs, &inputs, &mut cache).unwrap();
+        assert_eq!(result.len(), 4);
+        assert_eq!(server.requests().len(), 3);
+        for (i, actual) in result.iter().enumerate() {
+            assert_eq!(actual.document.symbol_name, docs[i].symbol_name);
+            assert_eq!(actual.embedding, vector(&inputs[i]));
+        }
+        assert!(server.requests().iter().all(|body| body.len() <= limit));
+    }
+
+    #[test]
+    fn payload_overlay_refresh_settles_every_key_before_exposing_embedding_failure() {
+        use crate::embedder::payload_tests::{success, PayloadServer};
+        for manifest in [false, true] {
+            for dirty in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let content = "Процедура Тест()\nКонецПроцедуры";
+                for file in ["A.bsl", "B.bsl"] {
+                    std::fs::write(dir.path().join(file), content).unwrap();
+                }
+                let roots = single_root(dir.path());
+                let store = Store::open(&dir.path().join("search.db")).unwrap();
+                let mut cache = WorkspaceOverlayCache::default();
+                cache.enable_watcher_mode();
+                let server = PayloadServer::new(|i, body| {
+                    if i == 0 {
+                        (413, "refused".into())
+                    } else {
+                        success(i, body)
+                    }
+                });
+                let embedder = crate::Embedder::new(server.config(4096));
+                if dirty {
+                    cache
+                        .refresh(
+                            &store,
+                            &roots,
+                            None,
+                            32,
+                            super::BaselineHashMode::RawFileBytes,
+                            true,
+                        )
+                        .unwrap();
+                    for file in ["A.bsl", "B.bsl"] {
+                        cache.mark_dirty_path(key(file));
+                    }
+                }
+                let result = if manifest {
+                    cache.refresh_with_manifest(
+                        &HashMap::new(),
+                        &roots,
+                        Some(&embedder),
+                        32,
+                        &store,
+                        true,
+                    )
+                } else {
+                    cache.refresh(
+                        &store,
+                        &roots,
+                        Some(&embedder),
+                        32,
+                        super::BaselineHashMode::RawFileBytes,
+                        true,
+                    )
+                };
+                assert_eq!(result.unwrap_err().to_string(), "embedding_request_too_large");
+                assert_eq!(server.requests().len(), 2, "the second drained key must still settle");
+                assert_eq!(cache.stats().semantic_chunks, 1);
+                assert_eq!(cache.dirty_paths_snapshot().len(), 1);
+            }
+        }
+    }
+
     use super::{
         build_overlay_documents, fingerprint_content, lexical_hits, BaselineHashMode,
         PublishOutcome, WorkspaceOverlayCache, WorkspaceOverlayStats, MAX_DIRTY_REFRESH_FAILURES,
@@ -5366,6 +5494,7 @@ mod tests {
             dim: Some(3),
             api_key: None,
             provider: None,
+            ..Default::default()
         });
         if !deny_access(&broken) {
             return;
@@ -5379,7 +5508,10 @@ mod tests {
             &HashMap::new(),
         );
         restore_access(&broken);
-        assert!(result.is_ok(), "a per-key build fault must not abort the batch");
+        assert!(
+            result.is_err(),
+            "the batch settles every key before returning the embedding failure"
+        );
 
         let rows = store.load_overlay_fingerprint_cache("").unwrap_or(None).unwrap_or_default();
         assert!(
@@ -6570,6 +6702,7 @@ mod tests {
             dim: Some(3),
             api_key: None,
             provider: None,
+            ..Default::default()
         });
         let result = cache.refresh_dirty_paths_from_manifest(
             vec![key("A.bsl"), key("B.bsl")],
@@ -6579,7 +6712,11 @@ mod tests {
             32,
             &HashMap::new(),
         );
-        assert!(result.is_ok(), "one key's build fault must not abort the batch");
+        assert_eq!(
+            result.unwrap_err().embedding_failure().unwrap().code,
+            crate::EmbeddingFailureCode::EmbeddingTransportError,
+            "the settled batch must still report its embedding failure",
+        );
         assert!(
             cache.dirty_paths_snapshot().contains_key(&key("A.bsl")),
             "the build-faulted key stays marked for the retry"
@@ -6599,7 +6736,7 @@ mod tests {
                     32,
                     &HashMap::new(),
                 )
-                .unwrap();
+                .unwrap_err();
         }
         assert!(
             cache.dirty_paths_snapshot().contains_key(&key("A.bsl")),
@@ -6750,10 +6887,15 @@ mod tests {
             dim: Some(3),
             api_key: None,
             provider: None,
+            ..Default::default()
         });
         let result =
             cache.full_refresh_from_manifest(&manifest, &roots, Some(&embedder), 32, &store);
-        assert!(result.is_ok(), "per-key faults must not abort the full pass");
+        assert_eq!(
+            result.unwrap_err().embedding_failure().unwrap().code,
+            crate::EmbeddingFailureCode::EmbeddingTransportError,
+            "the full pass reports its failure after settling the publication tail",
+        );
         assert!(
             cache.dirty_paths_snapshot().contains_key(&key("A.bsl")),
             "the unreadable file keeps its retry mark"

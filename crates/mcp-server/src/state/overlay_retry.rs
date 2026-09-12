@@ -434,10 +434,24 @@ impl OverlayRetry {
         self.passes_started.load(Ordering::SeqCst)
     }
 
+    fn set_runtime_status(&self, status: SemanticRuntimeStatus) {
+        if let Ok(mut runtime) = self.semantic_runtime.lock() {
+            // The main embedding pass owns its failure until its next attempt. Overlay work
+            // keeps its own failure in overlay_warmup and cannot clear the main owner's cause.
+            if runtime.embedding_failure().is_none() {
+                *runtime = status;
+            }
+        }
+    }
+
     fn run_pass(&self) -> super::WorkspaceSearchApply<OverlayWarmupState, String> {
         #[cfg(test)]
         self.passes_started.fetch_add(1, Ordering::SeqCst);
         let _active = PassActive::raise(&self.pass_active);
+        super::SharedState::set_overlay_warmup_state(
+            &self.overlay_warmup,
+            OverlayWarmupState::Pending,
+        );
         // The syncing status is shown only for a pass that can actually reach the engine;
         // flipping it while the engine is absent would mask a terminal init `Failed`.
         let engine_present = self
@@ -446,18 +460,12 @@ impl OverlayRetry {
             .map(|guard| guard.as_ref().is_some())
             .unwrap_or(false);
         if engine_present && self.lease.is_superseded() {
-            super::SharedState::set_semantic_runtime_status(
-                &self.semantic_runtime,
-                SemanticRuntimeStatus::Failed(
-                    "workspace cache ownership was superseded; reconnect to use the new daemon"
-                        .to_owned(),
-                ),
-            );
+            self.set_runtime_status(SemanticRuntimeStatus::Failed(
+                "workspace cache ownership was superseded; reconnect to use the new daemon"
+                    .to_owned(),
+            ));
         } else if engine_present {
-            super::SharedState::set_semantic_runtime_status(
-                &self.semantic_runtime,
-                SemanticRuntimeStatus::OverlaySyncing,
-            );
+            self.set_runtime_status(SemanticRuntimeStatus::OverlaySyncing);
         }
         let stop = self.stop.clone();
         let mut publish_retry =
@@ -517,31 +525,22 @@ impl OverlayRetry {
         if engine_present {
             match &outcome {
                 super::WorkspaceSearchApply::Applied(_) => {
-                    super::SharedState::set_semantic_runtime_status(
-                        &self.semantic_runtime,
-                        SemanticRuntimeStatus::Ready,
-                    );
+                    self.set_runtime_status(SemanticRuntimeStatus::Ready);
                 }
                 // Nothing to say about a pass that was asked to stop: the status it would
                 // write is about work nobody is doing any more.
                 super::WorkspaceSearchApply::TransientRefusal
                 | super::WorkspaceSearchApply::Stopping => {}
                 super::WorkspaceSearchApply::OperationError(error) => {
-                    super::SharedState::set_semantic_runtime_status(
-                        &self.semantic_runtime,
-                        SemanticRuntimeStatus::Failed(format!(
-                            "workspace overlay embedding failed: {error}"
-                        )),
-                    );
+                    self.set_runtime_status(SemanticRuntimeStatus::Failed(format!(
+                        "workspace overlay embedding failed: {error}"
+                    )));
                 }
                 super::WorkspaceSearchApply::Superseded => {
-                    super::SharedState::set_semantic_runtime_status(
-                        &self.semantic_runtime,
-                        SemanticRuntimeStatus::Failed(
-                            "workspace cache ownership was superseded; reconnect to use the new daemon"
-                                .to_owned(),
-                        ),
-                    );
+                    self.set_runtime_status(SemanticRuntimeStatus::Failed(
+                        "workspace cache ownership was superseded; reconnect to use the new daemon"
+                            .to_owned(),
+                    ));
                 }
                 super::WorkspaceSearchApply::Released => {}
             }
@@ -604,19 +603,17 @@ impl OverlayRetry {
             super::WorkspaceSearchApply::OperationError(error) => {
                 state.failed = true;
                 state.obligation = false;
-                super::SharedState::set_semantic_runtime_status(
-                    &self.semantic_runtime,
-                    SemanticRuntimeStatus::Failed(format!(
-                        "workspace overlay embedding failed: {error}"
-                    )),
-                );
+                self.set_runtime_status(SemanticRuntimeStatus::Failed(format!(
+                    "workspace overlay embedding failed: {error}"
+                )));
             }
             super::WorkspaceSearchApply::Superseded
             | super::WorkspaceSearchApply::Released
             | super::WorkspaceSearchApply::Applied(
                 OverlayWarmupState::Pending
                 | OverlayWarmupState::Skipped(_)
-                | OverlayWarmupState::Failed(_),
+                | OverlayWarmupState::Failed(_)
+                | OverlayWarmupState::EmbeddingFailed(_),
             ) => {
                 state.disarmed = true;
                 state.obligation = false;
@@ -642,13 +639,9 @@ impl OverlayRetry {
     fn disarm_superseded(&self, state: &mut RetryState) {
         state.disarmed = true;
         state.obligation = false;
-        super::SharedState::set_semantic_runtime_status(
-            &self.semantic_runtime,
-            SemanticRuntimeStatus::Failed(
-                "workspace cache ownership was superseded; reconnect to use the new daemon"
-                    .to_owned(),
-            ),
-        );
+        self.set_runtime_status(SemanticRuntimeStatus::Failed(
+            "workspace cache ownership was superseded; reconnect to use the new daemon".to_owned(),
+        ));
     }
 }
 
@@ -725,6 +718,66 @@ mod tests {
 
     /// The schedule itself: no delay after a clean pass, exponential growth from one tick,
     /// a hard cap — apart from the thread, so the shape is provable.
+    #[test]
+    fn payload_lifecycle_overlay_failure_and_retry_preserve_the_main_owner() {
+        let _lock = env_lock();
+        let server = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("Module.bsl");
+        std::fs::write(
+            &path,
+            format!("Процедура Большая()\nЗначение = \"{}\";\nКонецПроцедуры", "x".repeat(8192)),
+        )
+        .unwrap();
+        let mut config = mock_semantic_config(&server);
+        config.embedder.max_request_bytes = 2048;
+        let mut engine = SearchEngine::new(&dir.path().join("search.db"), config).unwrap();
+        engine.set_workspace_root(dir.path());
+        let retry = unstarted_driver_over(
+            Arc::new(crate::state::shared_engine(Some(engine))),
+            WorkspaceLease::unmanaged(),
+        );
+        let main_failure = bsl_search::EmbeddingFailure::new(
+            bsl_search::EmbeddingFailureCode::EmbeddingTransportError,
+        );
+        *retry.semantic_runtime.lock().unwrap() =
+            SemanticRuntimeStatus::EmbeddingFailed(main_failure);
+        let failed = retry.run_pass();
+        assert!(matches!(failed, super::super::WorkspaceSearchApply::OperationError(_)));
+        let overlay_failure = retry
+            .overlay_warmup
+            .lock()
+            .unwrap()
+            .embedding_failure()
+            .expect("the actual prime failure reaches the overlay owner");
+        assert_eq!(overlay_failure.code, bsl_search::EmbeddingFailureCode::EmbeddingInputTooLarge);
+        assert_eq!(retry.semantic_runtime.lock().unwrap().embedding_failure(), Some(main_failure));
+
+        retry.settle_outcome_at(&mut state(), failed, 0, Instant::now());
+        assert_eq!(retry.semantic_runtime.lock().unwrap().embedding_failure(), Some(main_failure));
+        super::super::SharedState::set_semantic_runtime_status(
+            &retry.semantic_runtime,
+            SemanticRuntimeStatus::Ready,
+        );
+        assert_eq!(retry.overlay_warmup.lock().unwrap().embedding_failure(), Some(overlay_failure));
+
+        *retry.semantic_runtime.lock().unwrap() =
+            SemanticRuntimeStatus::EmbeddingFailed(main_failure);
+        std::fs::write(&path, "Процедура Малая()\nКонецПроцедуры").unwrap();
+        let guard = retry.engine.lock().unwrap();
+        let next = Arc::clone(&retry);
+        let attempt = std::thread::spawn(move || next.run_pass());
+        let cleared_at_start = wait_for(1000, || {
+            matches!(*retry.overlay_warmup.lock().unwrap(), OverlayWarmupState::Pending)
+        });
+        drop(guard);
+        let recovered = attempt.join().unwrap();
+        assert!(cleared_at_start, "an admitted attempt clears only its own previous failure");
+        assert!(matches!(recovered, super::super::WorkspaceSearchApply::Applied(_)));
+        assert!(retry.overlay_warmup.lock().unwrap().embedding_failure().is_none());
+        assert_eq!(retry.semantic_runtime.lock().unwrap().embedding_failure(), Some(main_failure));
+    }
+
     #[test]
     fn the_retry_delay_grows_exponentially_to_a_cap() {
         assert_eq!(retry_delay(0), Duration::ZERO);

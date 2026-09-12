@@ -786,6 +786,10 @@ impl SharedState {
         Arc::clone(&self.reference_search.engine)
     }
 
+    pub(crate) fn reference_semantic_runtime(&self) -> Arc<Mutex<SemanticRuntimeStatus>> {
+        Arc::clone(&self.reference_search.semantic_runtime)
+    }
+
     pub(crate) fn reference_baseline_view(&self) -> crate::baseline::BaselineView {
         self.reference_search.baseline.view()
     }
