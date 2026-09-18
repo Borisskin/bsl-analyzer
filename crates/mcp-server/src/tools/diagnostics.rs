@@ -1710,9 +1710,11 @@ mod tests {
 
         /// A form module, whose methods are addressed by the `method/file/<rel>::<name>`
         /// path-fallback id — the only id form a strip root takes part in.
+        #[cfg(unix)]
         const FORM_MODULE_REL: &str = "CommonForms/Форма/Ext/Form/Module.bsl";
 
         /// Every finding's graph bridge, in the order the response lists them.
+        #[cfg(unix)]
         fn graph_ids(body: &Value) -> Vec<&str> {
             body["findings"]
                 .as_array()
@@ -1724,6 +1726,7 @@ mod tests {
 
         /// The card `symbol_info` builds for the method a finding sits in, by the same
         /// resident. `None` when the request does not resolve or the card carries no id.
+        #[cfg(unix)]
         fn card_graph_id(state: &DiagnosticsState, path: &Path, line: u32) -> Option<String> {
             match state.read(|resident, _| {
                 crate::tools::symbol_info::resolve_card(

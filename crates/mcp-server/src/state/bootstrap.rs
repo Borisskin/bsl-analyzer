@@ -291,6 +291,12 @@ impl SharedState {
     ) -> Result<Self, WorkspaceInitError> {
         let project = crate::project::at(&source_dir)?;
         let source_root = project.configuration_path().map(Path::to_path_buf);
+        let notices: Vec<String> =
+            [project.standalone_extension_notice(), project.standalone_external_notice()]
+                .into_iter()
+                .flatten()
+                .collect();
+        let standalone_notice = (!notices.is_empty()).then(|| notices.join("\n"));
 
         // One value, used by everything that reads the tree: the watch, the walk that
         // feeds the graph and the search index, and the roots the engine registers. Two
@@ -483,6 +489,7 @@ impl SharedState {
         Ok(Self {
             workspace_root: Some(source_dir),
             source_root,
+            standalone_notice,
             onec_client: None,
             onec_connections: Default::default(),
             debug_session: Arc::new(Mutex::new(None)),
@@ -661,7 +668,10 @@ impl SharedState {
                         Ok(bsl_search::FenceOutcome::TransientRefusal) => {
                             unreachable!("startup_apply retries transient refusals")
                         }
-                        Ok(bsl_search::FenceOutcome::Terminal) => Ok(None),
+                        Ok(
+                            bsl_search::FenceOutcome::Superseded
+                            | bsl_search::FenceOutcome::Released,
+                        ) => Ok(None),
                         Err(error) => Err(error),
                     },
                     OverlayInit::RemoteWarmup => Ok(Some(())),
@@ -804,6 +814,7 @@ impl SharedState {
         Self {
             workspace_root: None,
             source_root: None,
+            standalone_notice: None,
             onec_client: None,
             onec_connections: Default::default(),
             debug_session: Arc::new(Mutex::new(None)),
@@ -830,6 +841,7 @@ impl SharedState {
         Self {
             workspace_root: None,
             source_root: None,
+            standalone_notice: None,
             onec_client: None,
             onec_connections: Default::default(),
             debug_session: Arc::new(Mutex::new(None)),
@@ -968,19 +980,11 @@ impl SharedState {
         lease: &crate::workspace_lease::WorkspaceLease,
         mut apply: impl FnMut() -> Result<T, bsl_search::SearchError>,
     ) -> bsl_search::FenceOutcome<Result<T, bsl_search::SearchError>> {
-        loop {
-            match lease.with_ownership_outcome(&mut apply) {
-                crate::workspace_lease::LeaseOutcome::Applied(result) => {
-                    return bsl_search::FenceOutcome::Applied(result)
-                }
-                crate::workspace_lease::LeaseOutcome::TransientRefusal => {
-                    std::thread::sleep(crate::workspace_lease::VERDICT_TTL)
-                }
-                crate::workspace_lease::LeaseOutcome::Terminal => {
-                    return bsl_search::FenceOutcome::Terminal
-                }
-            }
-        }
+        Self::startup_retry(
+            || Self::search_fence_outcome(lease.publish_short(&mut (), |_| apply())),
+            std::time::Instant::now,
+            std::thread::sleep,
+        )
     }
 
     pub(super) fn startup_apply_checkpointed(
@@ -989,17 +993,40 @@ impl SharedState {
             &mut dyn FnMut() -> std::ops::ControlFlow<()>,
         ) -> std::ops::ControlFlow<(), Result<(), bsl_search::SearchError>>,
     ) -> bsl_search::FenceOutcome<Result<(), bsl_search::SearchError>> {
+        Self::startup_retry(
+            || {
+                Self::search_fence_outcome(
+                    lease.publish_checkpointed(|checkpoint| apply(checkpoint)),
+                )
+            },
+            std::time::Instant::now,
+            std::thread::sleep,
+        )
+    }
+
+    fn startup_retry<T>(
+        mut attempt: impl FnMut() -> bsl_search::FenceOutcome<Result<T, bsl_search::SearchError>>,
+        mut now: impl FnMut() -> std::time::Instant,
+        mut sleep: impl FnMut(std::time::Duration),
+    ) -> bsl_search::FenceOutcome<Result<T, bsl_search::SearchError>> {
+        use super::retry_window::{RetryDecision, RetryOwner, RetryWindow};
+
+        let mut retry = RetryWindow::new(RetryOwner::Startup);
         loop {
-            match lease.with_ownership_checkpointed(|checkpoint| apply(checkpoint)) {
-                crate::workspace_lease::LeaseOutcome::Applied(result) => {
-                    return bsl_search::FenceOutcome::Applied(result)
+            match attempt() {
+                bsl_search::FenceOutcome::TransientRefusal => {
+                    match retry.refused(now(), std::time::Duration::from_secs(2)) {
+                        RetryDecision::RetryAfter(delay) => sleep(delay),
+                        RetryDecision::Stop(_) => {
+                            return bsl_search::FenceOutcome::Applied(Err(
+                                bsl_search::SearchError::Index(
+                                    "workspace lease startup retry budget exhausted".to_owned(),
+                                ),
+                            ));
+                        }
+                    }
                 }
-                crate::workspace_lease::LeaseOutcome::TransientRefusal => {
-                    std::thread::sleep(crate::workspace_lease::VERDICT_TTL)
-                }
-                crate::workspace_lease::LeaseOutcome::Terminal => {
-                    return bsl_search::FenceOutcome::Terminal
-                }
+                outcome => return outcome,
             }
         }
     }
@@ -1017,31 +1044,23 @@ impl SharedState {
         match outcome {
             bsl_search::FenceOutcome::Applied(Ok(())) => Ok(value),
             bsl_search::FenceOutcome::Applied(Err(error)) => Err(error),
-            bsl_search::FenceOutcome::Terminal => Ok(None),
+            bsl_search::FenceOutcome::Superseded | bsl_search::FenceOutcome::Released => Ok(None),
             bsl_search::FenceOutcome::TransientRefusal => {
                 unreachable!("startup_apply retries transient refusals")
             }
         }
     }
 
-    fn startup_apply_checkpointed_once<T>(
+    fn startup_apply_checkpointed_value<T>(
         lease: &crate::workspace_lease::WorkspaceLease,
-        operation: impl FnOnce(
+        mut operation: impl FnMut(
             &mut dyn FnMut() -> std::ops::ControlFlow<()>,
-        ) -> std::ops::ControlFlow<(), Result<T, bsl_search::SearchError>>,
+        )
+            -> std::ops::ControlFlow<(), Result<T, bsl_search::SearchError>>,
     ) -> Result<Option<T>, bsl_search::SearchError> {
-        let mut operation = Some(operation);
         let mut value = None;
-        let outcome = Self::startup_apply_checkpointed(lease, |checkpoint| {
-            let operation = match operation.take() {
-                Some(operation) => operation,
-                None => {
-                    return std::ops::ControlFlow::Continue(Err(bsl_search::SearchError::Index(
-                        "checkpointed startup operation invoked more than once".to_owned(),
-                    )));
-                }
-            };
-            match operation(checkpoint) {
+        let outcome =
+            Self::startup_apply_checkpointed(lease, |checkpoint| match operation(checkpoint) {
                 std::ops::ControlFlow::Break(()) => std::ops::ControlFlow::Break(()),
                 std::ops::ControlFlow::Continue(Err(error)) => {
                     std::ops::ControlFlow::Continue(Err(error))
@@ -1050,12 +1069,11 @@ impl SharedState {
                     value = Some(result);
                     std::ops::ControlFlow::Continue(Ok(()))
                 }
-            }
-        });
+            });
         match outcome {
             bsl_search::FenceOutcome::Applied(Ok(())) => Ok(value),
             bsl_search::FenceOutcome::Applied(Err(error)) => Err(error),
-            bsl_search::FenceOutcome::Terminal => Ok(None),
+            bsl_search::FenceOutcome::Superseded | bsl_search::FenceOutcome::Released => Ok(None),
             bsl_search::FenceOutcome::TransientRefusal => {
                 unreachable!("startup apply retries transient refusals")
             }
@@ -1079,7 +1097,7 @@ impl SharedState {
             bsl_search::FenceOutcome::TransientRefusal => {
                 unreachable!("startup_apply retries transient refusals")
             }
-            bsl_search::FenceOutcome::Terminal => None,
+            bsl_search::FenceOutcome::Superseded | bsl_search::FenceOutcome::Released => None,
         })
     }
 
@@ -1100,7 +1118,7 @@ impl SharedState {
             bsl_search::FenceOutcome::TransientRefusal => {
                 unreachable!("startup_apply retries transient refusals")
             }
-            bsl_search::FenceOutcome::Terminal => None,
+            bsl_search::FenceOutcome::Superseded | bsl_search::FenceOutcome::Released => None,
         })
     }
 
@@ -1154,7 +1172,14 @@ impl SharedState {
         store: &bsl_search::Store,
         lease: &crate::workspace_lease::WorkspaceLease,
     ) {
-        if let Err(error) = Self::startup_apply_once(lease, || store.clear_baseline_manifest()) {
+        let cleared = Self::startup_apply_checkpointed_value(lease, |checkpoint| {
+            match store.clear_baseline_manifest_checkpointed(checkpoint) {
+                Ok(std::ops::ControlFlow::Continue(())) => std::ops::ControlFlow::Continue(Ok(())),
+                Ok(std::ops::ControlFlow::Break(())) => std::ops::ControlFlow::Break(()),
+                Err(error) => std::ops::ControlFlow::Continue(Err(error)),
+            }
+        });
+        if let Err(error) = cleared {
             tracing::warn!("failed to clear stale workspace baseline manifest: {error}");
         }
     }
@@ -1226,20 +1251,22 @@ impl SharedState {
                 return Ok(None);
             };
             let roots = Self::roots_of(&project, &excluded);
-            let Some(()) = Self::startup_apply_once(lease, || {
-                Self::configure_workspace_engine(
+            let Some(()) = Self::startup_apply_checkpointed_value(lease, |checkpoint| {
+                if let Err(error) = Self::configure_workspace_engine(
                     &mut engine,
-                    roots,
+                    roots.clone(),
                     BaselineHashMode::NormalizedChunks,
-                )?;
-                engine.set_serves_external_baseline(true)
+                ) {
+                    return std::ops::ControlFlow::Continue(Err(error));
+                }
+                engine.set_serves_external_baseline_checkpointed(true, checkpoint)
             })?
             else {
                 return Ok(None);
             };
 
             let store = engine.store();
-            let Some(()) = Self::startup_apply_checkpointed_once(lease, |checkpoint| match store
+            let Some(()) = Self::startup_apply_checkpointed_value(lease, |checkpoint| match store
                 .clear_workspace_overlay_checkpointed("code", checkpoint)
             {
                 Ok(std::ops::ControlFlow::Continue(())) => std::ops::ControlFlow::Continue(Ok(())),
@@ -1288,8 +1315,18 @@ impl SharedState {
                         {
                             Ok(manifest) => {
                                 let manifest_files = manifest.files.len();
-                                match Self::startup_apply_once(lease, || {
-                                    store.save_baseline_manifest(&manifest)
+                                match Self::startup_apply_checkpointed_value(lease, |checkpoint| {
+                                    match store
+                                        .save_baseline_manifest_checkpointed(&manifest, checkpoint)
+                                    {
+                                        Ok(std::ops::ControlFlow::Continue(())) => {
+                                            std::ops::ControlFlow::Continue(Ok(()))
+                                        }
+                                        Ok(std::ops::ControlFlow::Break(())) => {
+                                            std::ops::ControlFlow::Break(())
+                                        }
+                                        Err(error) => std::ops::ControlFlow::Continue(Err(error)),
+                                    }
                                 }) {
                                     Ok(Some(())) => {}
                                     Ok(None) => return Ok(None),
@@ -1366,9 +1403,15 @@ impl SharedState {
         // a row surviving the local period would suppress a same-stat edit after a switch
         // back to the same snapshot. A failed clear leaves that lie standing, so the boot
         // fails closed, exactly like the Postgres branch does on its own failed clears.
-        let Some(()) = Self::startup_apply_once(lease, || {
-            Self::configure_workspace_engine(&mut engine, roots, BaselineHashMode::RawFileBytes)?;
-            engine.set_serves_external_baseline(false)
+        let Some(()) = Self::startup_apply_checkpointed_value(lease, |checkpoint| {
+            if let Err(error) = Self::configure_workspace_engine(
+                &mut engine,
+                roots.clone(),
+                BaselineHashMode::RawFileBytes,
+            ) {
+                return std::ops::ControlFlow::Continue(Err(error));
+            }
+            engine.set_serves_external_baseline_checkpointed(false, checkpoint)
         })?
         else {
             return Ok(None);
@@ -1455,7 +1498,9 @@ impl SharedState {
                         tracing::info!(indexed, "FTS + graph context written; embedding deferred");
                     }
                 }
-                Ok(bsl_search::FenceOutcome::Terminal) => return Ok(None),
+                Ok(bsl_search::FenceOutcome::Superseded | bsl_search::FenceOutcome::Released) => {
+                    return Ok(None)
+                }
                 Ok(bsl_search::FenceOutcome::TransientRefusal) => {
                     unreachable!("startup_apply retries transient refusals")
                 }
@@ -1503,7 +1548,9 @@ impl SharedState {
                 Ok(bsl_search::FenceOutcome::Applied(indexed)) => {
                     tracing::info!(indexed, "FTS index built")
                 }
-                Ok(bsl_search::FenceOutcome::Terminal) => return Ok(None),
+                Ok(bsl_search::FenceOutcome::Superseded | bsl_search::FenceOutcome::Released) => {
+                    return Ok(None)
+                }
                 Ok(bsl_search::FenceOutcome::TransientRefusal) => {
                     unreachable!("startup_apply retries transient refusals")
                 }
@@ -1533,7 +1580,9 @@ impl SharedState {
                     )
                 }
                 Ok(bsl_search::FenceOutcome::Applied(_)) => {}
-                Ok(bsl_search::FenceOutcome::Terminal) => return Ok(None),
+                Ok(bsl_search::FenceOutcome::Superseded | bsl_search::FenceOutcome::Released) => {
+                    return Ok(None)
+                }
                 Ok(bsl_search::FenceOutcome::TransientRefusal) => {
                     unreachable!("startup_apply retries transient refusals")
                 }
@@ -1840,7 +1889,7 @@ mod tests {
         };
         assert!(matches!(
             SharedState::startup_apply(&old, &mut terminal_apply),
-            bsl_search::FenceOutcome::Terminal
+            bsl_search::FenceOutcome::Superseded
         ));
         assert!(old.is_superseded());
         assert_eq!(terminal_calls.load(Ordering::SeqCst), 0);
@@ -1850,7 +1899,7 @@ mod tests {
         released.release();
         assert!(matches!(
             SharedState::startup_apply(&released, &mut || Ok(())),
-            bsl_search::FenceOutcome::Terminal
+            bsl_search::FenceOutcome::Released
         ));
 
         let error = SharedState::startup_apply(
@@ -1862,6 +1911,49 @@ mod tests {
             bsl_search::FenceOutcome::Applied(Err(bsl_search::SearchError::Index(message)))
                 if message == "expected"
         ));
+    }
+
+    #[test]
+    fn startup_lease_retry_stops_at_600_seconds() {
+        let started = std::time::Instant::now();
+        let clock = std::cell::Cell::new(started);
+        let attempts = std::cell::Cell::new(0_u16);
+        let outcome = SharedState::startup_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                bsl_search::FenceOutcome::<Result<(), bsl_search::SearchError>>::TransientRefusal
+            },
+            || clock.get(),
+            |delay| clock.set(clock.get().checked_add(delay).unwrap()),
+        );
+
+        assert!(matches!(
+            outcome,
+            bsl_search::FenceOutcome::Applied(Err(bsl_search::SearchError::Index(message)))
+                if message == "workspace lease startup retry budget exhausted"
+        ));
+        assert_eq!(clock.get().duration_since(started), std::time::Duration::from_secs(600));
+        assert_eq!(attempts.get(), 301);
+    }
+
+    #[test]
+    fn checkpoint_refusal_retries_the_startup_transaction() {
+        let dir = tempdir().unwrap();
+        let lease = crate::workspace_lease::WorkspaceLease::claim(dir.path());
+        lease.fail_next_checkpoint_lock_for_test();
+        let mut attempts = 0_u8;
+
+        let result = SharedState::startup_apply_checkpointed_value(&lease, |checkpoint| {
+            attempts += 1;
+            if checkpoint().is_break() {
+                return std::ops::ControlFlow::Break(());
+            }
+            std::ops::ControlFlow::Continue(Ok(attempts))
+        })
+        .unwrap();
+
+        assert_eq!(result, Some(2));
+        assert_eq!(attempts, 2);
     }
 
     #[test]
@@ -1956,7 +2048,7 @@ mod tests {
                 result
             })
             .unwrap();
-        assert!(matches!(result, bsl_search::FenceOutcome::Terminal));
+        assert!(matches!(result, bsl_search::FenceOutcome::Superseded));
         assert_eq!(
             admitted,
             bsl_search::WORKSPACE_APPLY_BATCH_ROWS,
@@ -1975,7 +2067,7 @@ mod tests {
                     SharedState::startup_apply(&old, apply)
                 })
                 .unwrap(),
-            bsl_search::FenceOutcome::Terminal
+            bsl_search::FenceOutcome::Superseded
         ));
         assert_eq!(
             partial.file_count().unwrap(),
@@ -2005,7 +2097,7 @@ mod tests {
                     SharedState::startup_apply(&old, apply)
                 })
                 .unwrap(),
-            bsl_search::FenceOutcome::Terminal
+            bsl_search::FenceOutcome::Superseded
         ));
         assert!(!prime.workspace_overlay_retry_signals().unwrap().initialized);
         drop(newer);

@@ -122,9 +122,17 @@ fn selective_lsp_enabled_error_is_fail_visible_and_recovers() {
         .to_owned();
     let object = root.join("baselines").join(&relative);
     let valid = std::fs::read(&object).unwrap();
+    let directory =
+        project_model::ManagedBaselineDirectory::open(root, "baselines", false).unwrap();
+    // Publish one complete state: truncate/write can expose an empty file with a
+    // different error epoch between two identical corrupt snapshots.
+    let replace_object = |contents: &[u8]| {
+        directory.create_file_new("replacement.tmp").unwrap().write_all(contents).unwrap();
+        directory.replace_file("replacement.tmp", &relative).unwrap();
+    };
     // Broken ONCE: the write may land before the watcher is armed and raise no event, and
     // the server has to notice it anyway, the next time the client asks it for anything.
-    std::fs::write(&object, b"{broken").unwrap();
+    replace_object(b"{broken");
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let main_uri = lsp_types::Url::from_file_path(root.join("src/cf/Main.bsl")).unwrap();
     let ext_uri = lsp_types::Url::from_file_path(root.join("src/cfe/Ext/Ext.bsl")).unwrap();
@@ -151,7 +159,7 @@ fn selective_lsp_enabled_error_is_fail_visible_and_recovers() {
         }
     }
 
-    std::fs::write(&object, b"{broken").unwrap();
+    replace_object(b"{broken");
     let duplicate = std::time::Instant::now() + Duration::from_millis(500);
     while std::time::Instant::now() < duplicate {
         match lsp.messages.recv_timeout(Duration::from_millis(50)) {
@@ -159,17 +167,15 @@ fn selective_lsp_enabled_error_is_fail_visible_and_recovers() {
                 message["method"] != "window/showMessage"
                     || !message["params"]["message"]
                         .as_str()
-                        .is_some_and(|message| message.contains("diagnostics baseline"))
+                        .is_some_and(|message| message.contains("diagnostics baseline")),
+                "unchanged baseline error was reported again: {message}"
             ),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 
-    let directory =
-        project_model::ManagedBaselineDirectory::open(root, "baselines", false).unwrap();
-    directory.create_file_new("replacement.tmp").unwrap().write_all(&valid).unwrap();
-    directory.replace_file("replacement.tmp", &relative).unwrap();
+    replace_object(&valid);
     let mut main_seen = false;
     let mut ext_seen = false;
     let repaired = std::time::Instant::now() + Duration::from_secs(60);
@@ -194,7 +200,7 @@ fn selective_lsp_enabled_error_is_fail_visible_and_recovers() {
         }
     }
 
-    std::fs::write(&object, b"{broken-again").unwrap();
+    replace_object(b"{broken-again");
     let again = std::time::Instant::now() + Duration::from_secs(60);
     let notified = loop {
         if let Some(message) = lsp.wait_for_within(Duration::from_secs(1), |message| {

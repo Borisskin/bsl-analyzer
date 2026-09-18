@@ -10,7 +10,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use mcp_server::{serve_stream, McpProfile, McpServer, SharedState};
+use mcp_server::{serve_stream, McpProfile, McpServer, SharedState, WorkspaceCacheLayout};
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::RunningService;
 use rmcp::{RoleClient, ServiceExt};
@@ -49,6 +49,21 @@ async fn workspace_client(root: &Path, warm: bool) -> Client {
     let (client_io, server_io) = tokio::io::duplex(4 * 1024 * 1024);
     tokio::spawn(serve_stream(server, server_io));
     ().serve(client_io).await.expect("session initialized")
+}
+
+async fn client_without_graph(root: &Path) -> (Client, std::fs::File) {
+    // Hold before construction: startup may otherwise publish before the first request.
+    let cache = WorkspaceCacheLayout::for_workspace(root);
+    cache.ensure().unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(cache.lease_lock_path())
+        .unwrap();
+    lock.lock().unwrap();
+    (workspace_client(root, true).await, lock)
 }
 
 fn args(pairs: &[(&str, Value)]) -> Map<String, Value> {
@@ -148,19 +163,11 @@ fn provider_of(body: &Value, category: &str) -> Option<String> {
         .and_then(|c| c["provider"].as_str().map(str::to_owned))
 }
 
-/// И2. The platform and the configuration's own tables answer by name — not the graph.
-///
-/// Which source answered IS the claim: with a built graph a metadata object is also found by
-/// its `mdo/…` node, so asserting merely that a candidate came back would pass on an
-/// implementation that only relabelled a graph hit. This used to be gated by asking before
-/// the graph had published, which is no precondition at all but a bet on which of two
-/// background builds finishes first — won on a loaded machine and lost on an idle one. The
-/// row names its own source, so the claim can be asserted outright and holds whatever the
-/// graph is doing.
+/// И2. Dictionary providers answer while a held lease prevents graph publication.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_configuration_and_the_platform_answer_by_name() {
     let ws = stage_workspace();
-    let client = workspace_client(ws.path(), true).await;
+    let (client, _lock) = client_without_graph(ws.path()).await;
     wait_until_resident_is_ready(&client).await;
 
     let platform = resolve(&client, "СтрНайти").await;
@@ -186,32 +193,22 @@ async fn the_configuration_and_the_platform_answer_by_name() {
     );
 }
 
-/// И3 end to end: every source is NAMED whatever it is doing, and once the graph is built
-/// it answers and nothing is building any more.
-///
-/// What this stand does NOT pin is the graph being unconsulted when the first question is
-/// asked. The graph is a second background build racing this one: waiting for the resident
-/// and asserting the graph has not published yet is not a precondition, it is a bet on which
-/// build finishes first. The half that needs the graph held unconsulted is
-/// `tools::graph::tests::an_unconsulted_source_is_named_not_merely_missing`, where that
-/// verdict is stated to the dictionary exactly as the handler states it. What is left here
-/// is the half only a live server can show.
+/// И3. An unconsulted graph is named; releasing the lease lets it answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_source_is_named_before_and_after_the_graph_is_built() {
     let ws = stage_workspace();
-    let client = workspace_client(ws.path(), true).await;
+    let (client, lock) = client_without_graph(ws.path()).await;
     wait_until_resident_is_ready(&client).await;
 
     let building = resolve(&client, "СтрНайти").await;
     assert!(!candidates(&building).is_empty(), "{building}");
     assert_eq!(provider_state(&building, "platform"), "answered", "{building}");
-    // Read out, never asserted: an unnamed source is one a consumer cannot decide to wait
-    // for, and `provider_state` fails if the graph is missing from the list at all.
-    let _ = provider_state(&building, "graph");
+    assert_eq!(provider_state(&building, "graph"), "not_ready", "{building}");
+    assert!(reason_codes(&building).iter().any(|c| c == "index_building"), "{building}");
 
-    // Deterministic by construction: the wait makes the graph's verdict an input rather
-    // than something to hope for. Without it an implementation that reported `not_ready`
-    // for ever would go unnoticed, since nothing above asserts the graph's state.
+    // The positive control. Without it the assertions above pass on an
+    // implementation that reports `not_ready` unconditionally.
+    drop(lock);
     wait_until_graph_is_ready(&client).await;
     let built = resolve(&client, "СтрНайти").await;
     assert_eq!(provider_state(&built, "graph"), "answered", "{built}");
@@ -221,26 +218,23 @@ async fn every_source_is_named_before_and_after_the_graph_is_built() {
     );
 }
 
-/// И4 end to end: once every source has answered, an empty list IS the answer.
-///
-/// What this stand does NOT pin is the other half — the same emptiness while a source is
-/// still unconsulted, which must NOT read as complete. Asking for it before the graph
-/// publishes is no precondition: it is a bet on which of two background builds finishes
-/// first, won on a loaded machine and lost on an idle one. That half is stated where the
-/// graph's verdict is an input rather than a hope: over the dictionary's own answer in
-/// `tools::graph::tests::an_empty_list_while_a_source_is_unconsulted_is_not_a_proven_zero`,
-/// and over the envelope this action assembles for itself in
-/// `resolve_envelope::an_unconsulted_source_makes_the_resolve_envelope_partial`. What is left
-/// here is the half only a live server can show: every source really did answer, and the
-/// envelope stops hedging.
+/// И4. The same empty answer is partial under the held lease and complete after release.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_empty_list_says_whether_it_is_a_proven_zero() {
     let ws = stage_workspace();
-    let client = workspace_client(ws.path(), true).await;
+    let (client, lock) = client_without_graph(ws.path()).await;
     wait_until_resident_is_ready(&client).await;
 
     const ABSENT: &str = "ЗаведомоНесуществующееИмяСимвола";
 
+    let building = resolve(&client, ABSENT).await;
+    assert!(candidates(&building).is_empty(), "{building}");
+    assert!(
+        reason_codes(&building).iter().any(|c| c == "index_building"),
+        "an empty list while the graph builds must not read as complete: {building}",
+    );
+
+    drop(lock);
     wait_until_graph_is_ready(&client).await;
     let settled = resolve(&client, ABSENT).await;
     assert!(candidates(&settled).is_empty(), "{settled}");
@@ -260,19 +254,11 @@ async fn an_empty_list_says_whether_it_is_a_proven_zero() {
 /// would leave the list empty under either implementation, which is why the test that asked
 /// for one proved nothing.
 ///
-/// What this stand does NOT pin is the graph's own state, and that is deliberate. The graph
-/// is a second background build racing this one: waiting for the resident and asserting the
-/// graph has not published yet is not a precondition, it is a bet on which build finishes
-/// first — won on a loaded machine and lost on an idle one. The half that needs the graph
-/// held not-ready is
-/// [`crate::tools::symbol_info::tests::a_resident_miss_is_answered_by_the_platform_while_the_graph_is_not_ready`],
-/// where that verdict is stated to the dictionary exactly as the handler states it. What is
-/// left here is the half only a live server can show: the whole path answers a miss with the
-/// platform's candidate, whatever the graph happens to be doing.
+/// The held lease keeps the graph unavailable while the platform answers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_resident_miss_is_answered_without_the_graph() {
     let ws = stage_workspace();
-    let client = workspace_client(ws.path(), true).await;
+    let (client, _lock) = client_without_graph(ws.path()).await;
     wait_until_resident_is_ready(&client).await;
 
     let miss = call(&client, "symbol_info", args(&[("symbol", Value::from("СтрНайт"))])).await;
@@ -289,8 +275,7 @@ async fn a_resident_miss_is_answered_without_the_graph() {
         "the platform answered nothing on a miss: {miss}",
     );
 
-    // The graph is NAMED whatever it is doing — an unnamed source is one a consumer cannot
-    // decide to wait for. Its state is read out only to say what it was, never asserted.
+    // The graph is named even though the lease prevents publication.
     let graph = miss["providers"]
         .as_array()
         .unwrap_or_else(|| panic!("the miss names its providers: {miss}"))
@@ -298,7 +283,7 @@ async fn a_resident_miss_is_answered_without_the_graph() {
         .find(|p| p["provider"] == "graph")
         .unwrap_or_else(|| panic!("`graph` is named among the sources: {miss}"))
         .clone();
-    assert!(graph["state"].is_string(), "the graph's state is published whatever it is: {miss}",);
+    assert_eq!(graph["state"], "not_ready", "{miss}");
 }
 
 /// И1. Every address published is accepted back by the tool it names, and the
@@ -407,10 +392,7 @@ async fn a_metadata_object_arrives_with_its_xml_and_not_an_excuse() {
     let ws = stage_workspace();
     let client = workspace_client(ws.path(), true).await;
     wait_until_resident_is_ready(&client).await;
-    // Waiting for the resident alone leaves the graph silent — the stand next
-    // door asserts exactly that. Without this wait the count below is taken over
-    // an answer the graph never contributed to, so it can neither see the split
-    // nor confirm the merge.
+    // The resident and graph load independently; this assertion needs both providers.
     wait_until_graph_is_ready(&client).await;
 
     let body = resolve(&client, "Справочник1").await;
