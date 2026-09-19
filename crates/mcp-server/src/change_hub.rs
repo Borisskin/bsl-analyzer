@@ -116,6 +116,20 @@ struct WatchSeams {
 
 type WatchRefusal = Arc<WatchSeams>;
 
+/// A seam that lets no watch arm: the hub's setup fails and it polls instead.
+#[cfg(test)]
+fn refuse_every_watch() -> WatchRefusal {
+    Arc::new(WatchSeams { refuses: Box::new(|_| true), disarmed: Box::new(|_| {}) })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by a test that boots a whole backend and needs its hub to poll: the hub is
+    /// created on the calling thread, deep inside the boot, where no parameter reaches.
+    pub(crate) static POLL_INSTEAD_OF_WATCHING: std::cell::Cell<Option<PollConfig>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Holds a hub's thread short of arming until released.
 #[cfg(test)]
 pub(crate) struct HubHold {
@@ -438,9 +452,30 @@ pub(crate) struct DrainBatch {
     pub(crate) entries: Vec<ChangeEntry>,
     pub(crate) cursor: SinkCursor,
     pub(crate) rescan_required: bool,
+    /// The identity of the loss this batch reports.
+    ///
+    /// A LOSS has no number of its own on the fact stream: a reconcile says the detail is
+    /// gone, and a hub whose sequence has not moved can still have lost something new. So one
+    /// is issued here — the SAME one to every cursor a shared window flagged, so two cursors
+    /// that lost the same delivery report one event, and one of its own to a cursor cut out of
+    /// entries nobody else lost. Re-materialising a batch does not move it.
+    losses: u64,
     through_seq: u64,
     start_pos: u64,
     generation: u64,
+}
+
+impl DrainBatch {
+    /// The number of the newest fact this batch covers: its latest entry, or — for a rescan,
+    /// whose walk reads disk as it stands when the batch is taken — the hub's position then.
+    /// The identity of the loss this batch reports, when it reports one.
+    pub(crate) fn loss_token(&self) -> Option<u64> {
+        self.rescan_required.then_some(self.losses)
+    }
+
+    pub(crate) fn fact_seq(&self) -> u64 {
+        self.through_seq
+    }
 }
 
 /// Per-cursor state held by the accumulator.
@@ -452,6 +487,37 @@ struct CursorState {
     /// than only in the shared window is what lets a debt exist for one consumer alone —
     /// a debt nobody can name is a debt no health can report.
     pending: Option<DegradeReason>,
+    /// The identity of the loss `pending` is about, issued when the debt was incurred. Held
+    /// per cursor because that is where the two kinds differ: one shared window gives every
+    /// cursor the same number, and a cursor cut out of its own entries gets one nobody else
+    /// carries.
+    loss: Option<u64>,
+    /// The loss of the reconcile batch this cursor's consumer has taken and not acknowledged.
+    ///
+    /// A consumer records a loss between taking its batch and acknowledging it, and a newer
+    /// window renames `loss` in that interval. Without this, a loss still in a consumer's hands
+    /// would read as one no cursor can deliver any more.
+    delivered: Option<u64>,
+}
+
+/// What the hub can still deliver of the losses it has issued.
+///
+/// A loss reaches a consumer only from a cursor that holds it — as the debt it owes, or as the
+/// batch its consumer took and has not acknowledged — and a newcomer inherits only the window
+/// that is open. So a loss issued by `issued` and absent from `live` can never reach a consumer
+/// again. Which losses are live cannot be read off their numbers: a cursor still inside an old
+/// window carries it past any number of newer losses issued to others.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LossHorizon {
+    pub(crate) issued: u64,
+    pub(crate) live: Vec<u64>,
+}
+
+impl LossHorizon {
+    /// Whether `token` may still be delivered to a consumer.
+    pub(crate) fn may_deliver(&self, token: u64) -> bool {
+        token > self.issued || self.live.contains(&token)
+    }
 }
 
 /// Bounded, seq-tagged accumulator. Entries coalesce by canonical path so the map
@@ -482,6 +548,18 @@ struct Accumulator {
     /// external state cannot tell one request per tick from one per target — while
     /// the cost is real: a consumer answers each with a full tree walk.
     rescans_requested: u64,
+    /// Losses issued: reconcile windows raised, and cursors cut out of entries they had not
+    /// drained. Distinct from `rescans_requested`, which counts what was ASKED for — a lag is
+    /// nobody's request and still costs the cursor it hit a full reconcile.
+    losses_issued: u64,
+    /// The identity of the shared window that is open, as its cursors were handed it. A
+    /// newcomer that inherits the window inherits THIS, never the counter: the counter also
+    /// moves for losses of single cursors, and one loss under two names is two events to a
+    /// consumer.
+    window_loss: Option<u64>,
+    /// The daemon is going away: every wait returns at once instead of sleeping out its
+    /// timeout, so an owner parked here learns of the stop immediately.
+    closing: bool,
 }
 
 impl Accumulator {
@@ -497,6 +575,9 @@ impl Accumulator {
             degrade_reason: None,
             setup_failed: false,
             rescans_requested: 0,
+            losses_issued: 0,
+            window_loss: None,
+            closing: false,
         }
     }
 
@@ -526,8 +607,19 @@ impl Accumulator {
         let owed = self.cursors.values().any(|cursor| {
             matches!(&cursor.pending, Some(reason) if *reason != DegradeReason::CursorLagged)
         });
+        let forced = force.is_some();
         let pending = force.or_else(|| owed.then(|| self.degrade_reason.clone()).flatten());
-        self.cursors.insert(id, CursorState { pos: self.max_seq(), pending });
+        // A debt inherited from the window that is still open is that window's loss, and a
+        // debt forced on a newcomer is one of its own.
+        let inherited = (owed && !forced).then_some(self.window_loss).flatten();
+        let loss = pending.as_ref().map(|_| {
+            inherited.unwrap_or_else(|| {
+                self.losses_issued += 1;
+                self.losses_issued
+            })
+        });
+        self.cursors
+            .insert(id, CursorState { pos: self.max_seq(), pending, loss, delivered: None });
         id
     }
 
@@ -537,9 +629,35 @@ impl Accumulator {
         self.reclaim();
     }
 
-    /// What this cursor still owes, if anything.
-    fn pending_of(&self, id: u64) -> Option<DegradeReason> {
-        self.cursors.get(&id).and_then(|cursor| cursor.pending.clone())
+    /// What this cursor still owes, if anything, and the identity of that loss.
+    fn debt_of(&self, id: u64) -> Option<(DegradeReason, Option<u64>)> {
+        self.cursors
+            .get(&id)
+            .and_then(|cursor| cursor.pending.clone().map(|reason| (reason, cursor.loss)))
+    }
+
+    /// Put a debt carried over from another cursor on `id`, under the identity it was issued
+    /// with: the loss did not happen again because the consumer changed cursors. A batch the
+    /// consumer took from the old cursor is still in its hands, and goes along too.
+    fn carry_debt(&mut self, id: u64, loss: Option<u64>, delivered: Option<u64>) {
+        let Some(cursor) = self.cursors.get_mut(&id) else { return };
+        if let Some(loss) = loss {
+            cursor.loss = Some(loss);
+        }
+        cursor.delivered = delivered;
+    }
+
+    fn loss_horizon(&self) -> LossHorizon {
+        let mut live: Vec<u64> = self
+            .cursors
+            .values()
+            .flat_map(|cursor| [cursor.loss, cursor.delivered])
+            .flatten()
+            .chain(self.window_loss)
+            .collect();
+        live.sort_unstable();
+        live.dedup();
+        LossHorizon { issued: self.losses_issued, live }
     }
 
     fn record(&mut self, canonical: PathBuf, raw: PathBuf, kind: ChangeKind) {
@@ -583,11 +701,18 @@ impl Accumulator {
                 self.entries.clear();
                 return;
             };
+            // A loss nobody else suffered, so it is issued its own identity — but only when
+            // this cursor did not already owe one. A debt it has not yet paid covers this cut
+            // too, and re-issuing would make the reconcile it is already about read as new.
             if let Some(cursor) = self.cursors.get_mut(&id) {
                 cursor.pos = max;
                 // `get_or_insert`, not an overwrite: an open window's reason is the more
                 // informative of the two, and this cursor owes one reconcile either way.
-                cursor.pending.get_or_insert(DegradeReason::CursorLagged);
+                if cursor.pending.is_none() {
+                    self.losses_issued += 1;
+                    cursor.pending = Some(DegradeReason::CursorLagged);
+                    cursor.loss = Some(self.losses_issued);
+                }
                 self.generation += 1;
             }
             self.reclaim();
@@ -610,7 +735,12 @@ impl Accumulator {
     fn force_rescan(&mut self, id: u64, reason: DegradeReason) {
         if let Some(cursor) = self.cursors.get_mut(&id) {
             if cursor.pending.is_none() {
+                // A loss of this cursor's own, so an identity of its own. Without one its batch
+                // borrowed the last number issued — the one a consumer has usually just acted
+                // on, which reads the new debt as a repeat.
+                self.losses_issued += 1;
                 cursor.pending = Some(reason);
+                cursor.loss = Some(self.losses_issued);
                 self.generation += 1;
             }
         }
@@ -637,6 +767,11 @@ impl Accumulator {
     /// it.
     fn enter_rescan(&mut self, clear_entries: bool, reason: DegradeReason) {
         self.rescans_requested += 1;
+        // ONE loss, however many cursors it reaches: a consumer that sees it through two
+        // cursors is seeing one event, and the identity is what says so.
+        self.losses_issued += 1;
+        let issued = self.losses_issued;
+        self.window_loss = Some(issued);
         let newly = self.degrade_reason.is_none();
         if clear_entries {
             self.entries.clear();
@@ -645,6 +780,7 @@ impl Accumulator {
             // Overwritten, unlike a lag debt: this is the newest thing that went wrong,
             // and it is what a consumer asking why it must reconcile should be told.
             cursor.pending.replace(reason.clone());
+            cursor.loss = Some(issued);
         }
         // Moved for every raise while anyone is listening, not only for the first. Two
         // windows in a row carry the same reason and would otherwise be one: a batch taken
@@ -666,31 +802,43 @@ impl Accumulator {
         }
     }
 
-    fn materialize(&self, id: u64) -> DrainBatch {
+    fn materialize(&mut self, id: u64) -> DrainBatch {
         let max = self.max_seq();
         let pos = self.cursors.get(&id).map(|c| c.pos).unwrap_or(max);
         let mut entries: Vec<ChangeEntry> =
             self.entries.values().filter(|e| e.seq > pos).cloned().collect();
         entries.sort_by_key(|e| e.seq);
-        let rescan_required = self.cursors.get(&id).is_some_and(|cursor| cursor.pending.is_some());
-        DrainBatch {
+        let cursor = self.cursors.get(&id);
+        let rescan_required = cursor.is_some_and(|cursor| cursor.pending.is_some());
+        let batch = DrainBatch {
             entries,
             cursor: SinkCursor { id },
             rescan_required,
+            losses: cursor.and_then(|cursor| cursor.loss).unwrap_or(self.losses_issued),
             through_seq: max,
             start_pos: pos,
             generation: self.generation,
+        };
+        if let Some(cursor) = self.cursors.get_mut(&id) {
+            cursor.delivered = batch.loss_token();
         }
+        batch
     }
 
     fn acknowledge(&mut self, batch: &DrainBatch) {
         let Some(cursor) = self.cursors.get_mut(&batch.cursor.id) else { return };
+        // Whatever the acknowledgement settles, the consumer is done with this batch: it
+        // recorded what the batch said before acknowledging it.
+        if batch.loss_token().is_some() && cursor.delivered == batch.loss_token() {
+            cursor.delivered = None;
+        }
         if cursor.pos != batch.start_pos {
             return;
         }
         cursor.pos = batch.through_seq;
         if batch.rescan_required && self.generation == batch.generation {
             cursor.pending.take();
+            cursor.loss.take();
         }
         self.close_window_if_settled();
         self.reclaim();
@@ -716,6 +864,7 @@ impl Accumulator {
         let owes_window = |cursor: &CursorState| matches!(&cursor.pending, Some(reason) if *reason != DegradeReason::CursorLagged);
         if self.degrade_reason.is_some() && !self.cursors.values().any(owes_window) {
             self.degrade_reason = None;
+            self.window_loss = None;
         }
     }
 
@@ -986,10 +1135,24 @@ struct HubInner {
     /// failure this node exists to prevent.
     ticks: AtomicU64,
     rearms: AtomicU64,
-    /// The declared set last handed to the thread, so `ensure_roots` can tell a genuine
-    /// declaration change from a repeat. Compared by raw spelling AND mode: an alias
-    /// swap keeps the canonical path and would otherwise pass unnoticed.
+    /// The fallback poll's cadence and read budget, and what it has done (see [`run_polling`]).
+    poll: PollConfig,
+    polling: AtomicBool,
+    poll_state: Mutex<PollStatus>,
+    /// The poll of declared roots that exist and are not watched, while the rest is.
+    blind_poll: BlindPoll,
+    /// The declaration the THREAD stands on, published by it after every declaration it
+    /// applies. `ensure_roots` compares against this, not against the armed set: a target the
+    /// backend could not take is a gap the hub repairs itself, and comparing coverage would
+    /// make every rebuild re-declare, re-arm and hand every consumer a reconcile — one
+    /// rebuild per reconcile, for ever. Compared by placed spelling AND mode: an alias swap
+    /// keeps the canonical path and would otherwise pass unnoticed.
     declared_published: Mutex<Vec<WatchTarget>>,
+    /// From when the hub owes an observation it has not made yet: the moment it entered the
+    /// fallback poll, or the moment a declared root went blind. A poll that was promised and
+    /// never happened is overdue exactly like one that stopped happening — without this, a
+    /// poller whose thread never started reads as "fresh" for ever.
+    poll_expected_since: Mutex<Option<Instant>>,
     /// Declared targets that exist and are not watched. DERIVED from the declaration and
     /// the armed set on every change to either, never accumulated: a target can leave the
     /// declaration without ever arming (a topology rebuild drops an extension, and a
@@ -1014,6 +1177,27 @@ impl HubInner {
             .map(|entry| (entry.resolved().to_path_buf(), entry.target().recursive))
             .collect();
         *self.watched_roots.lock().unwrap_or_else(PoisonError::into_inner) = pairs;
+    }
+
+    /// The declaration the thread stands on right now.
+    fn accepted_declaration(&self) -> Vec<WatchTarget> {
+        self.declared_published.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// Publish the declaration the thread has just applied. The ONLY writer is the thread:
+    /// a declaration recorded before the thread accepted it would let the next identical
+    /// request answer "already declared" over a set nothing stands on.
+    fn accept_declaration(&self, declared: &[WatchTarget]) {
+        *self.declared_published.lock().unwrap_or_else(PoisonError::into_inner) = declared.to_vec();
+    }
+
+    /// Record (or clear) the moment from which an observation is owed but not yet made.
+    fn expect_poll_from(&self, at: Option<Instant>) {
+        *self.poll_expected_since.lock().unwrap_or_else(PoisonError::into_inner) = at;
+    }
+
+    fn poll_expected_since(&self) -> Option<Instant> {
+        *self.poll_expected_since.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn lock_acc(&self) -> std::sync::MutexGuard<'_, Accumulator> {
@@ -1247,6 +1431,19 @@ impl HubInner {
         !self.blind_targets.lock().unwrap_or_else(PoisonError::into_inner).is_empty()
     }
 
+    /// Blind, and the reconcile announcing it already issued. A newcomer is handed a reconcile
+    /// of its own only then; before, the announcement that follows the first reading flags it.
+    fn is_blind_and_announced(&self) -> bool {
+        self.is_partially_blind() && !self.blind_poll.reconcile_pending.load(Ordering::SeqCst)
+    }
+
+    fn note_poll(&self, poller: &Poller) {
+        let mut state = self.poll_state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.last = Some(Instant::now());
+        state.polls += 1;
+        state.bytes = poller.bytes();
+    }
+
     fn mark_setup_failed(&self) {
         self.lock_acc().setup_failed = true;
         self.notify();
@@ -1282,11 +1479,33 @@ thread_local! {
 /// it is there: two links to one tree are two ways to reach the same files, and each file
 /// keeps the spelling the walk actually used to get to it.
 fn collect_subtree(dir: &Path, records: &mut Vec<(PathBuf, PathBuf, ChangeKind)>) {
+    collect_subtree_noting(dir, records, None);
+}
+
+/// [`collect_subtree`], naming in `unreadable` every path the walk could not read for another
+/// reason than absence.
+fn collect_subtree_noting(
+    dir: &Path,
+    records: &mut Vec<(PathBuf, PathBuf, ChangeKind)>,
+    mut unreadable: Option<&mut Vec<PathBuf>>,
+) {
     #[cfg(test)]
     SUBTREE_WALKS.with(|walks| walks.set(walks.get() + 1));
     let mut resolved_dirs: HashMap<PathBuf, PathBuf> = HashMap::new();
     for entry in WalkDir::new(dir).follow_links(true) {
-        let Ok(entry) = entry else { continue };
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                let absent =
+                    error.io_error().is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound);
+                if let (Some(unreadable), Some(path), false) =
+                    (unreadable.as_deref_mut(), error.path(), absent)
+                {
+                    unreadable.push(path.to_path_buf());
+                }
+                continue;
+            }
+        };
         if !entry.file_type().is_file() {
             continue;
         }
@@ -1371,17 +1590,15 @@ fn classify_path(path: &Path) -> Option<(PathBuf, ChangeKind)> {
 /// hub identity for the (many, clonable) handle holders to migrate to.
 enum HubMsg {
     Event(Result<Event, notify::Error>),
-    /// Re-point the watch set (see [`WorkspaceChangeHub::rearm`]). `ack` fires
-    /// once the new set is applied and every cursor is flagged to rescan; it
-    /// carries whether EVERY desired target is actually armed (partial coverage
-    /// must surface to the caller, not read as success).
+    /// Declare the watch set (see [`WorkspaceChangeHub::rearm`]). `ack` fires once the
+    /// declaration is applied; it carries whether EVERY desired target is actually armed
+    /// (partial coverage must surface to the caller, not read as success). What the
+    /// declaration costs — nothing, a record, or a re-arm and the reconcile that comes with
+    /// it — is decided by the thread in [`apply_declaration`], never by the sender.
     Rearm {
         targets: Vec<WatchTarget>,
         ack: std::sync::mpsc::SyncSender<bool>,
     },
-    /// A new declared set that the caller found coverage-equivalent. The thread still
-    /// decides for itself whether to re-arm (see [`apply_declaration`]).
-    Declare(Vec<WatchTarget>),
     /// Run one coverage tick now. A test seam: production drives ticks by the
     /// deadline, and both paths call the same function so a broken periodic path
     /// cannot hide behind a working commanded one.
@@ -1411,6 +1628,8 @@ struct HubThread {
     /// The watcher callback holds its own clone for events.
     control: std::sync::mpsc::SyncSender<HubMsg>,
     handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// The blind-root poller's stop, raised with the hub thread's (see [`BlindPoll`]).
+    blind_stop: Arc<StopFlag>,
 }
 
 impl HubThread {
@@ -1464,9 +1683,17 @@ impl HubThread {
     }
 }
 
+impl HubThread {
+    /// Stop everything this hub runs: the blind poll and the thread itself.
+    fn stop_all(&self) {
+        self.blind_stop.raise();
+        self.stop();
+    }
+}
+
 impl Drop for HubThread {
     fn drop(&mut self) {
-        self.stop();
+        self.stop_all();
     }
 }
 
@@ -1506,6 +1733,20 @@ impl WorkspaceChangeHub {
         targets: Vec<WatchTarget>,
         excluded: Vec<PathBuf>,
     ) -> Self {
+        #[cfg(test)]
+        if let Some(poll) = POLL_INSTEAD_OF_WATCHING.with(std::cell::Cell::get) {
+            return Self::start_seamed(
+                targets,
+                DEFAULT_CAPACITY,
+                COVERAGE_TICK_PERIOD,
+                false,
+                None,
+                Some(refuse_every_watch()),
+                excluded,
+                poll,
+                BlindPollSeam::default(),
+            );
+        }
         Self::start_seamed(
             targets,
             DEFAULT_CAPACITY,
@@ -1514,6 +1755,9 @@ impl WorkspaceChangeHub {
             None,
             None,
             excluded,
+            PollConfig::PRODUCTION,
+            #[cfg(test)]
+            BlindPollSeam::default(),
         )
     }
 
@@ -1528,6 +1772,9 @@ impl WorkspaceChangeHub {
             None,
             None,
             Vec::new(),
+            PollConfig::PRODUCTION,
+            #[cfg(test)]
+            BlindPollSeam::default(),
         )
     }
 
@@ -1547,6 +1794,9 @@ impl WorkspaceChangeHub {
             Some(Arc::new(move || gate.wait())),
             None,
             Vec::new(),
+            PollConfig::PRODUCTION,
+            #[cfg(test)]
+            BlindPollSeam::default(),
         );
         (hub, HubHoldGuard(hold))
     }
@@ -1575,15 +1825,100 @@ impl WorkspaceChangeHub {
             None,
             Some(refusals.as_refusal()),
             Vec::new(),
+            PollConfig::PRODUCTION,
+            #[cfg(test)]
+            BlindPollSeam::default(),
+        )
+    }
+
+    /// [`Self::start_targets_refusing_polled`] whose blind poll cannot start its thread.
+    #[cfg(all(test, unix))]
+    pub(crate) fn start_targets_refusing_unpollable(
+        targets: Vec<WatchTarget>,
+        period: Duration,
+        refusals: &Arc<RefusedWatches>,
+        poll: PollConfig,
+    ) -> Self {
+        Self::start_seamed(
+            targets,
+            DEFAULT_CAPACITY,
+            period,
+            false,
+            None,
+            Some(refusals.as_refusal()),
+            Vec::new(),
+            poll,
+            BlindPollSeam::refusing_to_start(),
+        )
+    }
+
+    /// [`Self::start_targets_refusing_polled`] whose blind polls each wait for `gate`.
+    #[cfg(all(test, unix))]
+    pub(crate) fn start_targets_refusing_polled_gated(
+        targets: Vec<WatchTarget>,
+        period: Duration,
+        refusals: &Arc<RefusedWatches>,
+        poll: PollConfig,
+        gate: Arc<PollGate>,
+        announce: Option<Arc<AnnounceBarrier>>,
+    ) -> Self {
+        Self::start_seamed(
+            targets,
+            DEFAULT_CAPACITY,
+            period,
+            false,
+            None,
+            Some(refusals.as_refusal()),
+            Vec::new(),
+            poll,
+            BlindPollSeam { cannot_start: false, gate: Some(gate), announce },
+        )
+    }
+
+    /// [`Self::start_targets_refusing`] that polls its blind roots on `poll`'s schedule.
+    #[cfg(all(test, unix))]
+    pub(crate) fn start_targets_refusing_polled(
+        targets: Vec<WatchTarget>,
+        period: Duration,
+        refusals: &Arc<RefusedWatches>,
+        poll: PollConfig,
+    ) -> Self {
+        Self::start_seamed(
+            targets,
+            DEFAULT_CAPACITY,
+            period,
+            false,
+            None,
+            Some(refusals.as_refusal()),
+            Vec::new(),
+            poll,
+            #[cfg(test)]
+            BlindPollSeam::default(),
         )
     }
 
     #[cfg(test)]
-    fn start_with_capacity(targets: Vec<WatchTarget>, cap: usize, tick_period: Duration) -> Self {
-        Self::start_seamed(targets, cap, tick_period, false, None, None, Vec::new())
+    pub(crate) fn start_with_capacity(
+        targets: Vec<WatchTarget>,
+        cap: usize,
+        tick_period: Duration,
+    ) -> Self {
+        Self::start_seamed(
+            targets,
+            cap,
+            tick_period,
+            false,
+            None,
+            None,
+            Vec::new(),
+            PollConfig::PRODUCTION,
+            #[cfg(test)]
+            BlindPollSeam::default(),
+        )
     }
 
-    /// The hub with its startup seams exposed. Production passes `false` and two `None`s.
+    /// The hub with its startup seams exposed. Production passes `false`, two `None`s and
+    /// [`PollConfig::PRODUCTION`].
     ///
     /// Each exists because the state it produces cannot be provoked on demand and is a
     /// state no other door leads to. `refuse_spawn`: an operating system refusing a
@@ -1592,7 +1927,11 @@ impl WorkspaceChangeHub {
     /// `before_arm`: a hub alive, not yet armed and not failed — what a huge initial walk
     /// looks like, and the only readiness answer that means "ask again later".
     /// `watch_refusal`: a root the watch will not take, which no file system produces for
-    /// every uid alike (see [`Watch`]).
+    /// every uid alike (see [`Watch`]). `poll`: the fallback poll's clock, which a test runs
+    /// by hand rather than waiting a production period out.
+    // Each seam is a state no other door leads to, and a bag struct would carry exactly these
+    // same arguments under one more name.
+    #[allow(clippy::too_many_arguments)]
     fn start_seamed(
         targets: Vec<WatchTarget>,
         cap: usize,
@@ -1601,6 +1940,8 @@ impl WorkspaceChangeHub {
         before_arm: Option<BeforeArm>,
         watch_refusal: Option<WatchRefusal>,
         excluded: Vec<PathBuf>,
+        poll: PollConfig,
+        #[cfg(test)] blind_poll_seam: BlindPollSeam,
     ) -> Self {
         let placed = ResolvedTargets::here(targets.clone());
 
@@ -1620,6 +1961,19 @@ impl WorkspaceChangeHub {
             tick_period,
             ticks: AtomicU64::new(0),
             rearms: AtomicU64::new(0),
+            poll,
+            polling: AtomicBool::new(false),
+            poll_state: Mutex::new(PollStatus::default()),
+            poll_expected_since: Mutex::new(None),
+            blind_poll: BlindPoll {
+                #[cfg(test)]
+                cannot_start: blind_poll_seam.cannot_start,
+                #[cfg(test)]
+                gate: blind_poll_seam.gate,
+                #[cfg(test)]
+                announce: blind_poll_seam.announce,
+                ..BlindPoll::default()
+            },
             // Placed, like every later declaration: the record is compared against
             // those, and a raw spelling would never equal its own placed form.
             declared_published: Mutex::new(placed.as_slice().to_vec()),
@@ -1651,7 +2005,11 @@ impl WorkspaceChangeHub {
             }
         };
 
-        Self { inner, thread: Arc::new(HubThread { control: tx, handle: Mutex::new(thread) }) }
+        let blind_stop = Arc::clone(&inner.blind_poll.stop);
+        Self {
+            inner,
+            thread: Arc::new(HubThread { control: tx, handle: Mutex::new(thread), blind_stop }),
+        }
     }
 
     /// Ask the hub thread to re-point the watch set at `targets`, blocking until it
@@ -1683,72 +2041,53 @@ impl WorkspaceChangeHub {
         ack_rx.recv_timeout(remaining).unwrap_or(false)
     }
 
-    /// Re-arm onto `targets` only when they differ from the live watch set
-    /// (canonical + mode comparison), so a rebuild whose topology did not move
-    /// never costs consumers a rescan round. Returns whether the hub covers
-    /// `targets` — `false` when a needed re-arm was not acknowledged or left a
-    /// target unarmed.
+    /// Declare `targets` to the hub, and say whether the hub covers them.
+    ///
+    /// The comparison is against the declaration the thread STANDS on, never against the
+    /// armed set. A target the backend could not take — a blind root, a directory that does
+    /// not exist — is a gap the hub repairs on its own schedule; measuring it here would make
+    /// every caller re-declare, every re-declaration re-arm, and every re-arm hand each
+    /// consumer a reconcile. Each such reconcile makes the graph rebuild, and each rebuild
+    /// calls this again: a loop with no external cause, which is why the repeat has to cost
+    /// nothing at all rather than merely little.
+    ///
+    /// An unchanged declaration therefore sends NOTHING — no message, no re-arm, no
+    /// reconcile — in either transport mode, and answers from what the hub already holds.
     pub(crate) fn ensure_roots(&self, targets: &[WatchTarget]) -> bool {
-        // Resolve before comparing, exactly as the hub thread will: the live set was
-        // published from placed targets, so comparing raw spellings against it would
-        // measure two different languages.
+        // Resolved before comparing, exactly as the hub thread will: the declaration travels
+        // and is remembered in PLACED spellings, and one relative spelling names two
+        // different targets under two different current directories.
         let resolved = ResolvedTargets::here(targets.to_vec());
-        let placed = resolved.is_complete();
-        // The declaration travels and is remembered in PLACED spellings: one relative
-        // spelling names two different targets under two different current directories,
-        // so remembering the raw one would suppress a real change as a repeat.
         let declaration = resolved.as_slice().to_vec();
-        let mut desired: Vec<(PathBuf, bool)> = dedup_targets(resolved.into_inner())
+        if same_declaration(&self.inner.accepted_declaration(), &declaration) {
+            // Nothing is sent — that is the point of the barrier — but the ANSWER is about
+            // coverage, and coverage is not knowable while the watch is still being armed:
+            // the accepted declaration is recorded before the thread has armed anything, so
+            // a caller asking in that window would be told "not covered" about a watch that
+            // arms a moment later. Waiting for the hub to settle costs the arming time once,
+            // which is what the acknowledgement of a re-arm used to cost anyway.
+            let _ = self.watch_readiness_or(REARM_ACK_TIMEOUT, || false);
+            return self.covers(&resolved);
+        }
+        tracing::info!(?targets, "workspace change hub declaring new scan roots");
+        self.rearm(targets.to_vec(), REARM_ACK_TIMEOUT)
+    }
+
+    /// Whether every declared target is placed and armed right now. A verdict read off what
+    /// the hub already holds — it starts nothing.
+    fn covers(&self, resolved: &ResolvedTargets) -> bool {
+        if !resolved.is_complete() {
+            return false;
+        }
+        let mut desired: Vec<(PathBuf, bool)> = dedup_targets(resolved.as_slice().to_vec())
             .into_iter()
-            .map(|(t, canonical)| (canonical, t.recursive))
+            .map(|(target, canonical)| (canonical, target.recursive))
             .collect();
         desired.sort();
         let mut current =
             self.inner.watched_roots.lock().unwrap_or_else(PoisonError::into_inner).clone();
         current.sort();
-        if placed && current == desired {
-            // Coverage is unchanged, but the DECLARATION may not be: a target absorbed
-            // by a recursive ancestor never reaches `watched_roots`, so its removal is
-            // invisible here, and an alias swap keeps the canonical path while changing
-            // the only spelling the watch actually holds. Telling the thread costs a
-            // message; not telling it leaves the tick re-arming targets the topology
-            // dropped long ago.
-            self.publish_declaration(&declaration);
-            return true;
-        }
-        tracing::info!(?targets, "workspace change hub re-arming onto new scan roots");
-        self.note_declaration(&declaration);
-        self.rearm(targets.to_vec(), REARM_ACK_TIMEOUT)
-    }
-
-    /// Record the declaration the thread is about to receive, so a repeat of the same
-    /// set costs nothing.
-    fn note_declaration(&self, targets: &[WatchTarget]) {
-        *self.inner.declared_published.lock().unwrap_or_else(PoisonError::into_inner) =
-            targets.to_vec();
-    }
-
-    /// Hand a coverage-equivalent declaration to the thread, unless it already has it.
-    ///
-    /// The record is of what was DELIVERED, not of what was intended: a failed send
-    /// leaves it untouched, so the next caller with the same set publishes again instead
-    /// of skipping as a repeat a declaration nobody ever received. The lock spans the
-    /// send for the same reason — released first, two callers could record in one order
-    /// and enqueue in the other, leaving the record naming a set the thread never got.
-    fn publish_declaration(&self, targets: &[WatchTarget]) {
-        let mut published =
-            self.inner.declared_published.lock().unwrap_or_else(PoisonError::into_inner);
-        if *published == targets {
-            return;
-        }
-        // `try_send`, not a blocking send: a full control channel means an event storm,
-        // and stalling a build thread behind it would be worse than a late declaration.
-        // Late, not lost — the record stays on the previous set, so the next rebuild's
-        // `ensure_roots` publishes this one again instead of skipping it as a repeat.
-        // Until then the periodic check polices the previous declaration.
-        if self.control().try_send(HubMsg::Declare(targets.to_vec())).is_ok() {
-            *published = targets.to_vec();
-        }
+        current == desired
     }
 
     /// The targets this hub currently stands declared on — what it was ASKED to
@@ -1760,12 +2099,19 @@ impl WorkspaceChangeHub {
         self.inner.declared_published.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
-    /// Terminate the hub thread and join it. Cursors keep draining whatever was
-    /// accumulated; no further events arrive. Idempotent, and reached from two
-    /// directions: explicitly here, and from the last handle's [`Drop`].
-    #[cfg(test)]
+    /// Terminate the hub's threads and join what can be joined. Cursors keep draining
+    /// whatever was accumulated; no further events arrive. Idempotent, and reached from two
+    /// directions: explicitly by the daemon's shutdown, and from the last handle's [`Drop`].
+    ///
+    /// `closing` FIRST, and that is the point: an owner parked in `wait_for_change_or`
+    /// returns on a new generation, on `closing`, or on its own predicate — never on a bare
+    /// wake — so stopping the threads without it would leave that owner asleep for its whole
+    /// timeout over a hub that has already gone. The blind poll is raised here too: its stop
+    /// flag otherwise lives only in `Drop`, and a daemon that shuts down while a handle is
+    /// still held would keep walking blind roots.
     pub(crate) fn shutdown(&self) {
-        self.thread.stop();
+        self.interrupt_waiters();
+        self.thread.stop_all();
     }
 
     /// Register a cursor positioned at "everything up to now already seen": a fresh
@@ -1773,10 +2119,153 @@ impl WorkspaceChangeHub {
     /// pending reconcile flag if it subscribes during an open rescan window, or while
     /// a declared root is unwatched — the window closes as soon as the cursors that
     /// existed at the time acknowledge it, and the blindness it announced does not).
+    /// Wake every waiter for good: [`Self::wait_for_change`] and [`Self::watch_readiness`]
+    /// return at once from now on. Called by the daemon's shutdown so no owner sleeps out a
+    /// hub wait after being asked to stop.
+    pub(crate) fn interrupt_waiters(&self) {
+        self.inner.lock_acc().closing = true;
+        self.inner.notify();
+    }
+
+    /// The number of the latest fact the hub has taken in. Monotonic; a consumer reads it
+    /// before it looks at disk to say which facts that look already covers.
+    pub(crate) fn seq(&self) -> u64 {
+        self.inner.lock_acc().max_seq()
+    }
+
+    /// Wake every waiter to re-check its own condition, without announcing new work: a
+    /// waiter on the generation alone goes straight back to sleep.
+    pub(crate) fn wake_waiters(&self) {
+        let _acc = self.inner.lock_acc();
+        self.inner.wake.notify_all();
+    }
+
+    /// The hub could not set up a watch and polls the targets instead.
+    pub(crate) fn is_polling(&self) -> bool {
+        self.inner.polling.load(Ordering::SeqCst)
+    }
+
+    /// How old the fallback poll's last walk is, and how long an edit that kept its size and
+    /// mtime can go unnoticed. `None` while nothing is polled.
+    ///
+    /// The bound is CONSERVATIVE, and one pass over every polled byte is not it. Verification
+    /// reads a budget of bytes per tick and resumes a file where it stopped; a partial read
+    /// keeps what it already has while the file's own stamp is unchanged, and the digest is
+    /// compared only once the file has been read through. So an edit landing behind the offset
+    /// a pass has already passed is not in that pass's bytes at all — it is seen by the NEXT
+    /// full read, which is why the pass in flight, a whole pass after it, and the ticks that
+    /// start and finish them are all inside the number a consumer is told.
+    ///
+    /// Two qualifications ride with it and cannot be dropped: the polled set has to stay
+    /// finite and readable — a file that cannot be read is not verified at all — and the walk's
+    /// own I/O is on top of this, since the number counts ticks rather than disk time.
+    pub(crate) fn poll_report(&self) -> Option<(Option<Duration>, Duration)> {
+        if !self.is_polling() && !self.is_partially_blind() {
+            return None;
+        }
+        let state = *self.inner.poll_state.lock().unwrap_or_else(PoisonError::into_inner);
+        let passes = state.bytes.div_ceil(self.inner.poll.verify_bytes.max(1)).max(1);
+        let ticks = passes.saturating_mul(2).saturating_add(3);
+        let cycle = self.inner.poll.period.saturating_mul(u32::try_from(ticks).unwrap_or(u32::MAX));
+        Some((state.last.map(|last| last.elapsed()), cycle))
+    }
+
+    /// Some declared root exists and nothing watches it: it is found by polling.
+    pub(crate) fn is_partially_blind(&self) -> bool {
+        self.inner.is_partially_blind()
+    }
+
+    /// Whether the hub polls — all of the workspace, or its blind roots — and its last walk
+    /// is older than twice the poll period: a poll that stopped happening vouches for nothing.
+    pub(crate) fn poll_overdue(&self) -> bool {
+        if !self.is_polling() && !self.is_partially_blind() {
+            return false;
+        }
+        let last = self.inner.poll_state.lock().unwrap_or_else(PoisonError::into_inner).last;
+        // A poll that was promised and never made is overdue exactly like one that stopped:
+        // the thread that would have made it may have failed to start, and reading "never
+        // walked" as "nothing to report" would vouch for a tree nobody has looked at.
+        let owed_since = match (last, self.inner.poll_expected_since()) {
+            (Some(last), Some(expected)) => Some(last.max(expected)),
+            (last, expected) => last.or(expected),
+        };
+        owed_since.is_some_and(|since| since.elapsed() > self.poll_period().saturating_mul(2))
+    }
+
+    /// The configured poll period, for a reader deciding whether a poll is overdue.
+    pub(crate) fn poll_period(&self) -> Duration {
+        self.inner.poll.period
+    }
+
+    /// A hub that can watch nothing and polls on `poll`'s schedule, held short of setup
+    /// until the guard releases it so a test can subscribe first.
+    #[cfg(test)]
+    pub(crate) fn start_polling(
+        targets: Vec<WatchTarget>,
+        poll: PollConfig,
+    ) -> (Self, HubHoldGuard) {
+        let hold = Arc::new(HubHold::new());
+        let gate = Arc::clone(&hold);
+        let hub = Self::start_seamed(
+            targets,
+            DEFAULT_CAPACITY,
+            COVERAGE_TICK_PERIOD,
+            false,
+            Some(Arc::new(move || gate.wait())),
+            Some(refuse_every_watch()),
+            Vec::new(),
+            poll,
+            #[cfg(test)]
+            BlindPollSeam::default(),
+        );
+        (hub, HubHoldGuard(hold))
+    }
+
+    /// Whether `cursor` has been told to reconcile, without acknowledging anything.
+    #[cfg(test)]
+    pub(crate) fn drain_peek(&self, cursor: SinkCursor) -> bool {
+        self.materialize(cursor).rescan_required
+    }
+
+    /// Run one poll now and wait for it to finish.
+    #[cfg(test)]
+    pub(crate) fn poll_now(&self, timeout: Duration) -> bool {
+        let polls = || self.inner.poll_state.lock().unwrap_or_else(PoisonError::into_inner).polls;
+        let before = polls();
+        if self.control().send(HubMsg::Tick).is_err() {
+            return false;
+        }
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if polls() > before {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// Wait until the reconcile announcing the current blindness has been issued — it follows
+    /// the first reading of every blind file.
+    #[cfg(test)]
+    pub(crate) fn wait_until_blindness_announced(&self) {
+        assert!(
+            test_support::eventually(Duration::from_secs(10), || {
+                !self.inner.blind_poll.reconcile_pending.load(Ordering::SeqCst)
+            }),
+            "the reconcile announcing the blind root never came",
+        );
+    }
+
+    /// Whether [`Self::interrupt_waiters`] has run.
+    pub(crate) fn is_closing(&self) -> bool {
+        self.inner.lock_acc().closing
+    }
+
     pub(crate) fn subscribe(&self) -> SinkCursor {
         // Read before taking the accumulator, so no path holds one of the two locks
         // while asking for the other.
-        let blind = self.inner.is_partially_blind().then_some(DegradeReason::RewatchFailed);
+        let blind = self.inner.is_blind_and_announced().then_some(DegradeReason::RewatchFailed);
         let id = self.inner.lock_acc().subscribe(blind.clone());
         // And read AGAIN, because those two lines are not one moment. A blind set published
         // between them belongs to a hub thread that flagged every cursor it could see — and
@@ -1784,7 +2273,7 @@ impl WorkspaceChangeHub {
         // clean over a declared root nothing is watching. Published before the flag, so the
         // orders that matter are covered both ways: either the flag found this cursor, or
         // this finds the publication.
-        if blind.is_none() && self.inner.is_partially_blind() {
+        if blind.is_none() && self.inner.is_blind_and_announced() {
             self.inner.lock_acc().force_rescan(id, DegradeReason::RewatchFailed);
         }
         SinkCursor { id }
@@ -1800,15 +2289,18 @@ impl WorkspaceChangeHub {
     pub(crate) fn resubscribe(&self, cursor: SinkCursor) -> SinkCursor {
         // Read before taking the accumulator, so no path holds one of the two locks while
         // asking for the other.
-        let blind = self.inner.is_partially_blind().then_some(DegradeReason::RewatchFailed);
+        let blind = self.inner.is_blind_and_announced().then_some(DegradeReason::RewatchFailed);
         let mut acc = self.inner.lock_acc();
-        let carried = acc.pending_of(cursor.id);
+        let carried = acc.debt_of(cursor.id);
+        let delivered = acc.cursors.get(&cursor.id).and_then(|cursor| cursor.delivered);
         acc.unsubscribe(cursor.id);
-        let id = acc.subscribe(carried.or(blind.clone()));
+        let (reason, loss) = carried.map_or((None, None), |(reason, loss)| (Some(reason), loss));
+        let id = acc.subscribe(reason.or(blind.clone()));
+        acc.carry_debt(id, loss, delivered);
         drop(acc);
         // The same second read as in [`Self::subscribe`], for the same gap between the two
         // locks.
-        if blind.is_none() && self.inner.is_partially_blind() {
+        if blind.is_none() && self.inner.is_blind_and_announced() {
             self.inner.lock_acc().force_rescan(id, DegradeReason::RewatchFailed);
         }
         SinkCursor { id }
@@ -1834,6 +2326,11 @@ impl WorkspaceChangeHub {
 
     pub(crate) fn acknowledge(&self, batch: &DrainBatch) {
         self.inner.lock_acc().acknowledge(batch);
+    }
+
+    /// What this hub can still deliver of the losses it has issued.
+    pub(crate) fn loss_horizon(&self) -> LossHorizon {
+        self.inner.lock_acc().loss_horizon()
     }
 
     /// Reported health: the accumulator's transient reason, or — once that has been
@@ -1897,14 +2394,31 @@ impl WorkspaceChangeHub {
     /// Block until setup settles (watch armed or failed) or `timeout` elapses, and say
     /// WHICH of the three happened. Sinks call this instead of a bare `is_watching`
     /// check so they do not race the asynchronous setup.
+    /// Kept for tests, which drive a hub with no daemon around it. Background code states
+    /// its stop: the form without a predicate would let an owner sleep out a whole slice
+    /// after it was told to leave.
+    #[cfg(test)]
     pub(crate) fn watch_readiness(&self, timeout: Duration) -> WatchReadiness {
+        self.watch_readiness_or(timeout, || false)
+    }
+
+    /// [`Self::watch_readiness`] that also gives up once `stopped` holds, re-checked on every
+    /// wake. An owner whose daemon is leaving has no use for a watch that is still arming, and
+    /// the answer to "will this watch arm for me" is then the same `Failed` a hub that cannot
+    /// be set up gives. The hub's own `closing` stays the second barrier, not the only one:
+    /// whichever of the two is raised first releases the wait.
+    pub(crate) fn watch_readiness_or(
+        &self,
+        timeout: Duration,
+        stopped: impl Fn() -> bool,
+    ) -> WatchReadiness {
         let deadline = Instant::now() + timeout;
         let mut acc = self.inner.lock_acc();
         loop {
             if self.inner.watching.load(Ordering::SeqCst) {
                 return WatchReadiness::Armed;
             }
-            if acc.setup_failed {
+            if acc.setup_failed || acc.closing || stopped() {
                 return WatchReadiness::Failed;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1937,14 +2451,39 @@ impl WorkspaceChangeHub {
         self.watch_readiness(timeout) == WatchReadiness::Armed
     }
 
+    /// The accumulator's generation right now.
+    ///
+    /// A sink that goes dormant reads this to say what it has already been told about: without
+    /// it the generation it waits on is whatever it last happened to observe, and a batch that
+    /// arrived before it went dormant would answer as work that arrived after.
+    pub(crate) fn generation(&self) -> u64 {
+        self.inner.lock_acc().generation
+    }
+
     /// Block until the accumulator advances past `since` or `timeout` elapses,
-    /// then return the current generation. Sink threads pass the generation they
-    /// last observed to sleep until there is new work.
+    /// then return the current generation.
+    ///
+    /// Kept for tests only, for the same reason as [`Self::watch_readiness`]: a background
+    /// sink states the stop it is to leave on, so the predicate-less form has no production
+    /// caller left.
+    #[cfg(test)]
     pub(crate) fn wait_for_change(&self, since: u64, timeout: Duration) -> u64 {
+        self.wait_for_change_or(since, timeout, || false)
+    }
+
+    /// [`Self::wait_for_change`] that also returns once `woken` holds, re-checked on every
+    /// [`Self::wake_waiters`]. For an owner whose next deadline can move while it sleeps —
+    /// work owed by someone else's thread — and who cannot wait out a whole slice for it.
+    pub(crate) fn wait_for_change_or(
+        &self,
+        since: u64,
+        timeout: Duration,
+        woken: impl Fn() -> bool,
+    ) -> u64 {
         let deadline = Instant::now() + timeout;
         let mut acc = self.inner.lock_acc();
         loop {
-            if acc.generation > since {
+            if acc.generation > since || acc.closing || woken() {
                 return acc.generation;
             }
             // A condition variable may wake without a signal at all, and every
@@ -1994,6 +2533,13 @@ impl WorkspaceChangeHub {
         }));
     }
 
+    /// Report a backend error, exactly as the backend would: the stream lapsed, and every
+    /// cursor then listening shares the one window that opens.
+    #[cfg(test)]
+    pub(crate) fn deliver_backend_error_for_test(&self) {
+        self.ingest_for_test(Err(notify::Error::generic("the backend lost its stream")));
+    }
+
     /// Number of registered cursors. Used by tests to wait deterministically for a
     /// sink to subscribe instead of sleeping a guessed interval.
     #[cfg(test)]
@@ -2002,6 +2548,19 @@ impl WorkspaceChangeHub {
     }
 
     /// Coverage ticks that ran on this hub.
+    #[cfg(test)]
+    /// Whether a blind-root poller thread exists right now.
+    #[cfg(test)]
+    pub(crate) fn blind_poll_running(&self) -> bool {
+        self.inner.blind_poll.running.load(Ordering::SeqCst)
+    }
+
+    /// How many fallback polls have landed, for a test that must see one stop happening.
+    #[cfg(test)]
+    pub(crate) fn poll_count(&self) -> u64 {
+        self.inner.poll_state.lock().unwrap_or_else(PoisonError::into_inner).polls
+    }
+
     #[cfg(test)]
     pub(crate) fn tick_count(&self) -> u64 {
         self.inner.ticks.load(Ordering::Relaxed)
@@ -2012,6 +2571,12 @@ impl WorkspaceChangeHub {
     #[cfg(test)]
     pub(crate) fn self_rearm_count(&self) -> u64 {
         self.inner.rearms.load(Ordering::Relaxed)
+    }
+
+    /// Distinct paths held for cursors that have not drained them yet.
+    #[cfg(test)]
+    pub(crate) fn undrained_paths(&self) -> usize {
+        self.inner.lock_acc().entries.len()
     }
 
     /// Reconcile REQUESTS, including those a consumer never distinguishes: `drain`
@@ -2435,12 +3000,13 @@ fn blind_targets(
 /// exists to avoid. What the repeats do not report, the standing ill health derived from
 /// the set says instead, and unlike a reconcile window it is not cleared by `drain`.
 fn refresh_blind_targets(
-    inner: &HubInner,
+    inner: &Arc<HubInner>,
     declared: &[WatchTarget],
     snapshot: &Snapshot,
     armed: &[ArmedTarget],
 ) {
     let blind = blind_targets(declared, snapshot, armed);
+    BlindPoll::retarget(inner, blind.iter().map(|(target, _)| target.clone()).collect());
     let (newly, cleared) = {
         let mut published = inner.blind_targets.lock().unwrap_or_else(PoisonError::into_inner);
         let newly = blind.iter().any(|(target, _)| !published.contains(&target.path));
@@ -2450,10 +3016,14 @@ fn refresh_blind_targets(
     };
     if newly {
         for (target, _) in &blind {
-            tracing::warn!(root = ?target.path, "workspace change hub is not watching a declared root; changes under it are found only by a reconcile");
+            tracing::warn!(root = ?target.path, "workspace change hub is not watching a declared root; changes under it are found by polling");
         }
-        inner.lock_acc().enter_rescan(false, DegradeReason::RewatchFailed);
-        inner.notify();
+        // Read first, announced after: the poll announces once every file of the newly blind
+        // roots has been read once, so no consumer re-reads a root ahead of its baseline.
+        if !BlindPoll::defer_reconcile(inner) {
+            inner.lock_acc().enter_rescan(false, DegradeReason::RewatchFailed);
+            inner.notify();
+        }
     } else if cleared {
         // The TRANSITION out of blindness, not merely the absence of it: the obstacle this
         // pass announced has ended, and this is where that becomes knowable, since `drain`
@@ -2509,6 +3079,23 @@ pub(crate) fn resolve_as_far_as_it_goes(path: &Path) -> PathBuf {
 /// against the tree it lies in); the RAW path is what gets watched, so event paths keep
 /// the spelling consumers strip against (the search sink strips the non-canonical source
 /// root). Returns each kept target with the resolved path used for the decision.
+/// Whether two declarations name the same watch, whatever order they name it in.
+///
+/// A declaration is a SET: the graph and the diagnostics resident derive theirs from the same
+/// project and can list the roots in different orders, and reading that as a different
+/// declaration would cost a re-arm and a reconcile every time either of them rebuilt — for
+/// ever, since neither order is the "right" one.
+fn same_declaration(left: &[WatchTarget], right: &[WatchTarget]) -> bool {
+    let key = |targets: &[WatchTarget]| {
+        let mut keys: Vec<(PathBuf, bool)> =
+            targets.iter().map(|t| (t.path.clone(), t.recursive)).collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    };
+    key(left) == key(right)
+}
+
 fn dedup_targets(targets: Vec<WatchTarget>) -> Vec<(WatchTarget, PathBuf)> {
     let mut pairs: Vec<(PathBuf, WatchTarget)> =
         targets.into_iter().map(|t| (resolve_as_far_as_it_goes(&t.path), t)).collect();
@@ -2559,6 +3146,827 @@ const REARM_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 /// a handful of `stat` calls over a handful of targets.
 const COVERAGE_TICK_PERIOD: Duration = Duration::from_secs(30);
 
+/// How often the fallback poll walks the targets when no watch could be set up.
+const POLL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How many bytes one poll reads to verify contents a stat cannot vouch for.
+const VERIFY_BYTES: u64 = 32 * 1024 * 1024;
+
+/// The fallback poll's cadence and read budget.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PollConfig {
+    pub(crate) period: Duration,
+    pub(crate) verify_bytes: u64,
+}
+
+impl PollConfig {
+    pub(crate) const PRODUCTION: Self = Self { period: POLL_INTERVAL, verify_bytes: VERIFY_BYTES };
+}
+
+/// What the fallback poll has done, for a status to report.
+#[derive(Debug, Default, Clone, Copy)]
+struct PollStatus {
+    last: Option<Instant>,
+    polls: u64,
+    /// Bytes under the polled targets as of the last walk: with the read budget it bounds how
+    /// long an edit that kept its size and mtime can go unnoticed.
+    bytes: u64,
+}
+
+/// What the fallback poll knows about one file.
+struct PolledFile {
+    raw: PathBuf,
+    stamp: (Option<SystemTime>, u64),
+}
+
+/// The fallback poll's own record of the tree: a `(mtime, len)` per file, and its OWN content
+/// hash per file. The hashes answer "did this file change since the poll last read it", never
+/// "does it match a baseline" — no store, no index mode, nothing a consumer owns takes part.
+/// The most the blind poll's content check reads in one hold of the poller.
+///
+/// The budget it spends is `verify_bytes`; this is how much of it may be read before the lock
+/// goes back, so a hub thread declaring a root blind waits for a slice rather than for a whole
+/// file. Large enough that the per-slice overhead is noise next to the read itself.
+const VERIFY_SLICE: u64 = 256 * 1024;
+
+#[derive(Default)]
+struct Poller {
+    files: HashMap<PathBuf, PolledFile>,
+    hashes: HashMap<PathBuf, blake3::Hash>,
+    verify_next: usize,
+    /// A file whose reading a tick's budget cut short, resumed where it stopped.
+    partial: Option<PartialRead>,
+    /// The same for the first reading of a root that has just turned blind. Kept apart, because
+    /// that reading and the ordinary rotation take turns, and one slot would throw the other's
+    /// progress away on every turn.
+    baseline_partial: Option<PartialRead>,
+    /// Whose turn the next content check is while a first reading is under way.
+    baseline_turn: bool,
+    /// The first picture is taken. A file first read after it may have changed since the
+    /// reconcile that picture stood for, and no earlier hash would show it.
+    pictured: bool,
+    /// Except these: keys of a root that has just turned blind, whose first hash is the
+    /// baseline and not news. That is sound only because the reconcile announcing the blindness
+    /// is held back until every one of them has been read: a consumer's re-read then follows
+    /// the baseline, and any edit after the baseline differs from it. Announced first, an edit
+    /// landing between a consumer's re-read and the first hash became the baseline in silence.
+    unpictured: std::collections::BTreeSet<PathBuf>,
+    /// Bytes the content check read in the last poll.
+    #[cfg(test)]
+    last_read: u64,
+}
+
+/// How far the content check has read one file, and the hash so far.
+struct PartialRead {
+    key: PathBuf,
+    stamp: (Option<SystemTime>, u64),
+    offset: u64,
+    hasher: blake3::Hasher,
+}
+
+/// What a walk saw, and where it could not look: a path it could not stat or read for
+/// another reason than absence says nothing about the files below it.
+#[derive(Default)]
+struct Walked {
+    files: HashMap<PathBuf, PolledFile>,
+    unreadable: Vec<PathBuf>,
+}
+
+/// The content check reads in pieces of this size, so a tick holds no more than one in memory.
+const VERIFY_CHUNK: usize = 64 * 1024;
+
+impl Poller {
+    /// Every file the scope lets the hub record, keyed as the event path keys it.
+    fn walk(targets: &[WatchTarget], scope: &Scope) -> Walked {
+        let mut found: Vec<(PathBuf, PathBuf, ChangeKind)> = Vec::new();
+        let mut unreadable = Vec::new();
+        for target in targets {
+            if target.recursive {
+                collect_subtree_noting(&target.path, &mut found, Some(&mut unreadable));
+            } else {
+                match std::fs::read_dir(&target.path) {
+                    Ok(entries) => {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.is_file() {
+                                found.push((
+                                    resolve_as_far_as_it_goes(&path),
+                                    path,
+                                    ChangeKind::MaybeChanged,
+                                ));
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                        unreadable.push(target.path.clone());
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+        let mut files = HashMap::new();
+        for (canonical, raw, _) in found.into_iter().filter(|(_, raw, _)| scope.may_record(raw)) {
+            match std::fs::metadata(&raw) {
+                Ok(meta) => {
+                    let stamp = (meta.modified().ok(), meta.len());
+                    files.insert(canonical, PolledFile { raw, stamp });
+                }
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => unreadable.push(raw),
+                Err(_) => {}
+            }
+        }
+        Walked { files, unreadable }
+    }
+
+    /// One poll: what moved since the last one, by stat and then by content within `budget`
+    /// bytes. `map_only` takes the first picture and reports nothing.
+    fn poll(
+        &mut self,
+        targets: &[WatchTarget],
+        scope: &Scope,
+        budget: u64,
+        map_only: bool,
+    ) -> Vec<(PathBuf, PathBuf, ChangeKind)> {
+        let now = Self::walk(targets, scope);
+        self.take(now, budget, map_only)
+    }
+
+    /// [`Self::poll`] over a walk already taken.
+    fn take(
+        &mut self,
+        now: Walked,
+        budget: u64,
+        map_only: bool,
+    ) -> Vec<(PathBuf, PathBuf, ChangeKind)> {
+        let Walked { files: mut now, unreadable } = now;
+        // A file under a path the walk could not look into is not gone: it keeps its last
+        // stamp until the walk can see it again.
+        for (key, old) in &self.files {
+            if !now.contains_key(key) && unreadable.iter().any(|path| old.raw.starts_with(path)) {
+                now.insert(key.clone(), PolledFile { raw: old.raw.clone(), stamp: old.stamp });
+            }
+        }
+        let mut records = Vec::new();
+        if !map_only {
+            for (key, file) in &now {
+                if self.files.get(key).is_none_or(|old| old.stamp != file.stamp) {
+                    records.push((key.clone(), file.raw.clone(), ChangeKind::MaybeChanged));
+                }
+            }
+            for (key, old) in &self.files {
+                if !now.contains_key(key) {
+                    records.push((key.clone(), old.raw.clone(), ChangeKind::MaybeRemoved));
+                }
+            }
+        }
+        self.hashes.retain(|key, _| now.contains_key(key));
+        self.unpictured.retain(|key| now.contains_key(key));
+        self.files = now;
+        self.verify(budget, &mut records);
+        if map_only {
+            self.pictured = true;
+        }
+        records
+    }
+
+    /// Read the next files in turn, no more than `budget` bytes in all and at least some of
+    /// one file, and report those whose bytes changed since this poll last read them. A file
+    /// larger than what is left of the budget is read across ticks. A file read for the first
+    /// time after the picture is reported too — it may have changed unseen before that
+    /// reading — and a change is reported once: the new hash replaces the old one.
+    ///
+    /// While a root that has just turned blind is being read for the first time, that reading
+    /// and the ordinary rotation take turns: the first reading is what its reconcile waits for,
+    /// and the rotation is what finds edits in every root already read — neither waits for the
+    /// other to finish.
+    fn verify(&mut self, budget: u64, records: &mut Vec<(PathBuf, PathBuf, ChangeKind)>) {
+        let mut keys: Vec<PathBuf> = self.files.keys().cloned().collect();
+        keys.sort();
+        let (baseline, settled): (Vec<PathBuf>, Vec<PathBuf>) =
+            keys.into_iter().partition(|key| self.unpictured.contains(key));
+        let mut left = budget.max(1);
+        let baseline_turn = if baseline.is_empty() {
+            false
+        } else if settled.is_empty() {
+            true
+        } else {
+            self.baseline_turn = !self.baseline_turn;
+            self.baseline_turn
+        };
+        if baseline_turn {
+            for key in &baseline {
+                if left == 0 || !self.read_one(key, true, &mut left, records) {
+                    break;
+                }
+            }
+        } else {
+            let mut visited = 0;
+            while visited < settled.len() && left > 0 {
+                let index = self.verify_next % settled.len();
+                if !self.read_one(&settled[index], false, &mut left, records) {
+                    break;
+                }
+                self.verify_next = index + 1;
+                visited += 1;
+            }
+        }
+        #[cfg(test)]
+        {
+            self.last_read = budget.max(1) - left;
+        }
+    }
+
+    /// Read `key` on from where its slot stopped. `false` when the budget ran out inside it.
+    fn read_one(
+        &mut self,
+        key: &PathBuf,
+        baseline: bool,
+        left: &mut u64,
+        records: &mut Vec<(PathBuf, PathBuf, ChangeKind)>,
+    ) -> bool {
+        let (raw, stamp) = {
+            let file = &self.files[key];
+            (file.raw.clone(), file.stamp)
+        };
+        let slot = if baseline { &mut self.baseline_partial } else { &mut self.partial };
+        let mut reading = match slot.take() {
+            Some(partial) if partial.key == *key && partial.stamp == stamp => partial,
+            _ => PartialRead { key: key.clone(), stamp, offset: 0, hasher: blake3::Hasher::new() },
+        };
+        match Self::read_some(&raw, &mut reading, left) {
+            // Unreadable now: nothing to compare, and the stat walk still sees it. Nor is there
+            // a baseline to take, so the reading that does succeed later is news, not one.
+            None => {
+                self.unpictured.remove(key);
+                true
+            }
+            Some(false) => {
+                *(if baseline { &mut self.baseline_partial } else { &mut self.partial }) =
+                    Some(reading);
+                false
+            }
+            Some(true) => {
+                let hash = reading.hasher.finalize();
+                let already = records.iter().any(|(recorded, _, _)| recorded == key);
+                let changed = match self.hashes.insert(key.clone(), hash) {
+                    Some(previous) => previous != hash,
+                    None => {
+                        // Taken off the list whatever the picture says, so one silent
+                        // reading is all a key ever gets.
+                        let covered = self.unpictured.remove(key);
+                        self.pictured && !covered
+                    }
+                };
+                if changed && !already {
+                    records.push((key.clone(), raw, ChangeKind::MaybeChanged));
+                }
+                true
+            }
+        }
+    }
+
+    /// Every file of the roots that turned blind has been read once, or could not be.
+    fn baseline_complete(&self) -> bool {
+        !self.files.keys().any(|key| self.unpictured.contains(key))
+    }
+
+    /// Read on from `reading.offset`, at most `left` bytes, into its hash. `Some(true)`: the
+    /// file is read to its end; `Some(false)`: the budget ran out first; `None`: unreadable.
+    fn read_some(path: &Path, reading: &mut PartialRead, left: &mut u64) -> Option<bool> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(path).ok()?;
+        file.seek(SeekFrom::Start(reading.offset)).ok()?;
+        let mut buffer = vec![0u8; VERIFY_CHUNK];
+        loop {
+            if *left == 0 {
+                return Some(reading.offset >= reading.stamp.1 && file.read(&mut [0u8]).ok()? == 0);
+            }
+            let want = buffer.len().min(usize::try_from(*left).unwrap_or(usize::MAX));
+            let read = file.read(&mut buffer[..want]).ok()?;
+            if read == 0 {
+                return Some(true);
+            }
+            reading.hasher.update(&buffer[..read]);
+            reading.offset += read as u64;
+            *left -= read as u64;
+        }
+    }
+
+    fn bytes(&self) -> u64 {
+        self.files.values().map(|file| file.stamp.1).sum()
+    }
+}
+
+/// A raised-once stop with a wait on it, shared by a thread and whoever stops it.
+#[derive(Default)]
+struct StopFlag {
+    raised: Mutex<bool>,
+    wake: Condvar,
+    /// Work is waiting: the current wait ends early, once, and the stop is not raised by it.
+    poked: std::sync::atomic::AtomicBool,
+}
+
+impl StopFlag {
+    fn raise(&self) {
+        *self.raised.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.wake.notify_all();
+    }
+
+    /// End the current wait (or the next one) early, without stopping anything.
+    fn poke(&self) {
+        let _raised = self.raised.lock().unwrap_or_else(PoisonError::into_inner);
+        self.poked.store(true, Ordering::SeqCst);
+        self.wake.notify_all();
+    }
+
+    #[cfg(test)]
+    fn is_raised(&self) -> bool {
+        *self.raised.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Wait up to `timeout`, or until poked; says whether the stop was raised.
+    fn wait(&self, timeout: Duration) -> bool {
+        let raised = self.raised.lock().unwrap_or_else(PoisonError::into_inner);
+        let raised = self
+            .wake
+            .wait_timeout_while(raised, timeout, |raised| {
+                !*raised && !self.poked.load(Ordering::SeqCst)
+            })
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
+        self.poked.store(false, Ordering::SeqCst);
+        *raised
+    }
+}
+
+/// The poll of blind roots: declared, present, and not watched while everything else is.
+///
+/// The hub thread keeps the target set current and takes each newly blind root's first
+/// picture itself, BEFORE the reconcile that announces the blindness — so a consumer's
+/// rescan reads everything the picture missed and every later change is a poll record. The
+/// periodic polls run on a thread of their own, so an event stream still flowing for the
+/// watched roots is never held up by a walk.
+#[derive(Default)]
+struct BlindPoll {
+    state: Mutex<BlindPollState>,
+    stop: Arc<StopFlag>,
+    running: AtomicBool,
+    /// Refuses to start the poll thread, so a test can see what a hub that promised an
+    /// observation and never made one reports. Per hub, never global: these tests run beside
+    /// others that need a working poll.
+    #[cfg(test)]
+    cannot_start: bool,
+    /// `reconcile_owed`, readable without the poller's lock: a cursor subscribed while the
+    /// first reading is under way is not handed a reconcile of its own ahead of the baseline —
+    /// the announcement that follows the baseline flags it like everyone else.
+    reconcile_pending: AtomicBool,
+    /// Holds each poll of this hub's blind roots until a test lets it run.
+    #[cfg(test)]
+    gate: Option<Arc<PollGate>>,
+    /// Parks the announcement of a blind root's reconcile where a test asks.
+    #[cfg(test)]
+    announce: Option<Arc<AnnounceBarrier>>,
+}
+
+/// The test seams of a hub's blind poll, fixed when the hub is built so the poll thread cannot
+/// run before they are in place.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct BlindPollSeam {
+    cannot_start: bool,
+    gate: Option<Arc<PollGate>>,
+    announce: Option<Arc<AnnounceBarrier>>,
+}
+
+#[cfg(test)]
+impl BlindPollSeam {
+    pub(crate) fn refusing_to_start() -> Self {
+        Self { cannot_start: true, gate: None, announce: None }
+    }
+}
+
+/// A barrier in front of every blind poll: a poll runs only on a permit, and each arrival is
+/// counted, so a test can say "exactly this many polls have completed". Stop-aware, so a hub
+/// shut down while a poll waits here is not held by it.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct PollGate {
+    counts: Mutex<(usize, usize)>,
+    moved: Condvar,
+}
+
+#[cfg(test)]
+impl PollGate {
+    const BOUND: Duration = Duration::from_secs(10);
+
+    fn arrive(&self, stop: &StopFlag) {
+        let mut counts = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
+        counts.1 += 1;
+        self.moved.notify_all();
+        let deadline = Instant::now() + Self::BOUND;
+        while counts.0 == 0 && Instant::now() < deadline && !stop.is_raised() {
+            counts = self
+                .moved
+                .wait_timeout(counts, Duration::from_millis(20))
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        counts.0 = counts.0.saturating_sub(1);
+    }
+
+    /// Wait until the poll has reached the gate at least `arrivals` times.
+    pub(crate) fn wait_arrivals(&self, arrivals: usize) {
+        let mut counts = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
+        let deadline = Instant::now() + Self::BOUND;
+        while counts.1 < arrivals && Instant::now() < deadline {
+            counts = self
+                .moved
+                .wait_timeout(counts, Duration::from_millis(20))
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        assert!(counts.1 >= arrivals, "the blind poll never reached its gate {arrivals} times");
+    }
+
+    /// Let `polls` more polls run, without waiting for any of them.
+    pub(crate) fn allow(&self, polls: usize) {
+        let mut counts = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
+        counts.0 += polls;
+        self.moved.notify_all();
+    }
+
+    /// Let `polls` polls run, and return once each of them has come back to the gate.
+    pub(crate) fn run_polls(&self, polls: usize) {
+        let target = {
+            let mut counts = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
+            counts.0 += polls;
+            self.moved.notify_all();
+            counts.1 + polls
+        };
+        self.wait_arrivals(target);
+    }
+}
+
+/// Where the announcement of a blind root's reconcile can be parked.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AnnouncePoint {
+    /// The first moment another thread can act after the poll decided to announce.
+    BeforeIssue,
+    /// The first moment another thread can act after the reconcile was issued.
+    AfterIssue,
+}
+
+/// A barrier inside the announcement: armed for one point, the poll parks there once until the
+/// test releases it. Stop-aware and bounded, so a failing stand does not hold the hub.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct AnnounceBarrier {
+    /// The armed point, whether the poll is parked, and whether it has been released.
+    state: Mutex<(Option<AnnouncePoint>, bool, bool)>,
+    moved: Condvar,
+}
+
+#[cfg(test)]
+impl AnnounceBarrier {
+    const BOUND: Duration = Duration::from_secs(10);
+
+    pub(crate) fn arm(&self, point: AnnouncePoint) {
+        *self.state.lock().unwrap_or_else(PoisonError::into_inner) = (Some(point), false, false);
+    }
+
+    fn reach(&self, point: AnnouncePoint, stop: &StopFlag) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.0 != Some(point) {
+            return;
+        }
+        state.0 = None;
+        state.1 = true;
+        self.moved.notify_all();
+        let deadline = Instant::now() + Self::BOUND;
+        while !state.2 && Instant::now() < deadline && !stop.is_raised() {
+            state = self
+                .moved
+                .wait_timeout(state, Duration::from_millis(20))
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        state.1 = false;
+        self.moved.notify_all();
+    }
+
+    pub(crate) fn wait_parked(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let deadline = Instant::now() + Self::BOUND;
+        while !state.1 && Instant::now() < deadline {
+            state = self
+                .moved
+                .wait_timeout(state, Duration::from_millis(20))
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        assert!(state.1, "the announcement never reached its barrier");
+    }
+
+    pub(crate) fn release(&self) {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).2 = true;
+        self.moved.notify_all();
+    }
+}
+
+#[derive(Default)]
+struct BlindPollState {
+    targets: Vec<WatchTarget>,
+    poller: Poller,
+    /// Moved on every retarget, so a walk taken against an older set is not applied.
+    epoch: u64,
+    /// A root turned blind and its reconcile is not announced yet: the poll announces it once
+    /// the first reading of every blind file is done.
+    reconcile_owed: bool,
+}
+
+impl BlindPoll {
+    /// Poll `targets` from now on. Roots joining the set are mapped here, on the calling
+    /// (hub) thread; roots leaving it take their files with them.
+    fn retarget(inner: &Arc<HubInner>, targets: Vec<WatchTarget>) {
+        let scope = inner.scope();
+        {
+            let mut state = inner.blind_poll.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if state.targets == targets {
+                return;
+            }
+            // Two walks, and both are needed: `joining` is the picture the reconcile stands
+            // for — files under a root that has just become blind are recorded as they are
+            // now, so they are not reported as changes — while `keep` says which of the files
+            // already recorded survive the new set. Deriving the first from the second by
+            // path containment would add a ninth place comparing paths (`one_path_rule`), and
+            // deriving it by "not seen before" would silently absorb a file that appeared
+            // under a SURVIVING root since the last walk, which is a change and must be
+            // reported. Both walks are over the BLIND roots, never over the watched tree.
+            let joining: Vec<WatchTarget> =
+                targets.iter().filter(|target| !state.targets.contains(target)).cloned().collect();
+            let fresh = Poller::walk(&joining, &scope);
+            let keep = Poller::walk(&targets, &scope);
+            state.poller.files.retain(|key, _| keep.files.contains_key(key));
+            state.poller.hashes.retain(|key, _| keep.files.contains_key(key));
+            state.poller.unpictured.retain(|key| keep.files.contains_key(key));
+            // The joining files ARE the picture the reconcile announcing the blindness stands
+            // for. Their content cannot be hashed here — this runs on the hub thread, and the
+            // root may be any size — so the poll's first reading of each takes the baseline,
+            // silently, and the reconcile is announced only once that reading is done.
+            // Anything after that is news.
+            state.poller.unpictured.extend(fresh.files.keys().cloned());
+            state.poller.files.extend(fresh.files);
+            state.poller.pictured = true;
+            state.targets = targets;
+            state.epoch += 1;
+            if state.targets.is_empty() {
+                // Nothing is blind any more: nothing is owed, and a stale expectation would
+                // keep reporting an overdue poll over a set nobody polls.
+                inner.expect_poll_from(None);
+                // Except the reconcile a blindness that has now ended still owes: there is
+                // nothing left to read first, so it is announced here rather than forgotten.
+                let owed = state.reconcile_owed;
+                if owed {
+                    Self::issue_reconcile(inner, &mut state);
+                }
+                drop(state);
+                if owed {
+                    inner.notify();
+                }
+                return;
+            }
+            // Owed from now. If the poll thread below never starts, this is what keeps the
+            // blindness visible instead of reading as a tree in good order.
+            inner.expect_poll_from(Some(Instant::now()));
+        }
+        if !inner.blind_poll.running.swap(true, Ordering::SeqCst) {
+            let weak = Arc::downgrade(inner);
+            let stop = Arc::clone(&inner.blind_poll.stop);
+            let period = inner.poll.period;
+            #[cfg(test)]
+            if inner.blind_poll.cannot_start {
+                tracing::warn!("workspace change hub cannot poll its blind roots: refused by test");
+                inner.blind_poll.running.store(false, Ordering::SeqCst);
+                return;
+            }
+            let spawned = std::thread::Builder::new()
+                .name("bsl-workspace-blind-poll".to_owned())
+                .spawn(move || Self::run(weak, stop, period));
+            if let Err(error) = spawned {
+                tracing::warn!("workspace change hub cannot poll its blind roots: {error}");
+                inner.blind_poll.running.store(false, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Owe the reconcile of a root that has just turned blind to the poll, which announces it
+    /// once every blind file has been read once. `false` when there is no poll to do that — the
+    /// thread could not start — and the caller announces at once.
+    fn defer_reconcile(inner: &HubInner) -> bool {
+        let mut state = inner.blind_poll.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.targets.is_empty() || !inner.blind_poll.running.load(Ordering::SeqCst) {
+            return false;
+        }
+        state.reconcile_owed = true;
+        inner.blind_poll.reconcile_pending.store(true, Ordering::SeqCst);
+        drop(state);
+        // The first reading starts now, not a whole idle period from now: what the reconcile
+        // waits for is that reading, and each poll still reads no more than its budget.
+        inner.blind_poll.stop.poke();
+        true
+    }
+
+    /// Issue the reconcile the blind roots are owed, and publish that it is made — under
+    /// `state`, the lock a retarget takes to add unread files and a newly blind root takes to
+    /// owe another announcement, so neither can come between the decision and the reconcile.
+    /// The accumulator is taken inside it, the one order these two locks are ever held in.
+    ///
+    /// The publication is made before the accumulator is released: a subscription lands either
+    /// before the reconcile, which flags it, or after the publication, which it reads as made
+    /// and is owed a reconcile of its own. Released in between, a newcomer with no open window
+    /// to inherit would read the announcement as still to come and never be told.
+    fn issue_reconcile(inner: &HubInner, state: &mut BlindPollState) {
+        state.reconcile_owed = false;
+        let mut acc = inner.lock_acc();
+        acc.enter_rescan(false, DegradeReason::RewatchFailed);
+        inner.blind_poll.reconcile_pending.store(false, Ordering::SeqCst);
+        drop(acc);
+    }
+
+    fn run(inner: std::sync::Weak<HubInner>, stop: Arc<StopFlag>, period: Duration) {
+        Self::poll_until_stopped(&inner, &stop, period);
+        // Left for good: the claim that a poller exists goes with the poller.
+        if let Some(inner) = inner.upgrade() {
+            inner.blind_poll.running.store(false, Ordering::SeqCst);
+        }
+    }
+
+    fn poll_until_stopped(
+        inner: &std::sync::Weak<HubInner>,
+        stop: &Arc<StopFlag>,
+        period: Duration,
+    ) {
+        while !stop.wait(period) {
+            let Some(inner) = inner.upgrade() else { return };
+            let (targets, epoch) = {
+                let state = inner.blind_poll.state.lock().unwrap_or_else(PoisonError::into_inner);
+                (state.targets.clone(), state.epoch)
+            };
+            if targets.is_empty() {
+                continue;
+            }
+            #[cfg(test)]
+            if let Some(gate) = &inner.blind_poll.gate {
+                gate.arrive(stop);
+            }
+            let now = Poller::walk(&targets, &inner.scope());
+            // The content check reads whole files — up to `verify_bytes`, which is 32 MB in
+            // production — and it needs the poller, which `retarget` needs too, on the hub
+            // thread. Taken in one hold, that read is how long the hub waits to declare a root
+            // blind. So the budget is spent a SLICE at a time and the lock is dropped between
+            // slices: the poller already carries an interrupted read across calls, so this
+            // changes what is held and for how long, not what is read.
+            let mut records = {
+                let mut state =
+                    inner.blind_poll.state.lock().unwrap_or_else(PoisonError::into_inner);
+                if state.epoch != epoch {
+                    continue;
+                }
+                state.poller.take(now, VERIFY_SLICE.min(inner.poll.verify_bytes), false)
+            };
+            let mut spent = VERIFY_SLICE.min(inner.poll.verify_bytes);
+            while spent < inner.poll.verify_bytes {
+                let slice = VERIFY_SLICE.min(inner.poll.verify_bytes - spent);
+                let mut state =
+                    inner.blind_poll.state.lock().unwrap_or_else(PoisonError::into_inner);
+                if state.epoch != epoch {
+                    break;
+                }
+                state.poller.verify(slice, &mut records);
+                drop(state);
+                spent += slice;
+            }
+            if !records.is_empty() {
+                let mut acc = inner.lock_acc();
+                for (canonical, raw, kind) in records {
+                    acc.record(canonical, raw, kind);
+                }
+                drop(acc);
+                inner.notify();
+            }
+            let announced = {
+                let mut state =
+                    inner.blind_poll.state.lock().unwrap_or_else(PoisonError::into_inner);
+                inner.note_poll(&state.poller);
+                // Read under the lock a retarget takes to add its files: a root that joined
+                // since this poll's walk is already among the files not yet read.
+                let ready = state.reconcile_owed && state.poller.baseline_complete();
+                if ready {
+                    // Inside the hold, on both sides of the reconcile: what a stand can do
+                    // from another thread here — subscribe, declare, drain — is exactly what
+                    // the hold has to keep from landing in between.
+                    #[cfg(test)]
+                    if let Some(barrier) = &inner.blind_poll.announce {
+                        barrier.reach(AnnouncePoint::BeforeIssue, stop);
+                    }
+                    Self::issue_reconcile(&inner, &mut state);
+                    #[cfg(test)]
+                    if let Some(barrier) = &inner.blind_poll.announce {
+                        barrier.reach(AnnouncePoint::AfterIssue, stop);
+                    }
+                }
+                ready
+            };
+            if announced {
+                inner.notify();
+            }
+        }
+    }
+}
+
+/// The hub without a watch: poll the declared targets on this thread until shutdown.
+///
+/// The first walk only takes the picture, and only THEN is every cursor told to reconcile
+/// once: a consumer's rescan after that point reads everything the picture missed, and every
+/// change after the picture is a poll record. The order the other way round would lose a
+/// change landing between a consumer's rescan and the picture.
+fn run_polling(
+    inner: &Arc<HubInner>,
+    mut declared: Vec<WatchTarget>,
+    rx: &std::sync::mpsc::Receiver<HubMsg>,
+) {
+    inner.polling.store(true, Ordering::SeqCst);
+    inner.accept_declaration(&declared);
+    // From here an observation is owed. Until the first walk lands, "never polled" must read
+    // as overdue rather than as fresh.
+    inner.expect_poll_from(Some(Instant::now()));
+    let mut poller = Poller::default();
+    let map = |poller: &mut Poller, declared: &[WatchTarget], reason: DegradeReason| {
+        poller.poll(declared, &inner.scope(), inner.poll.verify_bytes, true);
+        inner.note_poll(poller);
+        inner.lock_acc().enter_rescan_for_listeners(reason);
+        inner.notify();
+    };
+    tracing::warn!("workspace change hub has no watch; polling the workspace instead");
+    map(&mut poller, &declared, DegradeReason::WatcherSetup);
+    let mut due = Instant::now() + inner.poll.period;
+    loop {
+        let now = Instant::now();
+        if now >= due {
+            poll_once(inner, &mut poller, &declared);
+            due = Instant::now() + inner.poll.period;
+            continue;
+        }
+        match rx.recv_timeout(due - now) {
+            Ok(HubMsg::Shutdown) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return;
+            }
+            Ok(HubMsg::Rearm { targets, ack }) => {
+                // The same rule the watching thread applies: a declaration equal to the one
+                // in force costs nothing. Re-taking the picture would throw away the map the
+                // poll compares against and owe every consumer a reconcile for a set that
+                // did not move — and that reconcile is what rebuilds the graph, which
+                // declares again.
+                let resolved = ResolvedTargets::here(targets);
+                if !same_declaration(resolved.as_slice(), declared.as_slice()) {
+                    declared = repoint_polling(inner, resolved);
+                    poller = Poller::default();
+                    map(&mut poller, &declared, DegradeReason::Rearmed);
+                }
+                // Never "covered": polling is what the hub does when it could not watch.
+                let _ = ack.try_send(false);
+            }
+            #[cfg(test)]
+            Ok(HubMsg::Tick) => {
+                poll_once(inner, &mut poller, &declared);
+                due = Instant::now() + inner.poll.period;
+            }
+            Ok(HubMsg::Event(_)) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+fn repoint_polling(inner: &HubInner, resolved: ResolvedTargets) -> Vec<WatchTarget> {
+    inner.set_scope(inner.scope_from(&resolved));
+    let declared = resolved.into_inner();
+    inner.accept_declaration(&declared);
+    declared
+}
+
+fn poll_once(inner: &HubInner, poller: &mut Poller, declared: &[WatchTarget]) {
+    let records = poller.poll(declared, &inner.scope(), inner.poll.verify_bytes, false);
+    if !records.is_empty() {
+        let mut acc = inner.lock_acc();
+        for (canonical, raw, kind) in records {
+            acc.record(canonical, raw, kind);
+        }
+        drop(acc);
+        inner.notify();
+    }
+    inner.note_poll(poller);
+}
+
 /// Arm the watch over every target and pump events (and control messages) until
 /// shutdown. Runs on its own thread so `start` returns without blocking on the
 /// initial (potentially huge) directory walks.
@@ -2586,7 +3994,10 @@ fn run_hub_thread(
         Ok(backend) => Watch { backend, seams: watch_refusal },
         Err(error) => {
             tracing::warn!("workspace change hub failed to create watcher: {error}");
+            let targets = ResolvedTargets::here(targets);
+            inner.set_scope(inner.scope_from(&targets));
             inner.mark_setup_failed();
+            run_polling(&inner, targets.into_inner(), &rx);
             return;
         }
     };
@@ -2642,10 +4053,15 @@ fn run_hub_thread(
         }
     }
     if armed.is_empty() {
+        drop(watcher);
         inner.mark_setup_failed();
+        run_polling(&inner, declared, &rx);
         return;
     }
     inner.publish_watched_roots(&armed);
+    // The declaration this thread now stands on: a caller asking for the same set again is
+    // answered without a message, however much of it the backend managed to take.
+    inner.accept_declaration(&declared);
     // Before readiness is announced, so a consumer that waits for it and subscribes is
     // told to reconcile the window it was never watching over.
     refresh_blind_targets(&inner, &declared, &snapshot, &armed);
@@ -2761,22 +4177,11 @@ fn run_hub_thread(
                 }
             }
             HubMsg::Rearm { targets, ack } => {
-                // Placed ONCE for the whole message: the periodic check must police the
-                // very tree the watcher gets armed on, and a second `here()` could read a
-                // current directory that moved in between.
-                let resolved = ResolvedTargets::here(targets);
-                declared = resolved.as_slice().to_vec();
-                snapshot = snapshot_of(&declared, &snapshot);
-                let full_coverage = apply_rearm(&inner, &mut watcher, &mut armed, resolved);
-                // Before the acknowledgement: the requester is released by it and may read
-                // health immediately.
-                refresh_blind_targets(&inner, &declared, &snapshot, &armed);
-                // `try_send`, not `send`: the requester may have timed out and
-                // dropped its receiver; the hub thread must never block on it.
-                let _ = ack.try_send(full_coverage);
-            }
-            HubMsg::Declare(targets) => {
-                apply_declaration(
+                // One path for every declaration the thread receives. `apply_declaration`
+                // decides what the declaration is worth: an unchanged one costs nothing, one
+                // that moves no coverage is recorded without a re-arm, and only a real move
+                // re-arms and owes the reconcile that comes with it.
+                let covered = apply_declaration(
                     &inner,
                     &mut watcher,
                     &mut armed,
@@ -2784,6 +4189,9 @@ fn run_hub_thread(
                     &mut snapshot,
                     targets,
                 );
+                // `try_send`, not `send`: the requester may have timed out and
+                // dropped its receiver; the hub thread must never block on it.
+                let _ = ack.try_send(covered);
             }
             #[cfg(test)]
             HubMsg::Tick => {
@@ -2898,11 +4306,17 @@ fn retry_blind_targets(
     inner.notify();
 }
 
-/// Take a new declared set that the caller believes needs no re-arming.
+/// Apply a declaration and report whether the hub covers it.
 ///
-/// The belief is not trusted: the caller compared coverage on ITS thread, and a target
-/// absorbed by an ancestor at that moment can be standing on its own by the time this
-/// runs. The snapshot is therefore taken FIRST — before the cover is recomputed — so a
+/// Three outcomes, and which one a declaration gets is decided HERE rather than by its
+/// sender. A declaration equal to the one in force is answered from what the hub already
+/// holds: nothing is armed, nothing is re-pictured, nothing is owed. One that moves no
+/// coverage is recorded without a re-arm. Only a real move re-arms, and only then does a
+/// consumer owe a reconcile.
+///
+/// The sender's belief about coverage is not trusted: it compared on ITS thread, and a
+/// target absorbed by an ancestor at that moment can be standing on its own by the time
+/// this runs. The snapshot is therefore taken FIRST — before the cover is recomputed — so a
 /// retarget inside that window reads as movement instead of being recorded as the
 /// starting state, and the decision to arm uses the same rule the tick uses.
 fn apply_declaration(
@@ -2912,9 +4326,15 @@ fn apply_declaration(
     declared: &mut Vec<WatchTarget>,
     snapshot: &mut Snapshot,
     targets: Vec<WatchTarget>,
-) {
+) -> bool {
     let resolved = ResolvedTargets::here(targets);
+    let resolved_complete = resolved.is_complete();
     let next = resolved.as_slice().to_vec();
+    if same_declaration(&next, declared) {
+        // The second barrier, and the one that holds even when a caller asks directly. The
+        // first is `ensure_roots`, which does not send this message at all for a repeat.
+        return declared_coverage(declared, resolved_complete, armed);
+    }
     // Merged, not replaced: a drift that already happened to a surviving target must
     // survive this update, and a target seen for the first time gets described now.
     let current = snapshot_of(&next, snapshot);
@@ -2933,10 +4353,16 @@ fn apply_declaration(
         apply_rearm(inner, watcher, armed, resolved);
         inner.rearms.fetch_add(1, Ordering::Relaxed);
     } else {
-        if !resolved.is_complete() {
-            // A target that could not be placed silently narrows the scope, and the caller
-            // already counts this declaration as delivered — so it is reported here, like
-            // at every other placement point, rather than left to look like agreement.
+        if !resolved.is_complete() || !declared_coverage(declared, true, armed) {
+            // A declaration this pass did not arm in full — a target that could not be
+            // placed, or one that names a directory which does not exist — silently narrows
+            // what the hub can see, and the caller already counts the declaration as
+            // delivered. So it is reported here, like at every other placement point, rather
+            // than left to look like agreement.
+            //
+            // Reported on the CHANGE only: this branch is past the equality check above, so a
+            // repeat of the same declaration says nothing a second time. That is the whole
+            // difference between announcing a gap and re-announcing it on every rebuild.
             inner.note_unplaced_targets();
         }
         // Only on this branch, and only because nothing was armed on it: a scope can narrow
@@ -2991,6 +4417,28 @@ fn apply_declaration(
     // leaves the set: outside the cover, so dropping it moves no coverage at all, and a
     // set reconciled only inside `apply_rearm` would hold ill health over it forever.
     refresh_blind_targets(inner, declared, snapshot, armed);
+    // Only now, and only by the thread: from here an identical declaration is answered
+    // without a message. Recorded after the arming above, so a repeat can never be answered
+    // "already declared" over a set this pass has not finished placing.
+    inner.accept_declaration(declared);
+    // Read off the declaration as it now stands: `apply_rearm` consumed the resolved set, and
+    // re-resolving here would answer about a tree that may have moved since.
+    declared_coverage(declared, resolved_complete, armed)
+}
+
+/// Whether every declared target is placed and armed. The same question `ensure_roots` asks
+/// of the published list, asked here against the live one.
+fn declared_coverage(declared: &[WatchTarget], placed: bool, armed: &[ArmedTarget]) -> bool {
+    if !placed {
+        return false;
+    }
+    dedup_targets(declared.to_vec()).into_iter().all(|(target, canonical)| {
+        armed.iter().any(|entry| {
+            entry.is_declared()
+                && entry.resolved() == canonical
+                && entry.target().recursive == target.recursive
+        })
+    })
 }
 
 /// Whether arming `dir` is worth what the backend charges for it.
@@ -3707,6 +5155,7 @@ pub(crate) mod test_support {
             &refusals,
         );
         assert!(hub.wait_until_watching(Duration::from_secs(5)), "the live root still arms");
+        hub.wait_until_blindness_announced();
         (dir, a, b, hub, refusals)
     }
 }
@@ -5337,6 +6786,140 @@ mod tests {
         assert_ne!(reason, DegradeReason::Overflow, "its own lag is not a loss of the stream");
     }
 
+    /// A lag is a loss with an identity of its own.
+    ///
+    /// The token is what a consumer tells one loss from another by — a reconcile says the
+    /// detail is gone, and the fact number cannot say it, so the same number twice IS the same
+    /// event and is deduplicated. A cursor cut out of entries it had not drained lost something
+    /// nobody else lost; handing it the last SHARED loss number made its reconcile read as a
+    /// repeat of an event it had already acted on, and the debt it should have opened was
+    /// dropped on the way in.
+    #[test]
+    fn a_cursor_cut_out_of_its_entries_reports_a_loss_of_its_own() {
+        let mut acc = Accumulator::new(2);
+        let lagging = acc.subscribe(None);
+        let other = acc.subscribe(None);
+        let record = |acc: &mut Accumulator, name: &str| {
+            let p = PathBuf::from(name);
+            acc.record(p.clone(), p, ChangeKind::MaybeChanged);
+        };
+
+        // One loss of the stream, seen by both: the same event, and both must say so.
+        acc.enter_rescan(false, DegradeReason::RuntimeError);
+        let shared_lagging = acc.drain(lagging).loss_token().expect("the window is a loss");
+        let shared_other = acc.drain(other).loss_token().expect("the window is a loss");
+        assert_eq!(
+            shared_lagging, shared_other,
+            "one loss reaching two cursors is one event and must carry one identity",
+        );
+
+        // And now a loss of one cursor's own: `other` keeps draining, `lagging` does not, and
+        // the cap cuts it out of what it never read.
+        for name in ["/p1.bsl", "/p2.bsl", "/p3.bsl", "/p4.bsl"] {
+            record(&mut acc, name);
+            acc.drain(other);
+        }
+        let batch = acc.drain(lagging);
+        assert!(batch.rescan_required, "the stand needs the lagging cursor to have been cut");
+        assert_ne!(
+            batch.loss_token().expect("a cut is a loss"),
+            shared_lagging,
+            "a lag was handed the identity of the shared loss it had already acted on",
+        );
+    }
+
+    /// A newcomer inheriting an open window is handed THAT window's identity.
+    ///
+    /// Cutting a cursor that already owed the window issues nothing — its debt covers the cut —
+    /// but it still moved the counter, and a newcomer inheriting the window took its number
+    /// from the counter. One loss then reached a consumer under two names, and the second
+    /// name revived its budgets a second time.
+    #[test]
+    fn a_newcomer_inherits_the_identity_of_the_window_it_joins() {
+        let mut acc = Accumulator::new(2);
+        let behind = acc.subscribe(None);
+        let current = acc.subscribe(None);
+        acc.enter_rescan(false, DegradeReason::RuntimeError);
+        let window = acc.materialize(behind).loss_token().expect("the window is a loss");
+
+        // `current` reconciles and keeps up; `behind` does not, and the cap cuts it while it
+        // still owes the window.
+        acc.drain(current);
+        for name in ["/p1.bsl", "/p2.bsl", "/p3.bsl", "/p4.bsl"] {
+            let path = PathBuf::from(name);
+            acc.record(path.clone(), path, ChangeKind::MaybeChanged);
+            acc.drain(current);
+        }
+        assert_eq!(
+            acc.materialize(behind).loss_token(),
+            Some(window),
+            "the stand needs the cut cursor still owing the window, under its identity",
+        );
+        // And a loss of another cursor's own after the window: the counter moves past it.
+        acc.force_rescan(current, DegradeReason::RewatchFailed);
+
+        let newcomer = acc.subscribe(None);
+        assert_eq!(
+            acc.materialize(newcomer).loss_token(),
+            Some(window),
+            "a newcomer inheriting the open window was given another identity for the same loss",
+        );
+    }
+
+    /// A reconcile forced on one cursor is a loss of its own, with an identity of its own.
+    ///
+    /// Left without one, its batch borrowed the number of the last loss issued — which is the
+    /// number a consumer has usually just acted on, so the new debt read as a repeat and was
+    /// dropped on the way in.
+    #[test]
+    fn a_forced_reconcile_is_not_named_after_a_loss_already_acted_on() {
+        let mut acc = Accumulator::new(4);
+        let early = acc.subscribe(None);
+        acc.enter_rescan(false, DegradeReason::RuntimeError);
+        let acted_on = acc.drain(early).loss_token().expect("the window is a loss");
+
+        let late = acc.subscribe(None);
+        acc.force_rescan(late, DegradeReason::RewatchFailed);
+        let batch = acc.materialize(late);
+        assert!(batch.rescan_required, "the forced reconcile is owed");
+        assert_ne!(
+            batch.loss_token(),
+            Some(acted_on),
+            "a reconcile forced on a newcomer was named after a loss the consumer already acted on",
+        );
+        assert_eq!(
+            acc.materialize(late).loss_token(),
+            batch.loss_token(),
+            "re-materialising the same debt moved its identity",
+        );
+    }
+
+    /// Re-subscribing carries a debt across with the identity it was issued under.
+    ///
+    /// A consumer re-subscribes to take a fresh baseline, and the debt goes with it — but under
+    /// a new number, so the consumer that had already seen the old one read the same loss as a
+    /// new event and paid for it again.
+    #[test]
+    fn a_resubscribed_debt_keeps_its_identity() {
+        let dir = tempdir().unwrap();
+        let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        let cursor = hub.subscribe();
+        hub.inner.lock_acc().enter_rescan(false, DegradeReason::RuntimeError);
+        let before = hub.materialize(cursor);
+        assert!(before.rescan_required, "the stand needs a debt to carry");
+
+        let replaced = hub.resubscribe(cursor);
+        let after = hub.materialize(replaced);
+        hub.shutdown();
+        assert!(after.rescan_required, "the debt did not survive re-subscribing");
+        assert_eq!(
+            after.loss_token(),
+            before.loss_token(),
+            "re-subscribing re-issued the same loss under a new identity",
+        );
+    }
+
     /// A debt of one cursor's own is not the shared window. Left conflated, a private lag
     /// keeps the window open after every cursor that owed the SHARED reconcile has paid,
     /// so `health()` stays degraded and every newcomer inherits a full reconcile it owes
@@ -5621,6 +7204,1350 @@ mod tests {
             batch.entries.iter().any(|e| e.raw == toml),
             "the hub accepts any path; kind-filtering is the consumer's job",
         );
+    }
+
+    fn polling_hub(root: &Path, verify_bytes: u64) -> (WorkspaceChangeHub, SinkCursor) {
+        let (hub, hold) = WorkspaceChangeHub::start_polling(
+            vec![WatchTarget::recursive(root.to_path_buf())],
+            PollConfig { period: Duration::from_secs(3600), verify_bytes },
+        );
+        let cursor = hub.subscribe();
+        hold.release();
+        assert_eq!(hub.watch_readiness(Duration::from_secs(5)), WatchReadiness::Failed);
+        assert!(eventually(Duration::from_secs(5), || hub.is_polling() && hub.drain_peek(cursor)));
+        (hub, cursor)
+    }
+
+    /// The bound a status answer publishes covers the pass in flight AND the one after it.
+    ///
+    /// Verification reads a budget per tick and resumes a file where it stopped, keeping what
+    /// it already read while the file's stamp is unchanged and comparing the digest only once
+    /// the file has been read through. An edit landing behind the offset the current pass has
+    /// already passed is therefore not in that pass at all: it is found by the next full read.
+    /// One pass over every polled byte is the arithmetic of the work, not a bound on when the
+    /// edit is seen, and it was published as the second.
+    #[test]
+    fn the_published_poll_bound_covers_the_pass_in_flight_and_the_one_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("A.bsl"), vec![b'a'; 4096]).unwrap();
+
+        for (budget, passes) in [(4096u64, 1u64), (2048, 2), (1024, 4)] {
+            let (hub, _cursor) = polling_hub(root, budget);
+            let (_, cycle) = hub.poll_report().expect("a polling hub reports its bound");
+            assert_eq!(
+                cycle,
+                Duration::from_secs(3600) * u32::try_from(2 * passes + 3).unwrap(),
+                "the bound for a {budget}-byte budget is not the conservative one",
+            );
+            hub.shutdown();
+        }
+    }
+
+    /// A hub whose watch never came up tells every cursor to reconcile exactly once — the
+    /// facts before its first picture are lost — and from then on delivers changes as poll
+    /// records, with no further reconcile however many polls run.
+    #[test]
+    fn a_hub_without_a_watch_polls_after_one_reconcile() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("Before.bsl"), "Процедура П() КонецПроцедуры\n").unwrap();
+        let (hub, cursor) = polling_hub(root, VERIFY_BYTES);
+
+        let first = hub.drain(cursor);
+        assert!(first.rescan_required, "the facts before the picture are lost: one reconcile");
+        for _ in 0..3 {
+            assert!(hub.poll_now(Duration::from_secs(5)));
+            let batch = hub.drain(first.cursor);
+            assert!(!batch.rescan_required, "a poll cost another reconcile");
+            assert!(batch.entries.is_empty(), "a quiet poll reported {:?}", batch.entries);
+        }
+        assert_eq!(hub.rescan_request_count(), 1);
+
+        std::fs::write(root.join("After.bsl"), "Процедура Н() КонецПроцедуры\n").unwrap();
+        std::fs::remove_file(root.join("Before.bsl")).unwrap();
+        assert!(hub.poll_now(Duration::from_secs(5)));
+        let batch = hub.drain(first.cursor);
+        assert!(!batch.rescan_required);
+        let kinds: Vec<(String, ChangeKind)> = batch
+            .entries
+            .iter()
+            .map(|e| (e.raw.file_name().unwrap().to_string_lossy().into_owned(), e.kind))
+            .collect();
+        assert!(kinds.contains(&("After.bsl".to_owned(), ChangeKind::MaybeChanged)), "{kinds:?}");
+        assert!(kinds.contains(&("Before.bsl".to_owned(), ChangeKind::MaybeRemoved)), "{kinds:?}");
+        assert_eq!(
+            hub.health_for(Some(first.cursor)),
+            Health::Degraded(DegradeReason::WatcherSetup)
+        );
+        hub.shutdown();
+    }
+
+    /// Re-declaring the set the hub already stands on costs nothing at all: no message, no
+    /// re-mapping, no reconcile. The loop this prevents is the graph's: a reconcile makes it
+    /// rebuild, and every rebuild declares its scan roots again.
+    #[test]
+    fn a_repeated_declaration_costs_the_fallback_poll_nothing() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("Модуль.bsl"), "Процедура П() КонецПроцедуры\n").unwrap();
+        let (hub, cursor) = polling_hub(root, VERIFY_BYTES);
+        let first = hub.drain(cursor);
+        assert!(first.rescan_required, "entering the poll is owed exactly one reconcile");
+        let targets = vec![WatchTarget::recursive(root.to_path_buf())];
+        let polls = hub.poll_count();
+
+        for _ in 0..3 {
+            assert!(!hub.ensure_roots(&targets), "a polled hub covers nothing by watching");
+            assert!(hub.poll_now(Duration::from_secs(5)));
+            let batch = hub.drain(first.cursor);
+            assert!(!batch.rescan_required, "a repeated declaration cost a reconcile");
+            assert!(batch.entries.is_empty(), "a quiet poll reported {:?}", batch.entries);
+        }
+        assert_eq!(hub.rescan_request_count(), 1, "the declaration was answered by re-mapping");
+        assert_eq!(hub.poll_count(), polls + 3, "each tick is one poll, and no re-map besides");
+        hub.shutdown();
+    }
+
+    /// The same rule with a root the backend refuses: the gap is the hub's to repair, so
+    /// re-declaring it neither re-arms nor reconciles. Without this a workspace with one
+    /// unwatchable root rebuilds its graph for ever.
+    #[cfg(unix)]
+    #[test]
+    fn a_repeated_declaration_costs_a_blind_root_nothing() {
+        let dir = tempdir().unwrap();
+        let watched = dir.path().join("наблюдаемый");
+        let blind = dir.path().join("слепой");
+        std::fs::create_dir_all(&watched).unwrap();
+        std::fs::create_dir_all(&blind).unwrap();
+        let refusals = RefusedWatches::refusing(vec![blind.clone()]);
+        let targets =
+            vec![WatchTarget::recursive(watched.clone()), WatchTarget::recursive(blind.clone())];
+        let hub = WorkspaceChangeHub::start_targets_refusing(
+            targets.clone(),
+            Duration::from_secs(3600),
+            &refusals,
+        );
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(eventually(Duration::from_secs(5), || hub.is_partially_blind()));
+        hub.wait_until_blindness_announced();
+        let cursor = hub.subscribe();
+        // A cursor taken while a root is blind is handed that blindness at once; the question
+        // here is what the REPEATS cost, so it is cleared first.
+        let announced = hub.drain(cursor);
+        hub.acknowledge(&announced);
+        let rescans = hub.rescan_request_count();
+        let rearms = hub.self_rearm_count();
+
+        for _ in 0..3 {
+            assert!(!hub.ensure_roots(&targets), "a blind root is not covered");
+        }
+
+        assert_eq!(hub.rescan_request_count(), rescans, "a repeat owed a consumer a reconcile");
+        assert_eq!(hub.self_rearm_count(), rearms, "a repeat re-armed the watch");
+        assert!(!hub.drain(announced.cursor).rescan_required);
+        hub.shutdown();
+    }
+
+    /// A declared root that does not exist is reported ONCE, when the declaration changes —
+    /// and never again while it stands. Reporting it per declaration is what used to turn
+    /// every rebuild into a reconcile.
+    #[test]
+    fn a_declaration_naming_a_missing_root_is_reported_once() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let elsewhere = tempdir().unwrap();
+        let missing = elsewhere.path().join("нет-такого-каталога");
+        let hub = WorkspaceChangeHub::start(vec![root.clone()]);
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        let cursor = hub.subscribe();
+        let targets =
+            vec![WatchTarget::recursive(root.clone()), WatchTarget::recursive(missing.clone())];
+
+        assert!(!hub.ensure_roots(&targets), "a root that does not exist is not covered");
+        let announced = hub.drain(cursor);
+        assert!(announced.rescan_required, "the narrowed coverage has to be announced once");
+        let rescans = hub.rescan_request_count();
+
+        for _ in 0..3 {
+            assert!(!hub.ensure_roots(&targets));
+        }
+        assert_eq!(hub.rescan_request_count(), rescans, "the repeat was announced again");
+        assert!(!hub.drain(announced.cursor).rescan_required);
+        hub.shutdown();
+    }
+
+    /// Two owners — the graph and the diagnostics resident — declare the same scan roots
+    /// after their own rebuilds. The second declaration is a repeat like any other.
+    #[test]
+    fn two_owners_declaring_one_set_declare_it_once() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let hub = WorkspaceChangeHub::start(vec![root.clone()]);
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        let cursor = hub.subscribe();
+        // Outside the first root on purpose: a directory nested under a recursive watch is
+        // already covered, and declaring it moves nothing.
+        let extension = tempdir().unwrap();
+        let extension = extension.path().to_path_buf();
+        let targets =
+            vec![WatchTarget::recursive(root.clone()), WatchTarget::recursive(extension.clone())];
+
+        assert!(hub.ensure_roots(&targets), "the first declaration arms the new root");
+        let first = hub.drain(cursor);
+        assert!(first.rescan_required, "a widened watch owes one reconcile");
+        let rescans = hub.rescan_request_count();
+        let rearms = hub.self_rearm_count();
+
+        assert!(hub.ensure_roots(&targets), "the second owner declares the same set");
+        assert_eq!(hub.rescan_request_count(), rescans, "the second owner cost a reconcile");
+        assert_eq!(hub.self_rearm_count(), rearms, "the second owner cost a re-arm");
+        assert!(!hub.drain(first.cursor).rescan_required);
+        hub.shutdown();
+    }
+
+    /// A blind root whose poll thread never started is not "fresh": the hub promised an
+    /// observation it has not made, and after two periods that promise reads as overdue.
+    #[cfg(unix)]
+    #[test]
+    fn a_blind_root_whose_poll_cannot_start_reads_overdue() {
+        let dir = tempdir().unwrap();
+        let watched = dir.path().join("наблюдаемый");
+        let blind = dir.path().join("слепой");
+        std::fs::create_dir_all(&watched).unwrap();
+        std::fs::create_dir_all(&blind).unwrap();
+        let refusals = RefusedWatches::refusing(vec![blind.clone()]);
+        let hub = WorkspaceChangeHub::start_targets_refusing_unpollable(
+            vec![WatchTarget::recursive(watched), WatchTarget::recursive(blind)],
+            Duration::from_secs(3600),
+            &refusals,
+            PollConfig { period: Duration::from_millis(20), verify_bytes: VERIFY_BYTES },
+        );
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(eventually(Duration::from_secs(5), || hub.is_partially_blind()));
+        assert!(
+            eventually(Duration::from_secs(5), || hub.poll_overdue()),
+            "a poll that never ran must not read as an up-to-date observation"
+        );
+        hub.shutdown();
+    }
+
+    /// The barrier answers about coverage, and during the hub's own arming there is nothing
+    /// to answer with yet: the accepted declaration is recorded before the thread arms a
+    /// single root. A caller asking then — the first rebuild after the boot, every time —
+    /// would be told its roots are not covered while they are being covered, and log an
+    /// alarm about a watch that works.
+    #[test]
+    fn the_first_declaration_waits_for_the_watch_it_asks_about() {
+        let dir = tempdir().unwrap();
+        let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
+
+        // Asked immediately, without waiting for the watch: the answer must still be about
+        // what the hub ends up holding.
+        assert!(
+            hub.ensure_roots(&[WatchTarget::recursive(dir.path().to_path_buf())]),
+            "the hub answered 'not covered' about roots it was arming"
+        );
+        assert!(hub.wait_until_watching(Duration::from_secs(5)), "control: it did arm them");
+        hub.shutdown();
+    }
+
+    /// A declaration is a SET. Two owners derive theirs from the same project and may list
+    /// the roots in different orders, and an order-sensitive comparison reads that as a new
+    /// declaration: a message and an acknowledgement every time either of them rebuilds. The
+    /// coverage checks behind it do hold — nothing is re-armed and nobody is asked to
+    /// reconcile, which is what this measures — so the cost is the round trip, paid for ever.
+    #[test]
+    fn a_declaration_in_another_order_is_the_same_declaration() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("первый");
+        let second = dir.path().join("второй");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let hub = WorkspaceChangeHub::start(vec![first.clone(), second.clone()]);
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        let cursor = hub.subscribe();
+        let reconciles_before = hub.rescan_request_count();
+
+        assert!(hub.ensure_roots(&[
+            WatchTarget::recursive(second.clone()),
+            WatchTarget::recursive(first.clone()),
+        ]));
+
+        assert_eq!(
+            hub.rescan_request_count(),
+            reconciles_before,
+            "the same set in another order asked every consumer to reconcile"
+        );
+        assert!(!hub.drain(cursor).rescan_required, "and told this consumer to rescan");
+        hub.shutdown();
+    }
+
+    /// The daemon's shutdown stops the fallback poll, not just the waiting on it: a hub that
+    /// kept walking the workspace after its daemon stopped would read every file in it on a
+    /// schedule nobody owns any more.
+    #[test]
+    fn shutdown_stops_the_fallback_poll() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("Модуль.bsl"), "Процедура П() КонецПроцедуры\n").unwrap();
+        let (hub, hold) = WorkspaceChangeHub::start_polling(
+            vec![WatchTarget::recursive(dir.path().to_path_buf())],
+            PollConfig { period: Duration::from_millis(20), verify_bytes: VERIFY_BYTES },
+        );
+        hold.release();
+        assert_eq!(hub.watch_readiness(Duration::from_secs(5)), WatchReadiness::Failed);
+        assert!(eventually(Duration::from_secs(5), || hub.poll_count() >= 2));
+
+        hub.shutdown();
+        let stopped = hub.poll_count();
+        std::thread::sleep(Duration::from_millis(120));
+        assert_eq!(hub.poll_count(), stopped, "the poll outlived the daemon that owned it");
+    }
+
+    /// An edit that keeps a file's size and mtime is invisible to a stat. The poll's own
+    /// content check finds it within one pass over the budget, and reports it once.
+    #[test]
+    fn a_same_stat_edit_is_found_by_the_content_check_once() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let file = root.join("Same.bsl");
+        std::fs::write(&file, "Процедура А() КонецПроцедуры\n").unwrap();
+        let meta = std::fs::metadata(&file).unwrap();
+        let mtime = meta.modified().unwrap();
+        // A budget of exactly the file: one poll reads it whole.
+        let (hub, cursor) = polling_hub(root, meta.len());
+        let cursor = hub.drain(cursor).cursor;
+
+        std::fs::write(&file, "Процедура Б() КонецПроцедуры\n").unwrap();
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(mtime).unwrap();
+        assert!(hub.poll_now(Duration::from_secs(5)));
+        let batch = hub.drain(cursor);
+        assert_eq!(batch.entries.len(), 1, "the content change went unnoticed");
+        assert_eq!(batch.entries[0].kind, ChangeKind::MaybeChanged);
+
+        assert!(hub.poll_now(Duration::from_secs(5)));
+        assert!(hub.drain(batch.cursor).entries.is_empty(), "the same change was reported again");
+        hub.shutdown();
+    }
+
+    /// The content check reads no more than its budget in a tick, a file larger than the
+    /// budget included: such a file is read across several ticks, and its change is still found.
+    #[test]
+    fn the_content_check_keeps_its_budget_for_a_large_file() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let big = root.join("Big.bsl");
+        std::fs::write(&big, vec![b'a'; 10 * 1024]).unwrap();
+        let targets = [WatchTarget::recursive(root.to_path_buf())];
+        let scope = Scope::from_targets(&ResolvedTargets::here(targets.to_vec()), &[]);
+        let budget = 1024;
+        let mut poller = Poller::default();
+        poller.poll(&targets, &scope, budget, true);
+        let mut reads = vec![poller.last_read];
+        for _ in 0..12 {
+            poller.poll(&targets, &scope, budget, false);
+            reads.push(poller.last_read);
+        }
+        assert!(reads.iter().all(|read| *read <= budget), "a tick read past its budget: {reads:?}");
+        let mtime = std::fs::metadata(&big).unwrap().modified().unwrap();
+        std::fs::write(&big, vec![b'b'; 10 * 1024]).unwrap();
+        std::fs::File::options().write(true).open(&big).unwrap().set_modified(mtime).unwrap();
+        let found = (0..24).any(|_| !poller.poll(&targets, &scope, budget, false).is_empty());
+        assert!(found, "a same-stat change of a file larger than the budget went unnoticed");
+    }
+
+    /// The same budget contract with a SECOND file beside the large one — the case a single
+    /// file cannot show. A partial read is kept across ticks only if the next tick comes back
+    /// to the same key, so this asserts the cursor does not move past the file it suspended.
+    #[test]
+    fn a_large_file_resumes_across_ticks_with_other_files_beside_it() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("A.bsl"), "Процедура А() КонецПроцедуры\n").unwrap();
+        let big = root.join("Big.bsl");
+        std::fs::write(&big, vec![b'a'; 10 * 1024]).unwrap();
+        let targets = [WatchTarget::recursive(root.to_path_buf())];
+        let scope = Scope::from_targets(&ResolvedTargets::here(targets.to_vec()), &[]);
+        let budget = 1024;
+        let mut poller = Poller::default();
+        poller.poll(&targets, &scope, budget, true);
+        for _ in 0..24 {
+            poller.poll(&targets, &scope, budget, false);
+        }
+        let mtime = std::fs::metadata(&big).unwrap().modified().unwrap();
+        std::fs::write(&big, vec![b'b'; 10 * 1024]).unwrap();
+        std::fs::File::options().write(true).open(&big).unwrap().set_modified(mtime).unwrap();
+        let found = (0..48).any(|_| {
+            poller
+                .poll(&targets, &scope, budget, false)
+                .iter()
+                .any(|(key, _, _)| key.file_name().unwrap() == "Big.bsl")
+        });
+        assert!(
+            found,
+            "a same-stat edit in the tail of a file larger than the budget was never seen, so \
+             the partial read never survived a tick",
+        );
+    }
+
+    /// A same-stat edit made before the content check first read the file is still found: a
+    /// file first read after the picture may have changed since the reconcile that picture
+    /// stood for, so its first reading is reported — once.
+    #[test]
+    fn a_same_stat_edit_before_the_first_read_is_found() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("A.bsl"), "Процедура А() КонецПроцедуры\n").unwrap();
+        let b = root.join("B.bsl");
+        std::fs::write(&b, "Процедура Б() КонецПроцедуры\n").unwrap();
+        let meta = std::fs::metadata(&b).unwrap();
+        let mtime = meta.modified().unwrap();
+        // A budget of one file (A and B are the same length): the picture reads A only.
+        let (hub, cursor) = polling_hub(root, meta.len());
+        let mut cursor = hub.drain(cursor).cursor;
+        std::fs::write(&b, "Процедура В() КонецПроцедуры\n").unwrap();
+        std::fs::File::options().write(true).open(&b).unwrap().set_modified(mtime).unwrap();
+        let mut reported = 0;
+        for _ in 0..4 {
+            assert!(hub.poll_now(Duration::from_secs(5)));
+            let batch = hub.drain(cursor);
+            reported += batch.entries.iter().filter(|e| e.raw.file_name() == b.file_name()).count();
+            cursor = batch.cursor;
+        }
+        assert_eq!(reported, 1, "the edit before B's first reading was reported {reported} times");
+        hub.shutdown();
+    }
+
+    /// A walk that cannot read a directory for the moment does not report the files it did
+    /// not see as removed: a live file tombstoned by a failed stat costs every consumer the
+    /// index state it had for it.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_directory_is_not_a_removal() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let sub = root.join("Модуль");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("Module.bsl"), "Процедура П() КонецПроцедуры\n").unwrap();
+        let (hub, cursor) = polling_hub(root, VERIFY_BYTES);
+        let cursor = hub.drain(cursor).cursor;
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let polled = hub.poll_now(Duration::from_secs(5));
+        let batch = hub.drain(cursor);
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(polled);
+        let removed: Vec<_> =
+            batch.entries.iter().filter(|e| e.kind == ChangeKind::MaybeRemoved).collect();
+        assert!(removed.is_empty(), "an unreadable directory tombstoned {removed:?}");
+        hub.shutdown();
+    }
+
+    /// A root nobody watches while the rest is watched is polled: its changes reach every
+    /// cursor as records, after the one reconcile its blindness cost, and no poll costs
+    /// another.
+    #[cfg(unix)]
+    #[test]
+    fn a_blind_root_is_polled_while_the_rest_is_watched() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (a, b) = (root.join("a"), root.join("b"));
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        std::fs::write(b.join("Old.bsl"), "Процедура С() КонецПроцедуры\n").unwrap();
+        let refusals = RefusedWatches::refusing(vec![b.clone()]);
+        let hub = WorkspaceChangeHub::start_targets_refusing_polled(
+            vec![WatchTarget::recursive(a.clone()), WatchTarget::recursive(b.clone())],
+            Duration::from_secs(3600),
+            &refusals,
+            PollConfig { period: Duration::from_millis(50), verify_bytes: VERIFY_BYTES },
+        );
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        hub.wait_until_blindness_announced();
+        let cursor = hub.subscribe();
+        let first = hub.drain(cursor);
+        assert!(first.rescan_required, "a blind root is announced by one reconcile");
+        let rescans = hub.rescan_request_count();
+
+        std::fs::write(b.join("New.bsl"), "Процедура Н() КонецПроцедуры\n").unwrap();
+        let mut cursor = first.cursor;
+        let delivered = eventually(Duration::from_secs(10), || {
+            let batch = hub.drain(cursor);
+            cursor = batch.cursor;
+            assert!(!batch.rescan_required, "a poll cost another reconcile");
+            batch.entries.iter().any(|entry| entry.raw.ends_with("New.bsl"))
+        });
+        assert!(delivered, "a change under the blind root never reached the cursor");
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(hub.rescan_request_count(), rescans, "polls raised reconciles of their own");
+        hub.shutdown();
+    }
+
+    /// The content check reads whole files, and the poller it reads them into is what the hub
+    /// thread needs to declare a root blind. Enforced structurally because the failure is a
+    /// wait, not a wrong answer: one hold of the poller may cover a slice of the budget, never
+    /// the budget itself.
+    #[test]
+    fn the_blind_poll_never_reads_a_whole_budget_under_the_poller_lock() {
+        let source = include_str!("change_hub.rs");
+        let production = crate::inventory::production_source(source);
+        let at = production.find("fn poll_until_stopped(").expect("the blind poll loop");
+        let body = &production[at..];
+        let end = body.find("\n    }\n").map_or(body.len(), |stop| stop + 6);
+        let body = &body[..end];
+        assert!(
+            body.contains("VERIFY_SLICE"),
+            "the blind poll spends its budget in slices, and this one does not",
+        );
+        for line in body.lines() {
+            let line = line.trim();
+            if line.starts_with("//") {
+                continue;
+            }
+            assert!(
+                !(line.contains("poll.verify_bytes")
+                    && !line.contains("VERIFY_SLICE")
+                    && !line.contains("spent <")
+                    && !line.contains("- spent")),
+                "a whole verify budget is handed to one hold of the poller: {line}",
+            );
+        }
+    }
+
+    /// The owner accepted a bounded, ONE-TIME cost at the start of a fallback poll: a file
+    /// whose tail the first picture had no budget to hash may be reported once when it is
+    /// finally read. What was not accepted is repetition — an untouched file reported again
+    /// and again would be an endless reindex — and what must not be weakened to buy that
+    /// bound is detection: a same-stat edit before the first hash is still found.
+    #[test]
+    fn an_untouched_file_is_reported_at_most_once_and_a_same_stat_edit_is_still_found() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("A.bsl"), "Процедура А() КонецПроцедуры\n").unwrap();
+        let quiet = root.join("Quiet.bsl");
+        std::fs::write(&quiet, vec![b'q'; 4 * 1024]).unwrap();
+        let targets = [WatchTarget::recursive(root.to_path_buf())];
+        let scope = Scope::from_targets(&ResolvedTargets::here(targets.to_vec()), &[]);
+        let budget = 512;
+        let mut poller = Poller::default();
+        poller.poll(&targets, &scope, budget, true);
+
+        // Nothing is touched. The tail may cost ONE report as it is first read; after that the
+        // file is known, and a quiet file must go quiet.
+        let mut reports = 0;
+        for _ in 0..40 {
+            reports += poller
+                .poll(&targets, &scope, budget, false)
+                .iter()
+                .filter(|(key, _, _)| key.file_name().unwrap() == "Quiet.bsl")
+                .count();
+        }
+        assert!(
+            reports <= 1,
+            "an untouched file was reported {reports} times: the accepted cost is one-time, \
+             not a loop",
+        );
+
+        // And detection is not what paid for that bound: a same-stat edit is still found.
+        let mtime = std::fs::metadata(&quiet).unwrap().modified().unwrap();
+        std::fs::write(&quiet, vec![b'z'; 4 * 1024]).unwrap();
+        std::fs::File::options().write(true).open(&quiet).unwrap().set_modified(mtime).unwrap();
+        let found = (0..40).any(|_| {
+            poller
+                .poll(&targets, &scope, budget, false)
+                .iter()
+                .any(|(key, _, _)| key.file_name().unwrap() == "Quiet.bsl")
+        });
+        assert!(found, "a same-stat edit went unnoticed — detection must not pay for the bound");
+    }
+
+    /// A hub whose root `b` (and any other refused root) is blind, and whose blind polls each
+    /// wait for a permit. One file of `verify_bytes` is read per poll.
+    #[cfg(unix)]
+    fn gated_blind_hub(
+        declared: Vec<WatchTarget>,
+        refused: Vec<PathBuf>,
+        verify_bytes: u64,
+    ) -> (WorkspaceChangeHub, Arc<PollGate>, Arc<RefusedWatches>) {
+        barred_blind_hub(declared, refused, verify_bytes, None)
+    }
+
+    /// [`gated_blind_hub`] whose announcement also waits at `announce`, when given.
+    #[cfg(unix)]
+    fn barred_blind_hub(
+        declared: Vec<WatchTarget>,
+        refused: Vec<PathBuf>,
+        verify_bytes: u64,
+        announce: Option<Arc<AnnounceBarrier>>,
+    ) -> (WorkspaceChangeHub, Arc<PollGate>, Arc<RefusedWatches>) {
+        let gate = Arc::new(PollGate::default());
+        let refusals = RefusedWatches::refusing(refused);
+        let hub = WorkspaceChangeHub::start_targets_refusing_polled_gated(
+            declared,
+            Duration::from_secs(3600),
+            &refusals,
+            PollConfig { period: Duration::from_millis(5), verify_bytes },
+            Arc::clone(&gate),
+            announce,
+        );
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        gate.wait_arrivals(1);
+        (hub, gate, refusals)
+    }
+
+    /// Files of the blind roots the poll has not read once yet.
+    #[cfg(unix)]
+    fn unread_blind_files(hub: &WorkspaceChangeHub) -> usize {
+        let state = hub.inner.blind_poll.state.lock().unwrap();
+        state.poller.files.keys().filter(|key| state.poller.unpictured.contains(*key)).count()
+    }
+
+    /// Let polls run one at a time until `cursor` sees its reconcile, and say how many ran and
+    /// how many blind files were still unread at that moment — read while the poll is parked.
+    #[cfg(unix)]
+    fn polls_until_reconcile(
+        hub: &WorkspaceChangeHub,
+        gate: &PollGate,
+        cursor: SinkCursor,
+        bound: usize,
+    ) -> (usize, DrainBatch, usize) {
+        for polls in 0..=bound {
+            let unread = unread_blind_files(hub);
+            let batch = hub.materialize(cursor);
+            if batch.rescan_required {
+                return (polls, batch, unread);
+            }
+            gate.run_polls(1);
+        }
+        panic!("the reconcile announcing the blind root never came within {bound} polls");
+    }
+
+    #[cfg(unix)]
+    fn same_stat_edit(path: &Path, byte: u8) {
+        let before = std::fs::metadata(path).unwrap();
+        std::fs::write(path, vec![byte; before.len() as usize]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(before.modified().unwrap())
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn reported_names(batch: &DrainBatch) -> Vec<String> {
+        batch
+            .entries
+            .iter()
+            .map(|entry| entry.canonical.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn blind_fixture(files: &[(&str, usize)]) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (a, b) = (root.join("a"), root.join("b"));
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        for (name, len) in files {
+            std::fs::write(b.join(name), vec![b'o'; *len]).unwrap();
+        }
+        (dir, a, b)
+    }
+
+    /// The reconcile that announces a blind root is issued only once every file of that root
+    /// has been read once: those readings are the baseline its later readings compare with,
+    /// and a consumer re-reading the root before the baseline exists could re-read contents the
+    /// baseline then silently absorbs.
+    #[cfg(unix)]
+    #[test]
+    fn a_blind_root_is_read_once_before_its_reconcile_is_announced() {
+        let (_dir, a, b) = blind_fixture(&[("One.bsl", 64), ("Two.bsl", 64), ("Three.bsl", 64)]);
+        let (hub, gate, _refusals) = gated_blind_hub(
+            vec![WatchTarget::recursive(a), WatchTarget::recursive(b.clone())],
+            vec![b],
+            64,
+        );
+        let cursor = hub.subscribe();
+        let (polls, _batch, unread) = polls_until_reconcile(&hub, &gate, cursor, 30);
+        hub.shutdown();
+        assert_eq!(
+            unread, 0,
+            "the blind reconcile was visible after {polls} polls with {unread} files never read",
+        );
+    }
+
+    /// A same-stat edit made AFTER a consumer has finished the blind reconcile is reported, and
+    /// a file nobody touched is not.
+    #[cfg(unix)]
+    #[test]
+    fn a_same_stat_edit_after_the_blind_reconcile_is_reported_and_untouched_files_are_not() {
+        let (_dir, a, b) = blind_fixture(&[("Edited.bsl", 64), ("Untouched.bsl", 64)]);
+        let (hub, gate, _refusals) = gated_blind_hub(
+            vec![WatchTarget::recursive(a), WatchTarget::recursive(b.clone())],
+            vec![b.clone()],
+            64,
+        );
+        let cursor = hub.subscribe();
+        let (_, batch, _) = polls_until_reconcile(&hub, &gate, cursor, 30);
+        // The consumer's reconcile, completed: a full re-read and the acknowledgement.
+        for name in ["Edited.bsl", "Untouched.bsl"] {
+            assert_eq!(std::fs::read(b.join(name)).unwrap().len(), 64);
+        }
+        hub.acknowledge(&batch);
+
+        same_stat_edit(&b.join("Edited.bsl"), b'e');
+        gate.run_polls(4);
+        let reported = reported_names(&hub.drain(batch.cursor));
+        hub.shutdown();
+        assert!(
+            !reported.iter().any(|name| name == "Untouched.bsl"),
+            "an untouched file was reported after the blind reconcile: {reported:?}",
+        );
+        assert!(
+            reported.iter().any(|name| name == "Edited.bsl"),
+            "a same-stat edit made after the blind reconcile was never reported: {reported:?}",
+        );
+    }
+
+    /// The window between the baseline being ready and the consumer taking the reconcile: an
+    /// edit there is reported by the poll's own comparison, whenever the consumer reads.
+    #[cfg(unix)]
+    #[test]
+    fn a_same_stat_edit_before_the_blind_reconcile_is_taken_is_reported() {
+        let (_dir, a, b) = blind_fixture(&[("Edited.bsl", 64), ("Untouched.bsl", 64)]);
+        let (hub, gate, _refusals) = gated_blind_hub(
+            vec![WatchTarget::recursive(a), WatchTarget::recursive(b.clone())],
+            vec![b.clone()],
+            64,
+        );
+        let cursor = hub.subscribe();
+        let (_, _visible, _) = polls_until_reconcile(&hub, &gate, cursor, 30);
+        same_stat_edit(&b.join("Edited.bsl"), b'e');
+        let batch = hub.materialize(cursor);
+        hub.acknowledge(&batch);
+        gate.run_polls(4);
+        let reported = reported_names(&hub.drain(batch.cursor));
+        hub.shutdown();
+        assert!(
+            reported.iter().any(|name| name == "Edited.bsl"),
+            "an edit between the baseline and the consumer's reconcile was never reported: {reported:?}",
+        );
+    }
+
+    /// A root that turns blind while another is still being read once: the reconcile waits for
+    /// both, and nothing announces the first one's readiness over the second one's files.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_turning_blind_during_the_first_reading_waits_for_it_too() {
+        let (_dir, a, b) = blind_fixture(&[("B1.bsl", 64), ("B2.bsl", 64), ("B3.bsl", 64)]);
+        let c = a.parent().unwrap().join("c");
+        std::fs::create_dir(&c).unwrap();
+        for name in ["C1.bsl", "C2.bsl"] {
+            std::fs::write(c.join(name), vec![b'c'; 64]).unwrap();
+        }
+        let (hub, gate, _refusals) = gated_blind_hub(
+            vec![WatchTarget::recursive(a.clone()), WatchTarget::recursive(b.clone())],
+            vec![b.clone(), c.clone()],
+            64,
+        );
+        let cursor = hub.subscribe();
+        if !hub.materialize(cursor).rescan_required {
+            gate.run_polls(1);
+        }
+        // Acknowledged as not wholly armed — `c` is refused on purpose — so the answer is not
+        // the premise; the premise is `c` in the blind poll's set.
+        let _ = hub.rearm(
+            vec![
+                WatchTarget::recursive(a),
+                WatchTarget::recursive(b),
+                WatchTarget::recursive(c.clone()),
+            ],
+            Duration::from_secs(10),
+        );
+        let joined = || {
+            let state = hub.inner.blind_poll.state.lock().unwrap();
+            state.poller.files.keys().filter(|key| key.starts_with(&c)).count()
+        };
+        assert!(
+            eventually(Duration::from_secs(5), || joined() == 2),
+            "the stand needs the second root in the blind set"
+        );
+        // The declaration move has a reconcile of its own, and a consumer may take it at once.
+        // What must follow the first reading of every blind file is a reconcile issued after it.
+        let mut cursor = cursor;
+        let mut polls = 0;
+        while unread_blind_files(&hub) > 0 && polls < 40 {
+            let batch = hub.materialize(cursor);
+            hub.acknowledge(&batch);
+            cursor = batch.cursor;
+            gate.run_polls(1);
+            polls += 1;
+        }
+        assert_eq!(
+            unread_blind_files(&hub),
+            0,
+            "the first reading did not finish within {polls} polls"
+        );
+        let after = hub.materialize(cursor);
+        hub.shutdown();
+        assert!(
+            after.rescan_required,
+            "no reconcile was issued after the last blind file was read once ({polls} polls)",
+        );
+    }
+
+    /// A root larger than one poll's budget does not hold every other blind root's content
+    /// check until it has been read through: an edit in a root read long ago is found while
+    /// the large one is still being read once, and the large one's reconcile still comes.
+    #[cfg(unix)]
+    #[test]
+    fn a_large_joining_root_neither_starves_the_others_nor_stalls() {
+        let (_dir, a, b) = blind_fixture(&[("Settled.bsl", 64)]);
+        let c = a.parent().unwrap().join("c");
+        std::fs::create_dir(&c).unwrap();
+        std::fs::write(c.join("Large.bsl"), vec![b'l'; 64 * 12]).unwrap();
+        let (hub, gate, _refusals) = gated_blind_hub(
+            vec![WatchTarget::recursive(a.clone()), WatchTarget::recursive(b.clone())],
+            vec![b.clone(), c.clone()],
+            64,
+        );
+        let cursor = hub.subscribe();
+        let (_, batch, _) = polls_until_reconcile(&hub, &gate, cursor, 30);
+        hub.acknowledge(&batch);
+        let mut cursor = batch.cursor;
+        while unread_blind_files(&hub) > 0 {
+            gate.run_polls(1);
+        }
+
+        let _ = hub.rearm(
+            vec![
+                WatchTarget::recursive(a),
+                WatchTarget::recursive(b.clone()),
+                WatchTarget::recursive(c.clone()),
+            ],
+            Duration::from_secs(10),
+        );
+        assert!(
+            eventually(Duration::from_secs(5), || unread_blind_files(&hub) > 0),
+            "the stand needs the large root in the blind set",
+        );
+        same_stat_edit(&b.join("Settled.bsl"), b's');
+        let mut found_while_large_unread = false;
+        let mut large_announced = false;
+        for _ in 0..80 {
+            gate.run_polls(1);
+            let batch = hub.materialize(cursor);
+            let large_unread = unread_blind_files(&hub) > 0;
+            if reported_names(&batch).iter().any(|name| name == "Settled.bsl") && large_unread {
+                found_while_large_unread = true;
+            }
+            hub.acknowledge(&batch);
+            cursor = batch.cursor;
+            if batch.rescan_required && !large_unread {
+                large_announced = true;
+                break;
+            }
+        }
+        hub.shutdown();
+        assert!(
+            found_while_large_unread,
+            "an edit in a settled blind root waited for a joining root to be read through",
+        );
+        assert!(large_announced, "the large root's reconcile never came within the bound");
+    }
+
+    /// A file that cannot be read during the first reading does not hold the reconcile for
+    /// ever, and has no baseline: once it can be read, it is reported.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_file_neither_holds_the_blind_reconcile_nor_gets_a_silent_baseline() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, a, b) = blind_fixture(&[("Readable.bsl", 64), ("Closed.bsl", 64)]);
+        let closed = b.join("Closed.bsl");
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&closed).is_ok() {
+            eprintln!("skipping: mode 0o000 is not an obstacle for this user");
+            return;
+        }
+        let (hub, gate, _refusals) = gated_blind_hub(
+            vec![WatchTarget::recursive(a), WatchTarget::recursive(b.clone())],
+            vec![b.clone()],
+            64,
+        );
+        let cursor = hub.subscribe();
+        let (_, batch, unread) = polls_until_reconcile(&hub, &gate, cursor, 30);
+        hub.acknowledge(&batch);
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o644)).unwrap();
+        gate.run_polls(4);
+        let reported = reported_names(&hub.drain(batch.cursor));
+        hub.shutdown();
+        assert_eq!(unread, 0, "the reconcile came with readable files never read");
+        assert!(
+            reported.iter().any(|name| name == "Closed.bsl"),
+            "a file first read after the reconcile got a silent baseline: {reported:?}",
+        );
+    }
+
+    /// A blind root that vanishes before its first reading is done does not take the reconcile
+    /// it owed with it: its files were under a subtree nobody watched, the poll forgets them
+    /// without a record, and a consumer still holding them learns of it only by reconciling.
+    #[cfg(unix)]
+    #[test]
+    fn a_blind_root_gone_before_its_first_reading_still_gets_its_reconcile() {
+        let (_dir, a, b) = blind_fixture(&[("One.bsl", 64), ("Two.bsl", 64), ("Three.bsl", 64)]);
+        let (hub, gate, _refusals) = gated_blind_hub(
+            vec![WatchTarget::recursive(a), WatchTarget::recursive(b.clone())],
+            vec![b.clone()],
+            64,
+        );
+        let cursor = hub.subscribe();
+        gate.run_polls(1);
+        let before = hub.materialize(cursor);
+        assert!(
+            !before.rescan_required,
+            "the stand needs the first reading still under way when the root goes",
+        );
+        std::fs::remove_dir_all(&b).unwrap();
+        assert!(hub.tick_now(Duration::from_secs(5)));
+        assert!(
+            eventually(Duration::from_secs(5), || !hub.is_partially_blind()),
+            "the stand needs the gone root out of the blind set",
+        );
+        let owed = hub.materialize(cursor).rescan_required;
+        // The hub's own record of an announcement still to come is settled too: left standing,
+        // it would hold back the reconcile a newcomer is handed the next time a root goes blind.
+        let settled = eventually(Duration::from_secs(2), || {
+            !hub.inner.blind_poll.reconcile_pending.load(Ordering::SeqCst)
+        });
+        hub.shutdown();
+        assert!(owed, "the reconcile a blind root owed was forgotten when the root went away");
+        assert!(settled, "an announcement nobody will make was left pending");
+    }
+
+    /// A hub shut down while its blind poll waits returns promptly and leaves no poll behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_blind_poll_parked_before_its_first_reading_stops_with_the_hub() {
+        let (_dir, a, b) = blind_fixture(&[("One.bsl", 64)]);
+        let (hub, _gate, _refusals) = gated_blind_hub(
+            vec![WatchTarget::recursive(a), WatchTarget::recursive(b.clone())],
+            vec![b],
+            64,
+        );
+        let started = Instant::now();
+        hub.shutdown();
+        assert!(
+            eventually(Duration::from_secs(5), || !hub.blind_poll_running()),
+            "the blind poll outlived the hub",
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A hub whose blind root `b` holds two files, with `subscribers` cursors taken before its
+    /// first reading, and the announcement that follows that reading parked at `point`.
+    #[cfg(unix)]
+    #[allow(clippy::type_complexity)] // rationale: a stand's parts, destructured at every call.
+    fn parked_announcement(
+        point: AnnouncePoint,
+        subscribers: usize,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        WorkspaceChangeHub,
+        Arc<PollGate>,
+        Arc<AnnounceBarrier>,
+        Arc<RefusedWatches>,
+        Vec<SinkCursor>,
+    ) {
+        let (dir, a, b) = blind_fixture(&[("Edited.bsl", 64), ("Untouched.bsl", 64)]);
+        let barrier = Arc::new(AnnounceBarrier::default());
+        barrier.arm(point);
+        let (hub, gate, refusals) = barred_blind_hub(
+            vec![WatchTarget::recursive(a), WatchTarget::recursive(b.clone())],
+            vec![b.clone()],
+            64,
+            Some(Arc::clone(&barrier)),
+        );
+        let cursors = (0..subscribers).map(|_| hub.subscribe()).collect();
+        gate.allow(8);
+        barrier.wait_parked();
+        (dir, b, hub, gate, barrier, refusals, cursors)
+    }
+
+    #[cfg(unix)]
+    fn finish_announcement(hub: &WorkspaceChangeHub, barrier: &AnnounceBarrier) {
+        barrier.release();
+        hub.wait_until_blindness_announced();
+    }
+
+    /// A consumer that subscribes while the blind reconcile is being issued, with nobody else
+    /// listening, is owed that reconcile: it arrived after the reconcile flagged every cursor
+    /// there was, and it has not been told the root is blind any other way. Its reconcile done,
+    /// a same-stat edit is reported and an untouched file is not.
+    #[cfg(unix)]
+    #[test]
+    fn a_newcomer_arriving_while_the_blind_reconcile_is_issued_is_owed_it() {
+        let (_dir, b, hub, gate, barrier, _refusals, _) =
+            parked_announcement(AnnouncePoint::AfterIssue, 0);
+        let newcomer = hub.subscribe();
+        finish_announcement(&hub, &barrier);
+        let owed = hub.materialize(newcomer);
+        let mut reported = Vec::new();
+        if owed.rescan_required {
+            hub.acknowledge(&owed);
+            same_stat_edit(&b.join("Edited.bsl"), b'e');
+            gate.run_polls(4);
+            reported = reported_names(&hub.drain(owed.cursor));
+        }
+        hub.shutdown();
+        assert!(
+            owed.rescan_required,
+            "a consumer subscribed during the announcement was never told"
+        );
+        assert!(
+            reported.iter().any(|name| name == "Edited.bsl"),
+            "a same-stat edit after the newcomer's reconcile was not reported: {reported:?}",
+        );
+        assert!(
+            !reported.iter().any(|name| name == "Untouched.bsl"),
+            "an untouched file was reported: {reported:?}",
+        );
+    }
+
+    /// The same newcomer when the only other consumer has already settled its reconcile: there
+    /// is no open window left to inherit, so the announcement itself has to reach it.
+    #[cfg(unix)]
+    #[test]
+    fn a_newcomer_arriving_after_everyone_settled_the_issued_blind_reconcile_is_owed_it() {
+        let (_dir, _b, hub, _gate, barrier, _refusals, cursors) =
+            parked_announcement(AnnouncePoint::AfterIssue, 1);
+        let taken = hub.materialize(cursors[0]);
+        hub.acknowledge(&taken);
+        let settled = !hub.materialize(taken.cursor).rescan_required;
+        let newcomer = hub.subscribe();
+        finish_announcement(&hub, &barrier);
+        let owed = hub.materialize(newcomer).rescan_required;
+        hub.shutdown();
+        assert!(
+            taken.rescan_required && settled,
+            "the stand needs the reconcile issued and settled"
+        );
+        assert!(owed, "a consumer subscribed after the others settled was never told");
+    }
+
+    /// Let the gated poll run until the blind reconcile is announced.
+    #[cfg(unix)]
+    fn polls_until_announced(hub: &WorkspaceChangeHub, gate: &PollGate) {
+        for _ in 0..30 {
+            if !hub.inner.blind_poll.reconcile_pending.load(Ordering::SeqCst) {
+                return;
+            }
+            gate.run_polls(1);
+        }
+        panic!("the reconcile announcing the blind root never came within 30 polls");
+    }
+
+    /// Countercontrol: while the blind reconcile is still to come, a newcomer inherits a window
+    /// another consumer still owes, under that window's identity — and the announcement then
+    /// reaches both as one loss.
+    #[cfg(unix)]
+    #[test]
+    fn a_newcomer_before_the_blind_reconcile_inherits_a_window_still_owed() {
+        let (_dir, a, b) = blind_fixture(&[("Edited.bsl", 64), ("Untouched.bsl", 64)]);
+        let (hub, gate, _refusals) = gated_blind_hub(
+            vec![WatchTarget::recursive(a), WatchTarget::recursive(b.clone())],
+            vec![b],
+            64,
+        );
+        let owing = hub.subscribe();
+        hub.deliver_backend_error_for_test();
+        let newcomer = hub.subscribe();
+        let (window, inherited) = (hub.materialize(owing), hub.materialize(newcomer));
+        polls_until_announced(&hub, &gate);
+        let (owing, newcomer) = (hub.materialize(owing), hub.materialize(newcomer));
+        hub.shutdown();
+        assert!(window.rescan_required && inherited.rescan_required);
+        assert_eq!(inherited.loss_token(), window.loss_token(), "one window is one loss");
+        assert!(owing.rescan_required && newcomer.rescan_required);
+        assert_eq!(newcomer.loss_token(), owing.loss_token(), "one announcement is one loss");
+        assert_ne!(
+            owing.loss_token(),
+            window.loss_token(),
+            "the announcement is a loss of its own"
+        );
+    }
+
+    /// What the accumulator says about the blind reconcile right now: the window's reason, and
+    /// the announcement the hub still owes.
+    #[cfg(unix)]
+    fn announcement_state(hub: &WorkspaceChangeHub) -> (Option<DegradeReason>, bool) {
+        let reason = hub.inner.lock_acc().degrade_reason.clone();
+        (reason, hub.inner.blind_poll.reconcile_pending.load(Ordering::SeqCst))
+    }
+
+    /// A consumer that subscribes BEFORE the reconcile is issued is flagged by the reconcile
+    /// itself, under the window's identity — the same loss the consumer that was there all
+    /// along is told about.
+    ///
+    /// The boundary is asserted, not assumed: at the barrier no window has been entered and the
+    /// announcement is still owed, so a newcomer here cannot be answered by the published-
+    /// blindness path in `subscribe` and its debt can only come from the reconcile.
+    #[cfg(unix)]
+    #[test]
+    fn a_newcomer_before_the_blind_reconcile_is_issued_is_flagged_by_it() {
+        let (_dir, _b, hub, _gate, barrier, _refusals, cursors) =
+            parked_announcement(AnnouncePoint::BeforeIssue, 1);
+        let (reason, pending) = announcement_state(&hub);
+        let newcomer = hub.subscribe();
+        let at_barrier = hub.materialize(newcomer);
+        finish_announcement(&hub, &barrier);
+        let (resident, flagged) = (hub.materialize(cursors[0]), hub.materialize(newcomer));
+        hub.shutdown();
+        assert_eq!(reason, None, "the stand needs a barrier before the reconcile is issued");
+        assert!(pending, "the stand needs the announcement still owed at the barrier");
+        assert!(!at_barrier.rescan_required, "a newcomer was answered before the reconcile");
+        assert!(flagged.rescan_required, "the reconcile did not flag a consumer that was there");
+        assert!(resident.rescan_required);
+        assert_eq!(
+            flagged.loss_token(),
+            resident.loss_token(),
+            "one reconcile reaching two cursors is one loss",
+        );
+    }
+
+    /// A consumer that subscribes AFTER the reconcile is issued cannot be flagged by it, and is
+    /// owed one of its own — a different loss, because it is a different event for this cursor.
+    #[cfg(unix)]
+    #[test]
+    fn a_newcomer_after_the_blind_reconcile_is_issued_is_owed_one_of_its_own() {
+        let (_dir, _b, hub, _gate, barrier, _refusals, cursors) =
+            parked_announcement(AnnouncePoint::AfterIssue, 1);
+        let (reason, pending) = announcement_state(&hub);
+        let newcomer = hub.subscribe();
+        let at_barrier = hub.materialize(newcomer);
+        finish_announcement(&hub, &barrier);
+        let (resident, owed) = (hub.materialize(cursors[0]), hub.materialize(newcomer));
+        hub.shutdown();
+        assert_eq!(
+            reason,
+            Some(DegradeReason::RewatchFailed),
+            "the stand needs a barrier after the reconcile is issued",
+        );
+        assert!(!pending, "the announcement is published with the reconcile, under one hold");
+        assert!(
+            at_barrier.rescan_required,
+            "a newcomer after the reconcile was left owing nothing"
+        );
+        assert!(owed.rescan_required && resident.rescan_required);
+        assert_ne!(
+            owed.loss_token(),
+            resident.loss_token(),
+            "a reconcile the newcomer was never inside was given its identity",
+        );
+    }
+
+    /// Countercontrol: a consumer re-subscribing while the reconcile is being issued carries the
+    /// debt it holds, under its identity.
+    #[cfg(unix)]
+    #[test]
+    fn a_resubscription_while_the_blind_reconcile_is_issued_carries_its_debt() {
+        let (_dir, _b, hub, _gate, barrier, _refusals, cursors) =
+            parked_announcement(AnnouncePoint::AfterIssue, 1);
+        let held = hub.materialize(cursors[0]);
+        let replaced = hub.resubscribe(cursors[0]);
+        finish_announcement(&hub, &barrier);
+        let carried = hub.materialize(replaced);
+        hub.shutdown();
+        assert!(held.rescan_required, "the stand needs a debt to carry");
+        assert!(carried.rescan_required, "the debt did not survive re-subscribing");
+        assert_eq!(carried.loss_token(), held.loss_token());
+    }
+
+    /// Countercontrol: a batch taken before the blind reconcile was issued, acknowledged after,
+    /// does not settle it.
+    #[cfg(unix)]
+    #[test]
+    fn a_batch_taken_before_the_blind_reconcile_does_not_settle_it() {
+        let (_dir, a, b) = blind_fixture(&[("Edited.bsl", 64), ("Untouched.bsl", 64)]);
+        let (hub, gate, _refusals) = gated_blind_hub(
+            vec![WatchTarget::recursive(a), WatchTarget::recursive(b.clone())],
+            vec![b],
+            64,
+        );
+        let cursor = hub.subscribe();
+        let old = hub.materialize(cursor);
+        polls_until_announced(&hub, &gate);
+        hub.acknowledge(&old);
+        let owed = hub.materialize(old.cursor).rescan_required;
+        hub.shutdown();
+        assert!(!old.rescan_required, "the stand needs a batch taken before the announcement");
+        assert!(owed, "an acknowledgement of an older batch settled the blind reconcile");
+    }
+
+    /// The blind roots the hub has published, as the subscription path reads them.
+    #[cfg(unix)]
+    fn published_blind(hub: &WorkspaceChangeHub) -> Vec<PathBuf> {
+        hub.inner.blind_targets.lock().unwrap().clone()
+    }
+
+    /// A root that joins the blind set while the poll is issuing the reconcile of the others:
+    /// the declaration waits, so no reconcile is issued over files nobody has read — and the
+    /// joining root's own reconcile follows its first reading.
+    ///
+    /// The declaration goes through the real path (`rearm`), on its own thread, because the
+    /// hub thread is what the reconcile's hold of the poll state blocks. Its own reconcile —
+    /// the one a declaration move owes — is counted before the barrier is released, so the
+    /// blind announcement is never confused with it.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_joining_while_an_announcement_is_issued_waits_for_it() {
+        let (_dir, a, b) = blind_fixture(&[("B1.bsl", 64)]);
+        let c = a.parent().unwrap().join("c");
+        std::fs::create_dir(&c).unwrap();
+        for name in ["C1.bsl", "C2.bsl"] {
+            std::fs::write(c.join(name), vec![b'c'; 64]).unwrap();
+        }
+        let barrier = Arc::new(AnnounceBarrier::default());
+        barrier.arm(AnnouncePoint::BeforeIssue);
+        let (hub, gate, _refusals) = barred_blind_hub(
+            vec![WatchTarget::recursive(a.clone()), WatchTarget::recursive(b.clone())],
+            vec![b.clone(), c.clone()],
+            64,
+            Some(Arc::clone(&barrier)),
+        );
+        let cursor = hub.subscribe();
+        gate.allow(1);
+        barrier.wait_parked();
+        let issued = || hub.inner.lock_acc().losses_issued;
+        let at_park = issued();
+
+        let (asking, asked) = std::sync::mpsc::channel();
+        let declaring = {
+            let (hub, a, b, c) = (hub.clone(), a.clone(), b.clone(), c.clone());
+            std::thread::spawn(move || {
+                asking.send(()).unwrap();
+                hub.rearm(
+                    vec![
+                        WatchTarget::recursive(a),
+                        WatchTarget::recursive(b),
+                        WatchTarget::recursive(c),
+                    ],
+                    Duration::from_secs(10),
+                )
+            })
+        };
+        asked.recv_timeout(Duration::from_secs(5)).expect("the declaration was never asked for");
+        let joined_at_the_barrier =
+            eventually(Duration::from_secs(2), || published_blind(&hub).contains(&c));
+
+        barrier.release();
+        // The declaration is acknowledged as NOT wholly armed: `c` is refused on purpose, which
+        // is what puts it in the blind set at all.
+        let wholly_armed = declaring.join().expect("the declaring thread");
+        let joined = eventually(Duration::from_secs(5), || unread_blind_files(&hub) == 2);
+        let after_join = issued();
+
+        let mut cursor = cursor;
+        let mut announced_while_unread = Vec::new();
+        let mut polls = 0;
+        while unread_blind_files(&hub) > 0 && polls < 20 {
+            let batch = hub.materialize(cursor);
+            hub.acknowledge(&batch);
+            cursor = batch.cursor;
+            let before = issued();
+            gate.run_polls(1);
+            polls += 1;
+            if issued() > before && unread_blind_files(&hub) > 0 {
+                announced_while_unread.push(polls);
+            }
+        }
+        let owed_after_reading = issued() > after_join && hub.materialize(cursor).rescan_required;
+        hub.shutdown();
+        assert!(
+            !joined_at_the_barrier,
+            "a root joined the blind set while the reconcile of the others was being issued",
+        );
+        assert!(!wholly_armed, "the stand needs the joining root refused, not watched");
+        assert!(joined, "the stand needs the joining root in the blind set");
+        assert!(after_join > at_park, "the stand needs the reconcile and the declaration's own");
+        assert!(
+            announced_while_unread.is_empty(),
+            "announced over unread files at polls {announced_while_unread:?}",
+        );
+        assert!(owed_after_reading, "the joining root's reconcile never followed its reading");
+    }
+
+    /// The reconcile announcing a blind root already tells every consumer to re-read that root
+    /// whole. Reporting each of its files as changed on top of that is a second full re-index
+    /// of work just done — and it is every file, not a file that changed.
+    #[test]
+    fn a_root_turning_blind_does_not_report_its_untouched_files() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (a, b) = (root.join("a"), root.join("b"));
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        std::fs::write(b.join("Old.bsl"), "Процедура С() КонецПроцедуры\n").unwrap();
+        std::fs::write(b.join("Older.bsl"), "Процедура Д() КонецПроцедуры\n").unwrap();
+        let refusals = RefusedWatches::refusing(vec![b.clone()]);
+        let hub = WorkspaceChangeHub::start_targets_refusing_polled(
+            vec![WatchTarget::recursive(a.clone()), WatchTarget::recursive(b.clone())],
+            Duration::from_secs(3600),
+            &refusals,
+            PollConfig { period: Duration::from_millis(50), verify_bytes: VERIFY_BYTES },
+        );
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        hub.wait_until_blindness_announced();
+        let cursor = hub.subscribe();
+        let first = hub.drain(cursor);
+        assert!(first.rescan_required, "the stand needs the reconcile that announces blindness");
+
+        // Nothing is touched from here on. Several polls, so the first reading of every file
+        // has certainly happened.
+        let mut cursor = first.cursor;
+        let mut reported: Vec<String> = Vec::new();
+        for _ in 0..8 {
+            std::thread::sleep(Duration::from_millis(60));
+            let batch = hub.drain(cursor);
+            cursor = batch.cursor;
+            reported.extend(batch.entries.iter().map(|entry| entry.raw.display().to_string()));
+        }
+        hub.shutdown();
+        assert!(
+            reported.is_empty(),
+            "the reconcile already covered these files and they never changed: {reported:#?}",
+        );
+    }
+
+    /// An interrupted hub answers every waiter at once, however long it asked to wait, and
+    /// keeps answering: a stop that woke one wait and let the next one sleep would park the
+    /// owner right back.
+    #[test]
+    fn interrupted_waiters_return_at_once_and_stay_released() {
+        let dir = tempdir().unwrap();
+        let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
+        let since = hub.generation();
+        let waiter = {
+            let hub = hub.clone();
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                hub.wait_for_change(since, Duration::from_secs(60));
+                started.elapsed()
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        hub.interrupt_waiters();
+        assert!(waiter.join().unwrap() < Duration::from_secs(5), "the parked wait slept on");
+
+        let started = Instant::now();
+        hub.wait_for_change(hub.generation(), Duration::from_secs(60));
+        assert!(started.elapsed() < Duration::from_secs(1), "a later wait slept on");
+        let started = Instant::now();
+        hub.watch_readiness(Duration::from_secs(60));
+        assert!(started.elapsed() < Duration::from_secs(1), "a readiness wait slept on");
+        hub.shutdown();
     }
 
     #[test]
@@ -6557,6 +9484,8 @@ mod tests {
             None,
             Some(refusals.as_refusal()),
             vec![cache.clone()],
+            PollConfig::PRODUCTION,
+            BlindPollSeam::default(),
         );
         assert!(hub.wait_until_watching(Duration::from_secs(5)));
 
@@ -7312,6 +10241,8 @@ mod tests {
             None,
             Some(refusals.as_refusal()),
             vec![cache.clone()],
+            PollConfig::PRODUCTION,
+            BlindPollSeam::default(),
         );
         assert!(hub.wait_until_watching(Duration::from_secs(5)));
 
@@ -7322,9 +10253,13 @@ mod tests {
         );
         assert!(hub.tick_now(Duration::from_secs(10)), "the arm is in place");
 
-        // The restore of the workspace root fails, so its record must not survive.
+        // The restore of the workspace root fails, so its record must not survive — and the
+        // declaration that caused it is answered "not covered", not acknowledged.
         refusals.refuse(&workspace);
-        assert!(hub.ensure_roots(&[WatchTarget::recursive(workspace.clone())]));
+        assert!(
+            !hub.ensure_roots(&[WatchTarget::recursive(workspace.clone())]),
+            "a declaration whose root was lost while restoring it is not covered",
+        );
         assert!(hub.tick_now(Duration::from_secs(10)), "the declaration is applied");
         assert_eq!(
             hub.health(),

@@ -36,7 +36,7 @@ use crate::{McpProfile, McpServer};
 /// Consumers should require an exact major and a minimum minor. Bump this by hand in the
 /// same commit that changes the surface; the snapshot test over [`document`] puts the
 /// version field next to the change in the diff.
-pub const CONTRACT_VERSION: &str = "2.2";
+pub const CONTRACT_VERSION: &str = "2.3";
 
 /// URI of the MCP resource carrying [`document`].
 pub const CONTRACT_URI: &str = "bsl-analyzer://contract";
@@ -156,7 +156,7 @@ const WORKSPACE_TOOLS: &[ToolDecl] = &[
         name: "search",
         actions: WORKSPACE_SEARCH_ACTIONS,
         note: None,
-        output_schema_version: Some("4"),
+        output_schema_version: Some("5"),
         default_enabled: true,
     },
     tool("query", QUERY_ACTIONS),
@@ -839,7 +839,7 @@ mod tests {
         doc.insert("mcp".into(), mcp_surface());
         expect![[r#"
             {
-              "contract_version": "2.2",
+              "contract_version": "2.3",
               "mcp": {
                 "profiles": {
                   "reference": {
@@ -1187,8 +1187,8 @@ mod tests {
                           }
                         ],
                         "name": "search",
-                        "output_schema_fingerprint": "blake3:4829b5149282d60e71524da2b7b4a1b684b1f8db79d255f962f9063e0aec3adf",
-                        "output_schema_version": "4",
+                        "output_schema_fingerprint": "blake3:cba7e909df4a379a514118ba3c6a8795dcafc780dc1beb46a4c3d3097ed48716",
+                        "output_schema_version": "5",
                         "params": [
                           {
                             "name": "action",

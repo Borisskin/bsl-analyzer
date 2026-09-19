@@ -339,6 +339,7 @@ pub fn envelope(
             .with_revision(freshness.revision)
             .with_topology(freshness.topology)
             .with_stale(freshness.stale)
+            .with_drift_watch(freshness.drift_watch)
             .to_value(),
         "result": result,
     }))
@@ -378,6 +379,12 @@ pub fn status(report: &crate::graph::GraphStatusReport) -> CallToolResult {
     if let Some(superseded) = report.superseded {
         body["superseded"] = json!(superseded);
     }
+    if let Some(watch) = report.drift_watch {
+        body["drift_watch"] = json!(watch);
+    }
+    if let Some(cycle) = report.poll_cycle_secs {
+        body["poll_cycle_secs"] = json!(cycle);
+    }
     structured(body)
 }
 
@@ -397,9 +404,9 @@ pub fn loading(detail: Option<&str>) -> CallToolResult {
 /// independent of the on-disk SQLite cache layout in [`crate::graph_db`]).
 fn schema_json() -> Value {
     json!({
-        "schema_version": "33",
+        "schema_version": "34",
         "actions": ["overview", "schema", "status", "node", "source", "neighbors", "callers", "callees", "resolve"],
-        "status": "`status` returns the graph lifecycle ({state: disabled|loading|ready|failed, and when ready: files, unread_files, revision, stale, reload}) and kicks the lazy build — poll it instead of reading a flat `loading` envelope from a data action (mirrors `diagnostics status`). `unread_files` counts modules whose bytes could not be read when the artefact was built or last patched: they contributed no nodes and no edges, so the graph is missing them, `stale` is true, and no fingerprint comparison reveals it (stat needs no read permission). A patch never clears an inherited one — only a full rebuild restores the missing rows. `files` here is the module count the artefact COVERS, unread ones included, so `unread_files` is a subset of it — unlike `diagnostics status`, whose `files` counts only what it serves and excludes them; do not apply one arithmetic to both. `superseded: true` (emitted only when it holds) means another daemon generation owns this workspace's derived caches and this server no longer rebuilds. It reports `ready + superseded` and serves data only while one of its own pre-opened SQLite descriptors is available in the pool; otherwise status is `failed + superseded` and every data action returns the same reconnect error, never `loading`. Reconnect to use the current daemon. The static `schema` action remains available without a snapshot.",
+        "status": "`status` returns the graph lifecycle ({state: disabled|loading|ready|failed, and when ready: files, unread_files, revision, stale, reload}; for a workspace graph always `drift_watch`, see the envelope) and kicks the lazy build — poll it instead of reading a flat `loading` envelope from a data action (mirrors `diagnostics status`). `unread_files` counts modules whose bytes could not be read when the artefact was built or last patched: they contributed no nodes and no edges, so the graph is missing them, `stale` is true, and no fingerprint comparison reveals it (stat needs no read permission). A patch never clears an inherited one — only a full rebuild restores the missing rows. `files` here is the module count the artefact COVERS, unread ones included, so `unread_files` is a subset of it — unlike `diagnostics status`, whose `files` counts only what it serves and excludes them; do not apply one arithmetic to both. `superseded: true` (emitted only when it holds) means another daemon generation owns this workspace's derived caches and this server no longer rebuilds. It reports `ready + superseded` and serves data only while one of its own pre-opened SQLite descriptors is available in the pool; otherwise status is `failed + superseded` and every data action returns the same reconnect error, never `loading`. Reconnect to use the current daemon. The static `schema` action remains available without a snapshot.",
         "node_kinds": ["method", "module", "mdo", "attribute", "tabular_section", "form", "form_item", "form_attribute"],
         "node_shape": "`qualified` (russified display path) is emitted only for metadata nodes — for code nodes it would restate `module` + `name`; `addressable` is emitted only when false (absent = the id round-trips); `truncated: true` is emitted on a node whose `detail=bodies` source was cut short — or, when `source` is absent, dropped — to fit the output budget (so a short body is not mistaken for a complete one, nor a budget-dropped body for a method with no body)",
         "notes": "`node(module/<scope>)` resolves for any code module and returns a `methods` array ({id, name, is_export}) of the module's members; module membership is served on demand and is not a graph edge, so `neighbors(module/…)` stays empty",
@@ -451,7 +458,17 @@ fn schema_json() -> Value {
             "revision": "u64 — snapshot generation the answer was computed at; DEPRECATED in favour of freshness.revision, which carries the same value",
             "stale": "bool — this snapshot is not current: the workspace drifted on disk since it was built, and/or some module could not be read when it was built (see the status action's unread_files); DEPRECATED in favour of freshness.stale",
             "reload": "none | running | failed — background re-index state",
-            "freshness": "the location contract's envelope: { source, revision, topology_fingerprint, stale, completeness }. topology_fingerprint is 16 hex digits naming the extension topology this snapshot was built for; completeness is { status, reasons: [{ code, detail }] }",
+            "freshness": "the location contract's envelope: { source, revision, topology_fingerprint, stale, completeness, drift_watch }. topology_fingerprint is 16 hex digits naming the extension topology this snapshot was built for; completeness is { status, reasons: [{ code, detail }] }",
+            "drift_watch": format!(
+                "{} — what `stale` rests on. starting (the drift watcher has not finished its \
+                 first look) and unobserved (it has stopped) always read stale, since nothing \
+                 would notice the graph falling behind; polling adds an overdue poll, and the \
+                 status action's poll_cycle_secs is the conservative bound on how long an edit \
+                 that keeps its size and mtime can go unnoticed — it holds while the polled \
+                 files stay readable, and the walks' own I/O is on top of it; watching is the \
+                 ordinary case",
+                loc::DriftWatch::vocabulary(),
+            ),
             // The reason list is GENERATED from the vocabulary rather than restated here:
             // a schema that publishes a closed set has to publish all of it, and a hand-kept
             // copy of it drifts silently the moment a reason is added.
@@ -511,7 +528,7 @@ mod tests {
         let lease = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
         let graph = crate::graph::GraphState::for_workspace_with_cache(root.to_path_buf(), cache)
             .with_lease(lease.clone());
-        graph.ensure_loading();
+        graph.ensure_first_build();
         crate::graph::test_support::wait_ready(&graph);
         let held_lease = lease.hold_file_lock_for_test();
         std::fs::remove_file(lease_path).unwrap();
@@ -732,8 +749,11 @@ mod tests {
             reload: Some("none"),
             error: None,
             superseded: None,
+            drift_watch: Some("watching"),
+            poll_cycle_secs: None,
         };
         let body = status(&ready).structured_content.unwrap();
+        assert_eq!(body["drift_watch"], "watching");
         assert_eq!(body["state"], "ready");
         assert_eq!(body["files"], 10);
         assert_eq!(body["revision"], 3);
@@ -749,6 +769,8 @@ mod tests {
             reload: None,
             error: Some("boom".to_string()),
             superseded: None,
+            drift_watch: None,
+            poll_cycle_secs: None,
         };
         let body = status(&failed).structured_content.unwrap();
         assert_eq!(body["state"], "failed");
@@ -771,7 +793,7 @@ mod tests {
         // The contract version must be bumped in lockstep with any response-shape change
         // (a new action, node/edge kind, or result field). The history of what each bump
         // added lives in git, not here.
-        assert_eq!(schema["schema_version"], "33");
+        assert_eq!(schema["schema_version"], "34");
         // A bumped number over unchanged text would certify a contract the server no longer
         // honours, so the new keys are asserted by description, not by version alone.
         assert!(schema["envelope"]["freshness"].is_string(), "the freshness envelope advertised");
@@ -848,8 +870,13 @@ mod tests {
 
     #[test]
     fn envelope_populates_structured_content() {
-        let freshness =
-            Freshness { revision: 7, stale: true, reload: "running", topology: 0x0a1b_2c3d };
+        let freshness = Freshness {
+            revision: 7,
+            stale: true,
+            reload: "running",
+            topology: 0x0a1b_2c3d,
+            drift_watch: loc::DriftWatch::Unobserved,
+        };
         let result = envelope(
             freshness,
             loc::Completeness::partial(loc::ReasonCode::ResultCap, "capped by max_nodes"),
@@ -874,7 +901,7 @@ mod tests {
     #[test]
     fn schema_and_loading_populate_structured_content() {
         assert_structured_mirrors_text(&schema());
-        assert_eq!(schema().structured_content.unwrap()["schema_version"], "33");
+        assert_eq!(schema().structured_content.unwrap()["schema_version"], "34");
 
         assert_structured_mirrors_text(&loading(Some("indexing")));
         let body = loading(Some("indexing")).structured_content.unwrap();

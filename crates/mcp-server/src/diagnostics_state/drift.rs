@@ -140,7 +140,10 @@ impl DiagnosticsState {
         // a full scan for as long as the other one stays silent.
         let cursor = *lock_recover(&self.hub_cursor);
         match &self.change_hub {
-            Some(hub) if matches!(hub.health_for(cursor), Health::Healthy) => {
+            Some(hub)
+                if self.hub_armed.load(Ordering::SeqCst)
+                    && matches!(hub.health_for(cursor), Health::Healthy) =>
+            {
                 self.poll_drift_via_drain(hub, &root);
             }
             _ => {
@@ -152,11 +155,77 @@ impl DiagnosticsState {
     /// Re-read every held hole; serve the ones that came back and drop the ones that
     /// vanished. Cheap in the normal case — the list is empty.
     fn retry_holes(&self) {
+        self.retry_holes_in(None);
+    }
+
+    /// Re-read the ONE hole a request just asked about, whatever the window says.
+    ///
+    /// The pacing below exists because a sweep reads every hole whole; a client that repaired
+    /// one file and asked for it by name pays for that file alone, and telling it for another
+    /// window that the bytes cannot be read would answer about a state that has ended.
+    pub(super) fn retry_hole_named(&self, key: &str) {
+        {
+            // Paced per file, for the reason the sweep is paced at all: a read is the WHOLE
+            // file, taken under the resident's write lock, and a file that stays unreadable
+            // is the steady state a hole exists for. One re-read per window per file answers
+            // a repair at once and costs a client that polls an unreadable file nothing.
+            let mut last = lock_recover(&self.last_named_hole_retry);
+            if last.get(key).is_some_and(|at| at.elapsed() < self.drift_interval) {
+                return;
+            }
+            // Claimed under the SAME lock that checked, because checking and then stamping
+            // after the read is not one decision: two requests naming the same file in one
+            // window both passed the check and both read the whole file under the resident's
+            // write lock. Withdrawn below when the rebuild refuses, so the other half of the
+            // rule still holds — a window is spent only on an attempt that happened.
+            last.insert(key.to_owned(), Instant::now());
+            // Bounded by the hole list: a path that is no longer a hole never asks again.
+            last.retain(|_, at| at.elapsed() < self.drift_interval * 4);
+        }
+        // A retry the rebuild refuses — `reload == Running`, no resident, the path no longer a
+        // hole — must not spend the window, or every later request for that file inside it is
+        // skipped in silence: the one input the named retry exists for gets the answer it was
+        // added to prevent.
+        if !self.retry_holes_in(Some(key)) {
+            lock_recover(&self.last_named_hole_retry).remove(key);
+        }
+    }
+
+    /// Heal the hole a file request is about, if it is one, before the answer is built.
+    ///
+    /// A file held out of service answers "its bytes could not be read" and carries no
+    /// findings, so a client that fixed the file and asked again would be told the same
+    /// thing until the sweep's next window — about a state that has already ended. Bounded
+    /// by what was asked for: at most the one file named.
+    pub(crate) fn retry_unread_request_path(&self, root_id: Option<&str>, path: &Path) {
+        let Some(key) = self.unread_key_for(root_id, path) else { return };
+        self.retry_hole_named(&key);
+    }
+
+    /// The hole key this request names, and only when it IS a hole right now.
+    ///
+    /// Through the root table, exactly as the answer resolves it. Against the workspace root
+    /// alone — which is what a raw relative path resolves to — a file addressed by its own
+    /// root, in an extension or a nested source root, named a path nobody holds: no hole was
+    /// found, nothing was re-read, and the request waited out the sweep it was meant to skip.
+    fn unread_key_for(&self, root_id: Option<&str>, path: &Path) -> Option<String> {
+        let inner = lock_recover(&self.inner);
+        let resident = inner.resident.as_ref()?;
+        let resolved = resident.resolve_rooted_path(root_id, path).ok()?;
+        resident.hole_key_of(&resolved)
+    }
+
+    /// Says whether a re-read was ATTEMPTED, so a caller pacing itself pays for a retry that
+    /// happened rather than for one that was refused before it began.
+    fn retry_holes_in(&self, only: Option<&str>) -> bool {
         let admits = {
             let inner = lock_recover(&self.inner);
-            let Some(resident) = inner.resident.as_ref() else { return };
+            let Some(resident) = inner.resident.as_ref() else { return false };
             if resident.holes.is_empty() {
-                return;
+                return false;
+            }
+            if only.is_some_and(|key| !resident.holes.contains_key(key)) {
+                return false;
             }
             resident.holes.values().any(|o| *o == super::resident::HoleOrigin::Pending)
         };
@@ -168,14 +237,11 @@ impl DiagnosticsState {
         // `catch_up`), so an unthrottled retry would put a full re-read of every hole
         // on the hot path of a workspace whose normal state, for this node, is holes.
         // Healing is not urgent — the next window is soon enough.
-        {
-            let mut last = lock_recover(&self.last_hole_retry);
-            if let Some(at) = *last {
-                if at.elapsed() < self.drift_interval {
-                    return;
-                }
+        if only.is_none() {
+            let last = lock_recover(&self.last_hole_retry);
+            if last.is_some_and(|at| at.elapsed() < self.drift_interval) {
+                return false;
             }
-            *last = Some(Instant::now());
         }
         // Asked BEFORE the lock, like the drain does: `resident_config_is_current`
         // takes the same mutex, and asking it under `apply` would deadlock rather
@@ -195,18 +261,28 @@ impl DiagnosticsState {
         {
             let mut inner = lock_recover(&self.inner);
             if inner.reload == ReloadState::Running {
-                return;
+                // Refused before any file was read, so nothing is paced: see the caller.
+                return false;
             }
             let Inner {
                 resident: Some(resident), stats, generation, baseline_epoch, status, ..
             } = &mut *inner
             else {
-                return;
+                return false;
             };
+            // Past EVERY refusal, the resident included: the lock is released between the
+            // sample above and this one, so the idle sweeper can evict the resident in the
+            // gap. Stamped before this check, that eviction spent the window for a re-read
+            // that never happened, and every request inside it was skipped in silence.
+            if only.is_none() {
+                *lock_recover(&self.last_hole_retry) = Some(Instant::now());
+            }
             let (healed, vanished) =
-                super::resident::retry_resident_holes(resident, config_is_current);
+                super::resident::retry_resident_holes(resident, config_is_current, only);
             if healed.is_empty() && vanished.is_empty() {
-                return;
+                // Read and found nothing changed: an attempt all the same, and the pacing it
+                // earns is the whole point — an unreadable file is the steady state.
+                return true;
             }
             // Healing changed the bytes this file serves, so its baseline entry moves
             // with it — to the fingerprint taken BEFORE the read, the one describing
@@ -247,6 +323,7 @@ impl DiagnosticsState {
         if let Some((root, base)) = rescope {
             self.rescope_out_of_lock(&root, &base);
         }
+        true
     }
 
     fn poll_drift_via_scan(&self, root: &Path) -> bool {
@@ -775,6 +852,11 @@ impl DiagnosticsState {
         let Some(hub) = &self.change_hub else {
             return;
         };
+        // Whether the stream was already covering the tree when this resident is about to
+        // read it. A resident built while the watch is still arming derives its state from
+        // a tree nobody was watching, and no event carries the window in between: until one
+        // scan runs under an armed watch, this one keeps its own eyes on disk.
+        self.hub_armed.store(hub.is_watching(), Ordering::SeqCst);
         let mut slot = lock_recover(&self.hub_cursor);
         *slot = Some(match slot.take() {
             // The rebuild this precedes can fail, and a failed rebuild leaves the OLD
@@ -958,6 +1040,12 @@ impl DiagnosticsState {
                 });
             }
         }
+        // Decided here, where "this call walked" is a fact rather than an inference: the scan
+        // counter is shared, so a caller that compared it around this call could be reading
+        // ANOTHER thread's walk while itself receiving the cached snapshot above — a snapshot
+        // that may predate the arming this flag is about.
+        let armed_before_the_walk =
+            self.change_hub.as_ref().is_some_and(WorkspaceChangeHub::is_watching);
         // Read BEFORE the walk, never after. Too old is safe — the snapshot is refused and
         // the next poll walks again; too new would let a snapshot that predates a baseline
         // move claim it was taken after one.
@@ -974,6 +1062,12 @@ impl DiagnosticsState {
             &project.excluded,
         );
         let config_fp = config_identity(config_files_fp, &project.configs);
+        if armed_before_the_walk {
+            // This call read the tree itself, with the watch already holding it: the walk
+            // covers everything up to it and the stream everything after, so from here the
+            // drain alone is enough.
+            self.hub_armed.store(true, Ordering::SeqCst);
+        }
         *cache = Some(ScanCache {
             at: Instant::now(),
             stats: stats.clone(),
@@ -1525,6 +1619,215 @@ mod tests {
         let ResidentOutcome::Ready((served, unread), _) = out else { panic!("expected Ready") };
         assert!(served, "control: a readable module is served");
         assert_eq!(unread, 0, "control: no holes");
+    }
+
+    /// The named retry is paced per file, like the sweep it sits beside and for the same
+    /// reason: it reads the WHOLE file under the resident's write lock, and a file that stays
+    /// unreadable is the steady state a hole exists for. An editor polling such a file would
+    /// otherwise pay that read on every request and block every other reader while it ran.
+    #[test]
+    fn a_named_hole_retry_is_paced_like_the_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+
+        let mut state = DiagnosticsState::for_workspace(root.to_path_buf());
+        state.drift_interval = Duration::from_millis(0);
+        state.ensure_loading();
+        wait_ready(&state);
+        let gen0 = state.generation();
+        let module = module_path(root, "Сервер");
+
+        std::thread::sleep(Duration::from_millis(10));
+        fs::write(&module, UNREADABLE).unwrap();
+        wait_for_apply(&state, gen0, "the unreadable body is a drift move");
+
+        state.drift_interval = Duration::from_secs(3600);
+        let ResidentOutcome::Ready(key, _) =
+            state.read(|resident, _| resident.hole_key_of(&module))
+        else {
+            panic!("expected Ready")
+        };
+        let key = key.expect("the file is a hole");
+
+        // The file stays unreadable, so every retry that runs pays the whole read. The
+        // moment recorded for it moves only when one does.
+        state.retry_hole_named(&key);
+        let first = *lock_recover(&state.last_named_hole_retry)
+            .get(&key)
+            .expect("the first request re-read the file it asked about");
+        std::thread::sleep(Duration::from_millis(5));
+        for _ in 0..4 {
+            state.retry_hole_named(&key);
+        }
+        let last = *lock_recover(&state.last_named_hole_retry).get(&key).expect("still recorded");
+        assert_eq!(first, last, "a request inside the window re-read the file again");
+        let ResidentOutcome::Ready(still_a_hole, _) =
+            state.read(|resident, _| resident.is_unread(&module))
+        else {
+            panic!("expected Ready")
+        };
+        assert!(still_a_hole, "control: the file is still held out of service");
+        assert_eq!(
+            lock_recover(&state.last_named_hole_retry).len(),
+            1,
+            "the pacing record grew per call instead of per file"
+        );
+    }
+
+    /// The flag that hands the drift over to the event stream is set by the call that walked
+    /// the tree, and only by it. The scan counter is shared, so a caller that compared it
+    /// around the throttled scan could be reading another thread's walk while itself
+    /// receiving the cached snapshot — one taken before the watch armed, which proves nothing
+    /// about the window that follows it.
+    #[test]
+    fn only_the_call_that_walked_hands_the_drift_to_the_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+
+        let mut state = DiagnosticsState::for_workspace(root.to_path_buf());
+        state.drift_interval = Duration::from_secs(3600);
+        state.ensure_loading();
+        wait_ready(&state);
+
+        // No hub at all: nothing can arm, so no walk may hand the drift over.
+        let walks = state.scan_count.load(Ordering::SeqCst);
+        state.throttled_scan(root).expect("the first call walks");
+        assert!(
+            state.scan_count.load(Ordering::SeqCst) > walks,
+            "control: the first call after the window really does walk"
+        );
+        assert!(
+            !state.hub_armed.load(Ordering::SeqCst),
+            "a walk with no armed watch behind it handed the drift to a stream that carries \
+             nothing"
+        );
+
+        // A second call inside the window returns the cached snapshot and walks nothing —
+        // and must not hand anything over either, however many walks others have made.
+        let walks = state.scan_count.load(Ordering::SeqCst);
+        state.throttled_scan(root).expect("the cached snapshot is served");
+        assert_eq!(
+            state.scan_count.load(Ordering::SeqCst),
+            walks,
+            "control: the second call inside the window did not walk"
+        );
+        assert!(!state.hub_armed.load(Ordering::SeqCst));
+    }
+
+    /// A file held out of service answers "unreadable" and carries no findings, and the
+    /// sweep that re-reads holes is paced — it reads every hole whole, so it may not run on
+    /// every request. A client that repaired one file and asked for it by name would be told
+    /// about a state that has already ended, for as long as that window lasts. The file it
+    /// asked for is re-read for that request, and nothing else is.
+    #[test]
+    fn a_request_for_a_repaired_file_does_not_wait_out_the_sweep_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+
+        let mut state = DiagnosticsState::for_workspace(root.to_path_buf());
+        state.drift_interval = Duration::from_millis(0);
+        state.ensure_loading();
+        wait_ready(&state);
+        let gen0 = state.generation();
+        let module = module_path(root, "Сервер");
+
+        std::thread::sleep(Duration::from_millis(10));
+        fs::write(&module, UNREADABLE).unwrap();
+        wait_for_apply(&state, gen0, "the unreadable body is a drift move");
+        let held = state.read(|resident, _| resident.is_unread(&module));
+        let ResidentOutcome::Ready(true, _) = held else { panic!("the file is not a hole") };
+
+        // Paced as in production from here on, and repaired on disk.
+        state.drift_interval = Duration::from_secs(3600);
+        std::thread::sleep(Duration::from_millis(10));
+        fs::write(&module, "&НаСервере\nФункция Считать() Экспорт КонецФункции\n").unwrap();
+
+        // Control: an ordinary read inside the window heals nothing — which is what makes
+        // the answer below the request's doing rather than the sweep's.
+        let paced = state.read(|resident, _| resident.is_unread(&module));
+        let ResidentOutcome::Ready(true, _) = paced else {
+            panic!("the sweep healed inside its own window; this test proves nothing")
+        };
+
+        state.retry_unread_request_path(None, &module);
+
+        let asked =
+            state.read(|resident, _| (resident.is_unread(&module), resident.unread_count()));
+        let ResidentOutcome::Ready((still_a_hole, unread), _) = asked else {
+            panic!("expected Ready")
+        };
+        assert!(!still_a_hole, "the file the request named is still held out of service");
+        assert_eq!(unread, 0);
+    }
+
+    /// The accelerated heal resolves the file the way the ANSWER does.
+    ///
+    /// A request names a file as a root id and a path inside it; the answer resolves that pair
+    /// through the root table. The heal in front of it resolved the raw path against the
+    /// workspace root alone, so for anything not physically under that root — an extension, a
+    /// nested source root — it looked for a hole under a path nobody holds, found none, and
+    /// healed nothing. The periodic sweep still gets there, so the file is not lost; what the
+    /// request pays for and does not get is the re-read it asked for.
+    #[test]
+    fn a_rooted_request_heals_the_hole_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let cf = root.join("src/cf");
+        fs::create_dir_all(&cf).unwrap();
+        fs::write(cf.join("Configuration.xml"), "<Configuration/>").unwrap();
+        write_common_module(&cf, "Сервер", true, "&НаСервере\nФункция Ч() Экспорт КонецФункции");
+        let ext = root.join("src/cfe/Расш");
+        fs::create_dir_all(&ext).unwrap();
+        fs::write(ext.join("Configuration.xml"), "<Configuration/>").unwrap();
+        write_common_module(
+            &ext,
+            "РасшМодуль",
+            true,
+            "&НаСервере\nФункция Р() Экспорт КонецФункции",
+        );
+
+        let mut state = DiagnosticsState::for_workspace(root.to_path_buf());
+        state.drift_interval = Duration::from_millis(0);
+        state.ensure_loading();
+        wait_ready(&state);
+
+        let ext_module = ext.join("CommonModules/РасшМодуль/Ext/Module.bsl");
+        let gen0 = state.generation();
+        std::thread::sleep(Duration::from_millis(10));
+        fs::write(&ext_module, UNREADABLE).unwrap();
+        wait_for_apply(&state, gen0, "the unreadable extension body is a drift move");
+        let held = state.read(|resident, _| resident.is_unread(&ext_module));
+        let ResidentOutcome::Ready(true, _) = held else { panic!("the file is not a hole") };
+
+        // Paced as in production, and repaired on disk.
+        state.drift_interval = Duration::from_secs(3600);
+        std::thread::sleep(Duration::from_millis(10));
+        fs::write(&ext_module, "&НаСервере\nФункция Р() Экспорт КонецФункции\n").unwrap();
+        let paced = state.read(|resident, _| resident.is_unread(&ext_module));
+        let ResidentOutcome::Ready(true, _) = paced else {
+            panic!("the sweep healed inside its own window; this test proves nothing")
+        };
+
+        // Addressed the way a client addresses a file in a root that is not the workspace
+        // root: the id of the root, and the path inside it.
+        let key = state.read(|resident, _| resident.workspace_roots().key_of_path(&ext_module));
+        let ResidentOutcome::Ready(Some(key), _) = key else {
+            panic!("the extension module belongs to a registered root")
+        };
+        assert_ne!(key.root_id, "", "the stand needs a root that is not the workspace root");
+        let relative = std::path::PathBuf::from(&key.path);
+
+        state.retry_unread_request_path(Some(&key.root_id), &relative);
+
+        let asked = state.read(|resident, _| resident.is_unread(&ext_module));
+        let ResidentOutcome::Ready(still_a_hole, _) = asked else { panic!("expected Ready") };
+        assert!(
+            !still_a_hole,
+            "the request named the file through its root and the heal looked somewhere else",
+        );
     }
 
     /// A body that becomes unreadable WHILE SERVING must lose its `module_file`

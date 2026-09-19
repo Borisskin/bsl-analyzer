@@ -161,7 +161,29 @@ struct Inner {
     /// must not take the workspace back — a background pass still finishing during shutdown
     /// would otherwise see the record it just removed as "nobody owns this" and re-claim it.
     released: AtomicBool,
+    /// When ownership was last ATTEMPTED, and the lock the attempt itself runs under. It paces
+    /// the next attempt and nothing else: an attempt that could not take the lock file, or
+    /// whose write failed, still happened — which is what the pacing is about — and it answered
+    /// nothing.
     checked_at: Mutex<Option<Instant>>,
+    /// Whether a verdict has been ESTABLISHED: a check that completed and produced an answer.
+    ///
+    /// Apart from `checked_at` in two ways that both matter. It is a fact about the answer
+    /// rather than about the attempt, so a refresh that answered nothing leaves it where it was
+    /// instead of publishing the initial value as a checked one. And it is an atomic, so
+    /// reading it takes no lock: the attempts hold `checked_at` across a file lock and a record
+    /// read — seconds of it, by design — and a reader that had to take that lock would queue
+    /// behind I/O it is forbidden to do itself.
+    established: AtomicBool,
+    /// Every lease read or claim that went to disk, by the thread that made it.
+    ///
+    /// Threads rather than a count, and that is the whole point: "the answer came back quickly"
+    /// is not the statement a request path has to make — a read that beats a bound on an idle
+    /// machine is the same read under load — and a count cannot tell a request that read the
+    /// lease from a background owner that did, while background reads are not merely allowed
+    /// but are how the verdict this daemon serves stays current.
+    #[cfg(test)]
+    disk_check_threads: Mutex<Vec<String>>,
     /// When [`WorkspaceLease::publish_checkpointed`] last restamped the record.
     ///
     /// On the shared inner, not on one call: a hot consumer opens a NEW fence on every
@@ -176,6 +198,10 @@ struct Inner {
     fail_managed_restamp: AtomicBool,
     #[cfg(test)]
     fail_checkpoint_lock: AtomicBool,
+    /// Refuse the n-th checkpoint rather than the next one. A production path takes several
+    /// checkpoints before the one under test, and a one-shot flag burns on the first.
+    #[cfg(test)]
+    fail_checkpoint_lock_countdown: std::sync::atomic::AtomicU64,
 }
 
 impl WorkspaceLease {
@@ -197,6 +223,27 @@ impl WorkspaceLease {
         cache.ensure().unwrap();
         let _guard = LockGuard::acquire(&cache.lease_lock_path(), LOCK_WAIT).unwrap();
         run()
+    }
+
+    /// Hold the cache's lease lock until the returned sender lets go — or until the stand that
+    /// asked for it goes away with it still held. For a stand whose question is "did the answer
+    /// come back while the lock was held", which is a fact about order, not about a duration.
+    #[cfg(test)]
+    pub(crate) fn hold_cache_lock_until_released(
+        cache: &crate::cache::WorkspaceCacheLayout,
+    ) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Sender<()>) {
+        cache.ensure().unwrap();
+        let path = cache.lease_lock_path();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let _guard = LockGuard::acquire(&path, LOCK_WAIT).unwrap();
+            ready_tx.send(()).unwrap();
+            // Either the stand releases it, or the stand is gone and the sender with it.
+            let _ = release_rx.recv();
+        });
+        ready_rx.recv().unwrap();
+        (handle, release_tx)
     }
 
     #[cfg(test)]
@@ -244,7 +291,10 @@ impl WorkspaceLease {
                 superseded: AtomicBool::new(false),
                 released: AtomicBool::new(false),
                 checked_at: Mutex::new(None),
+                established: AtomicBool::new(false),
                 stamped_at: Mutex::new(None),
+                #[cfg(test)]
+                disk_check_threads: Mutex::new(Vec::new()),
                 #[cfg(test)]
                 fail_managed_lock: AtomicBool::new(false),
                 #[cfg(test)]
@@ -253,6 +303,8 @@ impl WorkspaceLease {
                 fail_managed_restamp: AtomicBool::new(false),
                 #[cfg(test)]
                 fail_checkpoint_lock: AtomicBool::new(false),
+                #[cfg(test)]
+                fail_checkpoint_lock_countdown: std::sync::atomic::AtomicU64::new(0),
             }),
         }
     }
@@ -271,7 +323,10 @@ impl WorkspaceLease {
             superseded: AtomicBool::new(false),
             released: AtomicBool::new(false),
             checked_at: Mutex::new(None),
+            established: AtomicBool::new(false),
             stamped_at: Mutex::new(None),
+            #[cfg(test)]
+            disk_check_threads: Mutex::new(Vec::new()),
             #[cfg(test)]
             fail_managed_lock: AtomicBool::new(false),
             #[cfg(test)]
@@ -280,6 +335,8 @@ impl WorkspaceLease {
             fail_managed_restamp: AtomicBool::new(false),
             #[cfg(test)]
             fail_checkpoint_lock: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_checkpoint_lock_countdown: std::sync::atomic::AtomicU64::new(0),
         });
         let lease = Self { inner };
         // A starting daemon outbids whatever it finds — newest wins is the whole rule.
@@ -312,6 +369,8 @@ impl WorkspaceLease {
         checked_at: &mut Option<Instant>,
         claimable: impl Fn(Option<&LeaseRecord>) -> bool,
     ) -> bool {
+        #[cfg(test)]
+        self.note_disk_check();
         if self.inner.released.load(Ordering::SeqCst)
             || self.inner.superseded.load(Ordering::SeqCst)
         {
@@ -350,7 +409,7 @@ impl WorkspaceLease {
         }
         self.inner.generation.store(generation, Ordering::SeqCst);
         self.inner.token.store(token, Ordering::SeqCst);
-        self.inner.owns.store(true, Ordering::SeqCst);
+        self.establish(true);
         *checked_at = Some(Instant::now());
         tracing::info!(
             generation,
@@ -389,9 +448,52 @@ impl WorkspaceLease {
         if self.inner.generation.load(Ordering::SeqCst) == UNCLAIMED {
             return self.take_generation_locked(&mut checked_at, |_| true);
         }
-        let owns = self.recheck_locked(path, &mut checked_at);
+        self.settle(self.recheck_locked(path, &mut checked_at))
+    }
+
+    /// Whether the lifecycle lock is held right now. Test-only: it is how a stand puts a
+    /// request against a background check that is inside that lock, and nothing in production
+    /// decides anything on a `try_lock`.
+    #[cfg(test)]
+    pub(crate) fn lifecycle_is_busy(&self) -> bool {
+        matches!(self.inner.checked_at.try_lock(), Err(std::sync::TryLockError::WouldBlock))
+    }
+
+    /// The threads this lease's disk answers were asked on, in order. Noted on exactly two
+    /// paths: the ownership checks and the publication fence. `release` takes the lock file
+    /// too and is not noted — it runs as this process leaves, not while a request is served.
+    #[cfg(test)]
+    pub(crate) fn disk_check_threads(&self) -> Vec<String> {
+        lock_recover(&self.inner.disk_check_threads).clone()
+    }
+
+    #[cfg(test)]
+    fn note_disk_check(&self) {
+        lock_recover(&self.inner.disk_check_threads)
+            .push(std::thread::current().name().unwrap_or("<unnamed>").to_owned());
+    }
+
+    /// Whether any check has established this lease's ownership verdict yet.
+    ///
+    /// An unmanaged lease owns everything by construction and needs no check; a managed one
+    /// whose startup claim did not go through has a cached value that means nothing until a
+    /// check answers, and a caller publishing that value would publish a guess.
+    ///
+    /// Lock-free, and that is not an optimization: the checks that produce the verdict hold the
+    /// lifecycle lock across their file lock and their record read, so asking this under that
+    /// lock would make the asker wait out somebody else's I/O.
+    pub(crate) fn ownership_was_checked(&self) -> bool {
+        self.inner.path.is_none() || self.inner.established.load(Ordering::SeqCst)
+    }
+
+    /// Record a verdict a check actually produced: what it says, and that there now IS one.
+    ///
+    /// Every producer goes through here — the claim that wrote its record, the recheck that read
+    /// one, the fence that found a foreign token, the release — so "answered" and "attempted"
+    /// cannot drift apart again.
+    fn establish(&self, owns: bool) {
         self.inner.owns.store(owns, Ordering::SeqCst);
-        owns
+        self.inner.established.store(true, Ordering::SeqCst);
     }
 
     /// Last process-local ownership verdict, without lock-file or lease-record I/O.
@@ -404,9 +506,9 @@ impl WorkspaceLease {
     /// Ownership as of NOW, bypassing the cached verdict.
     ///
     /// For a caller whose next act writes something a takeover would poison, where up to
-    /// [`VERDICT_TTL`] of stale "yes" is too generous — the embedding pass, which persists a
-    /// vector per batch. It costs one small read, so it belongs on paths that run per batch,
-    /// not per query. This narrows the window; it does not fence it (only
+    /// [`VERDICT_TTL`] of stale "yes" is too generous — the graph, which decides here whether
+    /// to start a build or claim a reload. It costs one small read, so it belongs on paths that
+    /// run per pass, not per query. This narrows the window; it does not fence it (only
     /// [`Self::with_ownership`] does), which is the right trade where the write is a vector
     /// that a re-embed can replace rather than a rename that destroys another daemon's build.
     pub(crate) fn owns_caches_now(&self) -> bool {
@@ -428,9 +530,19 @@ impl WorkspaceLease {
         if self.inner.generation.load(Ordering::SeqCst) == UNCLAIMED {
             return self.take_generation_locked(&mut checked_at, |_| true);
         }
-        let owns = self.recheck_locked(path, &mut checked_at);
-        self.inner.owns.store(owns, Ordering::SeqCst);
-        owns
+        self.settle(self.recheck_locked(path, &mut checked_at))
+    }
+
+    /// What a check answered, published — or, when it answered nothing, the conservative "not
+    /// now" its caller needs, with no verdict published on the strength of an attempt.
+    fn settle(&self, answer: Option<bool>) -> bool {
+        match answer {
+            Some(owns) => {
+                self.establish(owns);
+                owns
+            }
+            None => false,
+        }
     }
 
     /// Publish one already-prepared value through a single visibility point.
@@ -486,6 +598,12 @@ impl WorkspaceLease {
             ));
         }
         let lock_path = dir.join(LEASE_LOCK_FILE);
+        // A fence is this lease's disk too: it takes the lock file and restamps the record.
+        // Noting it here is what lets a stand say WHICH thread asked — the ownership checks
+        // alone leave a request that fences invisible, and a bounded wait on a held lock is
+        // not a hang that a timeout would catch.
+        #[cfg(test)]
+        self.note_disk_check();
         let guard = match LockGuard::acquire(&lock_path, LOCK_WAIT) {
             Ok(guard) => guard,
             Err(error) if is_lock_contention(&error) => {
@@ -518,11 +636,11 @@ impl WorkspaceLease {
         if record.token != mine {
             if !is_stale(&record) {
                 self.latch_superseded(&record);
-                self.inner.owns.store(false, Ordering::SeqCst);
+                self.establish(false);
                 *checked_at = Some(Instant::now());
                 return LeaseOperationOutcome::Superseded;
             }
-            self.inner.owns.store(false, Ordering::SeqCst);
+            self.establish(false);
             *checked_at = Some(Instant::now());
             return LeaseOperationOutcome::TransientRefusal;
         }
@@ -545,7 +663,13 @@ impl WorkspaceLease {
                 }
             });
             #[cfg(test)]
-            if self.inner.fail_checkpoint_lock.swap(false, Ordering::SeqCst) {
+            if self.inner.fail_checkpoint_lock.swap(false, Ordering::SeqCst)
+                || self.inner.fail_checkpoint_lock_countdown.fetch_update(
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                    |left| (left > 0).then(|| left - 1),
+                ) == Ok(1)
+            {
                 stopped = Some(LeaseOperationOutcome::TransientRefusal);
                 return ControlFlow::Break(());
             }
@@ -582,11 +706,11 @@ impl WorkspaceLease {
             if record.token != mine {
                 if !is_stale(&record) {
                     self.latch_superseded(&record);
-                    self.inner.owns.store(false, Ordering::SeqCst);
+                    self.establish(false);
                     *checked_at = Some(Instant::now());
                     stopped = Some(LeaseOperationOutcome::Superseded);
                 } else {
-                    self.inner.owns.store(false, Ordering::SeqCst);
+                    self.establish(false);
                     *checked_at = Some(Instant::now());
                     stopped = Some(LeaseOperationOutcome::TransientRefusal);
                 }
@@ -667,6 +791,12 @@ impl WorkspaceLease {
         self.inner.fail_checkpoint_lock.store(true, Ordering::SeqCst);
     }
 
+    /// Refuse the `nth` checkpoint this lease admits (1 = the next one).
+    #[cfg(test)]
+    pub(crate) fn fail_checkpoint_lock_after_for_test(&self, nth: u64) {
+        self.inner.fail_checkpoint_lock_countdown.store(nth, Ordering::SeqCst);
+    }
+
     #[cfg(test)]
     pub(crate) fn fail_next_restamp_for_test(&self) {
         self.inner.fail_managed_restamp.store(true, Ordering::SeqCst);
@@ -682,7 +812,9 @@ impl WorkspaceLease {
     pub(crate) fn release(&self) {
         self.inner.released.store(true, Ordering::SeqCst);
         let mut checked_at = lock_recover(&self.inner.checked_at);
-        self.inner.owns.store(false, Ordering::SeqCst);
+        // Handing the workspace back IS a verdict, and one a status answer must be able to
+        // publish at once: this daemon owns nothing from here on.
+        self.establish(false);
         *checked_at = Some(Instant::now());
         let Some(path) = self.inner.path.as_deref() else {
             return;
@@ -723,13 +855,17 @@ impl WorkspaceLease {
     /// stopped reporting, or none at all, means the workspace is free: claim it afresh under
     /// the lock, where two daemons doing the same thing get distinct generations and the loser
     /// demotes at its next check.
-    fn recheck_locked(&self, path: &Path, checked_at: &mut Option<Instant>) -> bool {
+    /// The verdict this check produced, or `None` when it produced none: there was no record to
+    /// read, and the claim that would have settled the question could not be made either.
+    fn recheck_locked(&self, path: &Path, checked_at: &mut Option<Instant>) -> Option<bool> {
+        #[cfg(test)]
+        self.note_disk_check();
         let mine = self.inner.token.load(Ordering::SeqCst);
         match read_record(path) {
-            Some(record) if record.token == mine => true,
+            Some(record) if record.token == mine => Some(true),
             Some(record) if !is_stale(&record) => {
                 self.latch_superseded(&record);
-                false
+                Some(false)
             }
             found => {
                 let abandoned = found.map(|r| r.generation);
@@ -743,7 +879,9 @@ impl WorkspaceLease {
                         "this workspace's derived caches were left unowned; claiming them"
                     );
                 }
-                claimed
+                // A workspace whose claim this attempt could not take is not an answer about
+                // ownership: the attempt is paced, and the next one asks again.
+                claimed.then_some(true)
             }
         }
     }
@@ -792,9 +930,6 @@ fn spawn_heartbeat(inner: Weak<Inner>) {
             while waited < HEARTBEAT_INTERVAL {
                 std::thread::sleep(Duration::from_secs(1));
                 waited += Duration::from_secs(1);
-                if inner.upgrade().is_none() {
-                    return;
-                }
                 let Some(inner) = inner.upgrade() else { return };
                 if inner.released.load(Ordering::SeqCst) {
                     return;
@@ -956,6 +1091,181 @@ mod tests {
         })
     }
 
+    /// Before any check has succeeded, the cached verdict is an INITIAL value, not an answer.
+    ///
+    /// A claim that could not be written at startup — the cache lock held by a peer for the
+    /// Every state a verdict can be in, and which of them is one.
+    ///
+    /// The distinction this pins is "answered" against "attempted": an unmanaged lease owns by
+    /// construction, a claim that wrote its record answers `true`, a takeover and a release
+    /// answer `false` — and an attempt that could not take the lock answers nothing at all and
+    /// must leave the question open rather than republish whatever the value happened to be.
+    #[test]
+    fn the_established_verdict_is_the_one_a_check_answered() {
+        // Unmanaged: nothing to check, and it owns everything it is asked about.
+        let unmanaged = WorkspaceLease::unmanaged();
+        assert!(unmanaged.ownership_was_checked(), "an unmanaged lease needs no check");
+        assert!(unmanaged.owns_caches_cached());
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(dir.path());
+
+        // A claim that wrote its record: checked, and it owns.
+        let owner = WorkspaceLease::claim_cache(&cache);
+        assert!(owner.ownership_was_checked(), "a claim that went through is an answer");
+        assert!(owner.owns_caches_cached());
+
+        // A takeover: checked, and it does not.
+        let newer = WorkspaceLease::claim_cache(&cache);
+        assert!(!owner.owns_caches_now(), "the older generation must observe the takeover");
+        assert!(owner.ownership_was_checked());
+        assert!(!owner.owns_caches_cached(), "a superseded daemon owns nothing");
+
+        // Handing the workspace back: checked, and it does not.
+        newer.release();
+        assert!(newer.ownership_was_checked(), "a release is an answer about this daemon");
+        assert!(!newer.owns_caches_cached());
+
+        // And an attempt that answered nothing leaves the question where it was.
+        let other = tempfile::tempdir().unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(other.path());
+        let unknown =
+            WorkspaceLease::while_cache_lock_held(&cache, || WorkspaceLease::claim_cache(&cache));
+        // The premise is read off DISK, not off the flag this half is about: a defect that
+        // records attempts as answers must reach the assertion after the refresh rather than
+        // fail the setup before it.
+        assert!(!cache.lease_path().exists(), "the startup claim wrote a record after all");
+        let before = unknown.disk_check_threads().len();
+        assert!(
+            !WorkspaceLease::while_cache_lock_held(&cache, || unknown.owns_caches_now()),
+            "a refresh that cannot take the lock answers `not now`",
+        );
+        assert!(
+            unknown.disk_check_threads().len() > before,
+            "the refresh never reached the claim it is supposed to retry",
+        );
+        assert!(!cache.lease_path().exists(), "the refresh wrote a record after all");
+        assert!(
+            !unknown.ownership_was_checked(),
+            "an attempt that answered nothing was recorded as the answer",
+        );
+        // The retry that CAN take it is what closes the question.
+        assert!(unknown.owns_caches_now(), "the claim is retried and taken on the next check");
+        assert!(unknown.ownership_was_checked());
+        assert!(unknown.owns_caches_cached());
+        unknown.release();
+    }
+
+    /// A refresh that answered nothing leaves the verdict a check DID answer standing.
+    ///
+    /// The other half of the same line, and the opposite damage: over an unknown verdict,
+    /// recording the attempt invents a `false` nobody checked; over an established one it
+    /// destroys a `true` this daemon is still entitled to — the record is gone from disk, which
+    /// is exactly when a re-claim is owed, and the daemon that answers `no` about itself stops
+    /// maintaining caches it still owns.
+    #[test]
+    fn a_failed_refresh_keeps_the_verdict_the_last_check_established() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(dir.path());
+        let lease = WorkspaceLease::claim_cache(&cache);
+        // Premises off disk, for the same reason as above.
+        assert!(cache.lease_path().exists(), "the startup claim wrote no record to refresh");
+        std::fs::remove_file(cache.lease_path()).expect("the record is this daemon's to remove");
+
+        // The refresh a heartbeat makes: the record this daemon knows is gone — a re-claim is
+        // owed — and the lock that re-claim needs is held by a peer for longer than the wait.
+        let before = lease.disk_check_threads().len();
+        let answer = WorkspaceLease::while_cache_lock_held(&cache, || lease.owns_caches_now());
+        let attempts = lease.disk_check_threads().len() - before;
+
+        assert!(!answer, "a refresh that could take no lock answers `not now`");
+        assert!(
+            attempts >= 2,
+            "the refresh made {attempts} disk attempts: it never reached the re-claim whose \
+             failure this stand is about",
+        );
+        assert!(!cache.lease_path().exists(), "the refresh wrote a record after all");
+        assert!(lease.ownership_was_checked(), "an established verdict was un-established");
+        assert!(
+            lease.owns_caches_cached(),
+            "an attempt that answered nothing replaced the verdict a check had established",
+        );
+        lease.release();
+    }
+
+    /// Reading the published verdict takes no lock, so a request never queues behind the I/O a
+    /// check is doing under the lifecycle lock — which is seconds of it whenever a peer holds
+    /// the lock file.
+    #[test]
+    fn the_published_verdict_is_readable_while_a_check_holds_the_lifecycle_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(dir.path());
+        let lease = WorkspaceLease::claim_cache(&cache);
+        assert!(lease.ownership_was_checked());
+
+        // A real check, held inside the lifecycle lock by a lock file it cannot take.
+        let held = WorkspaceLease::hold_cache_lock_for(&cache, Duration::from_secs(3));
+        std::fs::remove_file(cache.lease_path()).expect("the record is this daemon's to remove");
+        let checking = {
+            let lease = lease.clone();
+            std::thread::spawn(move || lease.owns_caches_now())
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !lease.lifecycle_is_busy() {
+            assert!(Instant::now() < deadline, "the check never reached the lifecycle lock");
+            std::thread::yield_now();
+        }
+
+        let asking = Instant::now();
+        let checked = lease.ownership_was_checked();
+        let published = lease.owns_caches_cached();
+        let waited = asking.elapsed();
+
+        assert!(
+            waited < Duration::from_millis(100),
+            "reading the published verdict waited {waited:?} on a check that is doing I/O",
+        );
+        assert!(checked, "the verdict established before this check is still established");
+        assert!(published, "and it still says what it said");
+
+        held.join().unwrap();
+        let _ = checking.join();
+        // Whatever that check ended up doing — it either re-claimed the record it found gone,
+        // or ran out its wait and answered nothing — the published verdict is still a verdict
+        // somebody answered. An attempt is not one.
+        assert!(
+            lease.ownership_was_checked() && lease.owns_caches_cached(),
+            "an attempt that answered nothing overwrote the verdict a check had established",
+        );
+        lease.release();
+    }
+
+    /// moment — leaves the lease managed, un-owned and UNCHECKED, and the comment on
+    /// `owns_caches` says plainly that such a claim is retried on the next check. Until that
+    /// retry runs the cached accessor answers `false`, which is what this daemon actually
+    /// knows: it asked for the workspace and did not get it. A status answer says exactly
+    /// that and waits for a background check to say otherwise — going to the lease from the
+    /// request itself to find out is a file lock a peer may hold for seconds, paid by the
+    /// caller, for a verdict the next background pass brings anyway.
+    #[test]
+    fn a_cached_ownership_verdict_before_any_check_succeeded_is_not_an_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(dir.path());
+        let lease =
+            WorkspaceLease::while_cache_lock_held(&cache, || WorkspaceLease::claim_cache(&cache));
+
+        assert!(!lease.ownership_was_checked(), "no check has succeeded yet");
+        assert!(
+            !lease.owns_caches_cached(),
+            "and the cached verdict is still its initial value, which is the whole problem",
+        );
+
+        // The lock is free again, so the retry the comment promises can run.
+        assert!(lease.owns_caches_now(), "the claim is retried and taken on the next check");
+        assert!(lease.ownership_was_checked(), "and from here the cached accessor is an answer");
+        assert!(lease.owns_caches_cached());
+    }
+
     fn checkpoint_test<T>(
         lease: &WorkspaceLease,
         write: impl FnOnce(&mut dyn FnMut() -> ControlFlow<()>) -> ControlFlow<(), T>,
@@ -999,11 +1309,16 @@ mod tests {
                 superseded: AtomicBool::new(false),
                 released: AtomicBool::new(false),
                 checked_at: Mutex::new(None),
+                established: AtomicBool::new(false),
                 stamped_at: Mutex::new(None),
+                #[cfg(test)]
+                disk_check_threads: Mutex::new(Vec::new()),
                 fail_managed_lock: AtomicBool::new(false),
                 fail_managed_read: AtomicBool::new(false),
                 fail_managed_restamp: AtomicBool::new(false),
                 fail_checkpoint_lock: AtomicBool::new(false),
+                #[cfg(test)]
+                fail_checkpoint_lock_countdown: std::sync::atomic::AtomicU64::new(0),
             }),
         }
     }
@@ -1327,11 +1642,16 @@ mod tests {
                 superseded: AtomicBool::new(false),
                 released: AtomicBool::new(false),
                 checked_at: Mutex::new(None),
+                established: AtomicBool::new(false),
                 stamped_at: Mutex::new(None),
+                #[cfg(test)]
+                disk_check_threads: Mutex::new(Vec::new()),
                 fail_managed_lock: AtomicBool::new(false),
                 fail_managed_read: AtomicBool::new(false),
                 fail_managed_restamp: AtomicBool::new(false),
                 fail_checkpoint_lock: AtomicBool::new(false),
+                #[cfg(test)]
+                fail_checkpoint_lock_countdown: std::sync::atomic::AtomicU64::new(0),
             }),
         };
         assert!(matches!(

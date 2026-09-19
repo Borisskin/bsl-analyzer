@@ -13,6 +13,7 @@ mod key_carriers;
 mod lexical;
 mod local_baseline;
 mod merge;
+mod point_refresh;
 mod ports;
 mod publish;
 mod resolved_view_search;
@@ -42,10 +43,11 @@ pub use domain::{
 };
 pub use embedder::{Embedder, EmbedderConfig};
 pub use engine::{
-    FenceOutcome, FtsIngest, IndexProgress, OverlayRetrySignals, ReferenceCollectionReplaceOutcome,
-    SearchConfig, SearchEngine, SearchHit, ValidatedWorkspaceOverlayPublication,
-    ValidatedWorkspaceRootsTransitionPlan, WorkspaceRootsTransitionOutcome,
-    WorkspaceRootsTransitionPlan, WorkspaceRootsTransitionSeed, WORKSPACE_APPLY_BATCH_ROWS,
+    workspace_file_key_in, CarrierCapture, CarrierSnapshot, FenceOutcome, FtsIngest, IndexProgress,
+    OverlayRetrySignals, ReferenceCollectionReplaceOutcome, SearchConfig, SearchEngine, SearchHit,
+    ValidatedWorkspaceOverlayPublication, ValidatedWorkspaceRootsTransitionPlan,
+    WorkspaceOverlayDebt, WorkspaceRootsTransitionOutcome, WorkspaceRootsTransitionPlan,
+    WorkspaceRootsTransitionSeed, WORKSPACE_APPLY_BATCH_ROWS,
 };
 pub use error::SearchError;
 pub use error::SCHEMA_VERSION_CURRENT;
@@ -64,6 +66,10 @@ pub use local_baseline::LocalStoreBaselineAdapter;
 pub use merge::{
     build_merge_context, merge_context_for_collection, merge_lexical, merge_semantic, HitSource,
     MergeContext, MergedHit,
+};
+pub use point_refresh::{
+    BoundedPublication, PointCapture, PointPublish, PreparedPointBatch, C_BUSY_TIMEOUT,
+    POINT_BATCH_KEYS, PREPARED_BYTES,
 };
 pub use ports::{
     BaselineLexicalSearch, BaselineManifestFile, BaselineSemanticSearch, EmbeddingGenerator,

@@ -99,14 +99,19 @@ fn retire_registration(
 pub(super) fn retry_resident_holes(
     resident: &mut DiagnosticsResident,
     config_is_current: bool,
+    only: Option<&str>,
 ) -> (Vec<(String, Option<u64>)>, Vec<String>) {
     use base_db::{SourceDatabase, SourceRoot};
     use ide_host_core::{set_file_text_source, FileTextSource, VfsWrite};
 
     let mut healed = Vec::new();
     let mut vanished = Vec::new();
-    let candidates: Vec<(String, HoleOrigin)> =
-        resident.holes.iter().map(|(k, o)| (k.clone(), *o)).collect();
+    let candidates: Vec<(String, HoleOrigin)> = resident
+        .holes
+        .iter()
+        .filter(|(key, _)| only.is_none_or(|wanted| wanted == key.as_str()))
+        .map(|(k, o)| (k.clone(), *o))
+        .collect();
 
     let mut file_set = {
         let db = &resident.db;
@@ -316,6 +321,13 @@ impl DiagnosticsResident {
     /// existing file, and replacing the old lie ("the file is clean") with a new one
     /// is not the point of holding it out of service.
     pub(crate) fn is_unread(&self, path: &Path) -> bool {
+        self.hole_key_of(path).is_some()
+    }
+
+    /// The hole this path names, in the spelling the hole list is keyed by; `None` when the
+    /// path is not being held out of service. One resolution for both questions: a caller
+    /// that heals what an answer calls unreadable has to name the same file.
+    pub(super) fn hole_key_of(&self, path: &Path) -> Option<String> {
         let resolved;
         let abs: &Path = if path.is_absolute() {
             path
@@ -323,7 +335,8 @@ impl DiagnosticsResident {
             resolved = self.workspace_root.join(path);
             &resolved
         };
-        self.holes.contains_key(&canonical_key(abs))
+        let key = canonical_key(abs);
+        self.holes.contains_key(&key).then_some(key)
     }
 
     /// How many workspace `.bsl` files exist but could not be read.

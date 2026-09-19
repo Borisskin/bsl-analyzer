@@ -13,7 +13,7 @@ use crate::baseline::{BaselineCall, ConfiguredBaselineStatus, ExternalBaselineSe
 use bsl_search::{lexical_hits_for_resolved_view, SearchEngine, SearchError};
 use rmcp::model::CallToolResult;
 use rmcp::ErrorData as McpError;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, MutexGuard};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -32,7 +32,7 @@ fn unless_withdrawn<R>(
 /// The engine guard for one docs call, or the answer to give instead. A stalled lock is
 /// answered with the retry envelope: the index is there, it is merely held.
 fn engine_guard<'a>(
-    engine: &'a Arc<Mutex<Option<SearchEngine>>>,
+    engine: &'a crate::state::SharedSearchEngine,
     cancel: &CancellationToken,
     action: &str,
 ) -> Result<Result<MutexGuard<'a, Option<SearchEngine>>, CallToolResult>, SearchFailure> {
@@ -45,7 +45,7 @@ fn engine_guard<'a>(
 }
 
 pub fn find_docs(
-    engine: &Arc<Mutex<Option<SearchEngine>>>,
+    engine: &crate::state::SharedSearchEngine,
     cancel: &CancellationToken,
     configured_baseline: Option<&ConfiguredBaselineStatus>,
     external_baseline: Option<Arc<ExternalBaselineService>>,
@@ -77,7 +77,7 @@ pub fn find_docs(
                         .into_response("find_docs"));
                 }
                 Ok(_) => {
-                    return Ok(no_hits_response(None, Envelope::No, "find_docs"));
+                    return Ok(no_hits_response(None, Envelope::No, "find_docs", None));
                 }
                 Err(error) => {
                     if error.is_terminal() {
@@ -100,7 +100,7 @@ pub fn find_docs(
                 if !hits.is_empty() {
                     return Ok(format_doc_hits(&hits, max_output_tokens).into_response("find_docs"));
                 }
-                return Ok(no_hits_response(None, Envelope::No, "find_docs"));
+                return Ok(no_hits_response(None, Envelope::No, "find_docs", None));
             }
         }
     }
@@ -113,7 +113,7 @@ pub fn find_docs(
         .map_err(|e| McpError::internal_error(format!("search error: {e}"), None))?;
 
     if hits.is_empty() {
-        return Ok(no_hits_response(None, Envelope::No, "find_docs"));
+        return Ok(no_hits_response(None, Envelope::No, "find_docs", None));
     }
 
     Ok(format_doc_hits(&hits, max_output_tokens).into_response("find_docs"))
@@ -128,7 +128,7 @@ fn semantic_not_available() -> McpError {
 }
 
 pub fn search_docs(
-    engine: &Arc<Mutex<Option<SearchEngine>>>,
+    engine: &crate::state::SharedSearchEngine,
     cancel: &CancellationToken,
     configured_baseline: Option<&ConfiguredBaselineStatus>,
     external_baseline: Option<Arc<ExternalBaselineService>>,
@@ -222,7 +222,7 @@ pub fn search_docs(
                 );
             }
             Ok(_) => {
-                return Ok(no_hits_response(None, Envelope::No, "search_docs"));
+                return Ok(no_hits_response(None, Envelope::No, "search_docs", None));
             }
             Err(error) => {
                 if error.is_terminal() {
@@ -244,7 +244,7 @@ pub fn search_docs(
         .map_err(|e| McpError::internal_error(format!("search error: {e}"), None))?;
 
     if hits.is_empty() {
-        return Ok(no_hits_response(None, Envelope::No, "search_docs"));
+        return Ok(no_hits_response(None, Envelope::No, "search_docs", None));
     }
 
     Ok(format_doc_hits(&hits, max_output_tokens).into_response("search_docs"))
@@ -259,7 +259,7 @@ mod tests {
     use bsl_search::{BaselineRef, CorpusId, SearchEngine};
     use rmcp::model::ErrorCode;
     use serde_json::json;
-    use std::sync::{Arc, Mutex};
+
     use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;
 
@@ -279,7 +279,7 @@ mod tests {
         engine.index_documents("platform", "platform/Массив", b"v1", &[document], None).unwrap();
 
         let result = find_docs(
-            &Arc::new(Mutex::new(Some(engine))),
+            &crate::state::shared_engine(Some(engine)),
             &never(),
             None,
             None,
@@ -330,7 +330,7 @@ mod tests {
         engine.index_documents("platform", "platform/property", b"v1", &[document], None).unwrap();
 
         let result = find_docs(
-            &Arc::new(Mutex::new(Some(engine))),
+            &crate::state::shared_engine(Some(engine)),
             &never(),
             None,
             None,
@@ -373,7 +373,7 @@ mod tests {
             .unwrap();
 
         let result = search_docs(
-            &Arc::new(Mutex::new(Some(engine))),
+            &crate::state::shared_engine(Some(engine)),
             &never(),
             None,
             None,
@@ -395,9 +395,16 @@ mod tests {
         let db_path = dir.path().join("reference-search.db");
         let engine = SearchEngine::fts_only(&db_path).unwrap();
 
-        let building =
-            find_docs(&Arc::new(Mutex::new(None)), &never(), None, None, "Массив", 10, usize::MAX)
-                .unwrap();
+        let building = find_docs(
+            &crate::state::shared_engine(None),
+            &never(),
+            None,
+            None,
+            "Массив",
+            10,
+            usize::MAX,
+        )
+        .unwrap();
         assert_eq!(
             building.content[0].as_text().expect("text").text,
             "Search index is being built, please try again in a moment.",
@@ -407,7 +414,7 @@ mod tests {
         assert_eq!(building_body["retry_after_ms"], 1500);
 
         let empty = find_docs(
-            &Arc::new(Mutex::new(Some(engine))),
+            &crate::state::shared_engine(Some(engine)),
             &never(),
             None,
             None,
@@ -443,7 +450,7 @@ mod tests {
         );
 
         let error = search_docs(
-            &Arc::new(Mutex::new(Some(engine))),
+            &crate::state::shared_engine(Some(engine)),
             &never(),
             None,
             Some(source),
@@ -465,7 +472,7 @@ mod tests {
         let engine = SearchEngine::fts_only(&db_path).unwrap();
 
         let error = find_docs(
-            &Arc::new(Mutex::new(Some(engine))),
+            &crate::state::shared_engine(Some(engine)),
             &never(),
             Some(&ConfiguredBaselineStatus {
                 backend: "postgres",
@@ -500,7 +507,7 @@ mod tests {
         let engine = SearchEngine::fts_only(&db_path).unwrap();
 
         let error = search_docs(
-            &Arc::new(Mutex::new(Some(engine))),
+            &crate::state::shared_engine(Some(engine)),
             &never(),
             Some(&ConfiguredBaselineStatus {
                 backend: "postgres",
@@ -548,7 +555,7 @@ mod tests {
         );
 
         let result = search_docs(
-            &Arc::new(Mutex::new(Some(engine))),
+            &crate::state::shared_engine(Some(engine)),
             &never(),
             None,
             Some(source),

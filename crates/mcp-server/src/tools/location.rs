@@ -412,6 +412,41 @@ freshness_source! {
     NameDictionary => "name-dictionary";
 }
 
+/// Who is watching the workspace for the source that answered, and how.
+///
+/// `stale` says whether the answer is known to be behind; this says what that verdict rests
+/// on. A source nobody watches cannot know it is behind, so its answer is never called fresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriftWatch {
+    /// The source's watcher has not finished its first look at the workspace.
+    Starting,
+    /// Every change the watch delivers reaches the source.
+    Watching,
+    /// Nothing could be watched, or part of the workspace cannot: changes are found by a
+    /// periodic walk and a rolling content check, and can take up to one of its cycles.
+    Polling,
+    /// The source's watcher has stopped: changes since then go unnoticed.
+    Unobserved,
+}
+
+impl DriftWatch {
+    pub const ALL: &'static [Self] =
+        &[Self::Starting, Self::Watching, Self::Polling, Self::Unobserved];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Watching => "watching",
+            Self::Polling => "polling",
+            Self::Unobserved => "unobserved",
+        }
+    }
+
+    pub fn vocabulary() -> String {
+        joined(Self::ALL.iter().map(|watch| watch.as_str()))
+    }
+}
+
 /// The envelope every tool of the contract carries: what answered, at which revision
 /// and topology, whether it had drifted, and whether the answer is whole.
 ///
@@ -426,11 +461,26 @@ pub struct Freshness {
     pub topology_fingerprint: Option<u64>,
     pub stale: Option<bool>,
     pub completeness: Completeness,
+    /// Written only by the sources that follow the workspace themselves — the graph and
+    /// the workspace search index. Every other envelope stays byte-identical.
+    pub drift_watch: Option<DriftWatch>,
 }
 
 impl Freshness {
     pub fn new(source: FreshnessSource, completeness: Completeness) -> Self {
-        Self { source, revision: None, topology_fingerprint: None, stale: None, completeness }
+        Self {
+            source,
+            revision: None,
+            topology_fingerprint: None,
+            stale: None,
+            completeness,
+            drift_watch: None,
+        }
+    }
+
+    pub fn with_drift_watch(mut self, watch: DriftWatch) -> Self {
+        self.drift_watch = Some(watch);
+        self
     }
 
     pub fn with_revision(mut self, revision: u64) -> Self {
@@ -449,7 +499,7 @@ impl Freshness {
     }
 
     pub fn to_value(&self) -> Value {
-        json!({
+        let mut value = json!({
             "source": self.source.as_str(),
             "revision": self.revision,
             // Hex rather than a JSON number: the value is a u64 and a JS consumer
@@ -457,7 +507,11 @@ impl Freshness {
             "topology_fingerprint": self.topology_fingerprint.map(|fp| format!("{fp:016x}")),
             "stale": self.stale,
             "completeness": self.completeness.to_value(),
-        })
+        });
+        if let Some(watch) = self.drift_watch {
+            value["drift_watch"] = json!(watch.as_str());
+        }
+        value
     }
 }
 
@@ -704,6 +758,14 @@ mod tests {
             );
         }
 
+        for watch in DriftWatch::ALL {
+            assert!(
+                envelope.contains(&format!("`{}`", watch.as_str())),
+                "{} can appear in an envelope but the envelope section does not name it",
+                watch.as_str(),
+            );
+        }
+
         let mut seen = std::collections::BTreeSet::new();
         for reason in ReasonCode::ALL {
             assert!(seen.insert(reason.as_str()), "two reasons share the code {}", reason.as_str());
@@ -739,6 +801,20 @@ mod tests {
         assert!(value["revision"].is_null());
         assert!(value["topology_fingerprint"].is_null());
         assert!(value["stale"].is_null());
+    }
+
+    /// The drift watch is written only where a source set it: an envelope of any other source
+    /// is the same bytes it always was.
+    #[test]
+    fn the_drift_watch_is_written_only_where_it_is_set() {
+        let plain = Freshness::new(FreshnessSource::Resident, Completeness::complete()).to_value();
+        assert!(plain.get("drift_watch").is_none(), "{plain}");
+        assert_eq!(plain.as_object().unwrap().len(), 5);
+
+        let watched = Freshness::new(FreshnessSource::Graph, Completeness::complete())
+            .with_drift_watch(DriftWatch::Polling)
+            .to_value();
+        assert_eq!(watched["drift_watch"], "polling");
     }
 
     #[test]

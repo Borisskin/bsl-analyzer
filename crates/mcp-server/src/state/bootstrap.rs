@@ -82,12 +82,13 @@ impl ReferenceSearchState {
             },
         };
         Self {
-            engine: Arc::new(Mutex::new(None)),
+            engine: super::shared_engine(None),
             progress: IndexProgress::new(),
             semantic_runtime: Arc::new(Mutex::new(SemanticRuntimeStatus::Disabled)),
             baseline,
             lifecycle: Arc::new(Mutex::new(lifecycle)),
             stopped: Arc::new(AtomicBool::new(false)),
+            stop: super::OwnerStop::default(),
             worker: Arc::new(Mutex::new(None)),
         }
     }
@@ -148,11 +149,37 @@ impl ReferenceSearchState {
                             &engine,
                             &WorkspaceSearchMode::SqliteLocal,
                         );
-                        if let Ok(mut slot) = state.engine.lock() {
-                            *slot = Some(engine);
+                        // `Ready` is the claim that the engine is in the slot, so it is made
+                        // only where the engine reaches it. A refused admission — the daemon
+                        // stopping, or a poisoned slot — published nothing, and saying ready
+                        // over an empty slot sends every reader to a profile that cannot
+                        // answer.
+                        match state.engine.acquire_for_owner(&state.stop) {
+                            Ok(mut slot) => {
+                                *slot = Some(engine);
+                                SharedState::set_semantic_runtime_status(
+                                    &state.semantic_runtime,
+                                    status,
+                                );
+                                *lifecycle = ReferenceSearchLifecycle::Ready;
+                            }
+                            Err(error) => {
+                                let message =
+                                    format!("reference search engine was not published: {error}");
+                                SharedState::set_semantic_runtime_status(
+                                    &state.semantic_runtime,
+                                    SemanticRuntimeStatus::Failed(message.clone()),
+                                );
+                                // The worker ended without putting an engine in the slot, which
+                                // is what this code has always named. A new one would reach
+                                // `find_docs`/`search_docs` callers as `data.reasonCode`, and
+                                // the reference profile is frozen.
+                                *lifecycle = ReferenceSearchLifecycle::Failed {
+                                    message,
+                                    reason_code: "worker_gone".to_owned(),
+                                };
+                            }
                         }
-                        SharedState::set_semantic_runtime_status(&state.semantic_runtime, status);
-                        *lifecycle = ReferenceSearchLifecycle::Ready;
                     }
                     Err((message, reason_code)) => {
                         SharedState::set_semantic_runtime_status(
@@ -200,13 +227,18 @@ impl ReferenceSearchState {
 
     pub(super) fn shutdown(&self) {
         self.stopped.store(true, Ordering::Release);
+        // The same call for both: the flag the worker reads between steps, and the release of
+        // any wait it is already in.
+        self.stop.stop();
         self.baseline.shutdown();
         if let Some(worker) =
             self.worker.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take()
         {
             let _ = worker.join();
         }
-        if let Ok(mut engine) = self.engine.lock() {
+        // The daemon is going and every owner has been told to leave, so the only hold left
+        // to wait on is a request's. This is the one acquisition no stop can call off.
+        if let Ok(mut engine) = self.engine.take_for_shutdown() {
             *engine = None;
         }
     }
@@ -291,13 +323,6 @@ impl SharedState {
     ) -> Result<Self, WorkspaceInitError> {
         let project = crate::project::at(&source_dir)?;
         let source_root = project.configuration_path().map(Path::to_path_buf);
-        let notices: Vec<String> =
-            [project.standalone_extension_notice(), project.standalone_external_notice()]
-                .into_iter()
-                .flatten()
-                .collect();
-        let standalone_notice = (!notices.is_empty()).then(|| notices.join("\n"));
-
         // One value, used by everything that reads the tree: the watch, the walk that
         // feeds the graph and the search index, and the roots the engine registers. Two
         // derivations of "where my cache is" would be two chances to disagree, and a
@@ -345,7 +370,7 @@ impl SharedState {
             &crate::project::workspace_roots(&project, &cache_exclusions).1,
         );
 
-        let search_engine: SharedSearchEngine = Arc::new(Mutex::new(None));
+        let search_engine: SharedSearchEngine = super::shared_engine(None);
         let workspace_search_initializing = Arc::new(AtomicBool::new(true));
         let index_progress = IndexProgress::new();
         let semantic_runtime = Arc::new(Mutex::new(SemanticRuntimeStatus::Disabled));
@@ -404,6 +429,18 @@ impl SharedState {
         // On each graph publish/adopt (on the graph's own background thread) re-render the
         // search chunks marked context-dirty by an `.xml` drift, now that the graph has
         // caught up. Captures only shared handles; the closure never runs on a query path.
+        // The daemon's one stop, created before the first owner that needs it: the retry
+        // driver, the publish hook, the consumer and the backlog owner all take it, and every
+        // wait any of them makes is released by the one call that raises it.
+        let owners = super::OwnerStop::default();
+        {
+            // The hub's wait returns on a new generation, on `closing`, or on its caller's own
+            // predicate — never on a bare wake. So the stop sets `closing`: without it an owner
+            // parked on the hub sleeps out its whole timeout after the daemon has gone.
+            let hub = change_hub.clone();
+            owners.wakes(move || hub.interrupt_waiters());
+        }
+
         // The overlay retry driver exists only where an Embed pass exists: Postgres mode
         // with an embedder. It is created before the graph hook so a root transition can kick
         // the SAME owner; no second warmup worker is introduced.
@@ -412,6 +449,7 @@ impl SharedState {
                 if Self::embedding_config().is_some() {
                     Some(super::overlay_retry::OverlayRetry::spawn(
                         Arc::clone(&search_engine),
+                        owners.clone(),
                         Arc::clone(&overlay_warmup),
                         Arc::clone(&semantic_runtime),
                         workspace_lease.clone(),
@@ -436,6 +474,7 @@ impl SharedState {
         let root_drift_epoch = Arc::new(AtomicU64::new(0));
         let publish_hook = Self::build_publish_hook(
             Arc::clone(&search_engine),
+            owners.clone(),
             cache.clone(),
             Arc::clone(&semantic_runtime),
             Arc::clone(&index_progress),
@@ -448,7 +487,14 @@ impl SharedState {
         let graph = GraphState::for_workspace_with_cache(source_dir.clone(), cache.clone())
             .with_change_hub(change_hub.clone())
             .with_publish_hook(publish_hook)
-            .with_lease(workspace_lease.clone());
+            .with_lease(workspace_lease.clone())
+            .with_owner_stop(owners.clone());
+        // A test that has to ask a handler what it answers while the graph is genuinely
+        // unconsulted takes the first build here, where the graph exists and no thread this
+        // boot starts has run yet. It then holds production's own single flight, and every
+        // other claimant is refused the way any losing one is.
+        #[cfg(test)]
+        crate::graph::test_support::hold_the_first_build(&graph);
 
         // The `metadata` tool reads the resident diagnostics host (per-MDO substrate for
         // `object`, Channel-2 `load_configuration` for `tree`/`info`); it is seeded and
@@ -466,6 +512,26 @@ impl SharedState {
         // to feed it from; the lease rides along so the cursor is released on every way out
         // that does not end in a running sink — including this spawn failing, where the
         // closure is dropped unrun.
+        // Seeded from the project this boot has just parsed, so there is no "not computed
+        // yet"; the graph watcher keeps it current from here on.
+        let standalone_notice_slot = Arc::new(Mutex::new(super::StandaloneNotice::tracked(
+            super::standalone_notice_of(&project),
+        )));
+        let overlay_backlog = super::overlay_backlog::OverlayBacklog::default();
+        {
+            // The backlog owner parks on a signal of its own, so the stop has to reach it too.
+            let backlog = overlay_backlog.clone();
+            owners.wakes(move || backlog.stop());
+        }
+        let search_consumer = Arc::new(Mutex::new(super::ConsumerPhase::Pending));
+        // Started before the thread that builds the graph exists, so the watcher's cursor
+        // predates the first pre-scan and no change can fall between the two.
+        crate::graph::watcher::start(
+            &graph,
+            &change_hub,
+            Some((source_dir.clone(), Arc::clone(&standalone_notice_slot))),
+            owners.clone(),
+        );
         Self::spawn_workspace_search_init(
             Arc::clone(&search_engine),
             Arc::clone(&workspace_search_initializing),
@@ -483,13 +549,16 @@ impl SharedState {
             overlay_retry.clone(),
             Arc::clone(&root_drift_epoch),
             embedding_publish_retry_budget,
+            owners.clone(),
+            overlay_backlog.clone(),
+            Arc::clone(&search_consumer),
         );
 
         let reference_search = ReferenceSearchState::new(Some(&source_dir));
         Ok(Self {
             workspace_root: Some(source_dir),
             source_root,
-            standalone_notice,
+            standalone_notice: standalone_notice_slot,
             onec_client: None,
             onec_connections: Default::default(),
             debug_session: Arc::new(Mutex::new(None)),
@@ -508,6 +577,9 @@ impl SharedState {
             workspace_lease,
             overlay_retry,
             tasks: rmcp::task_manager::TaskManager::new(),
+            owners,
+            overlay_backlog,
+            search_consumer,
         })
     }
 
@@ -533,8 +605,15 @@ impl SharedState {
         overlay_retry: Option<Arc<super::overlay_retry::OverlayRetry>>,
         root_drift_epoch: Arc<AtomicU64>,
         embedding_publish_retry_budget: std::time::Duration,
+        owners: super::OwnerStop,
+        overlay_backlog: super::overlay_backlog::OverlayBacklog,
+        search_consumer: Arc<Mutex<super::ConsumerPhase>>,
     ) {
         let initializing_for_thread = Arc::clone(&initializing);
+        // Every way out of the init that does not start the consumer abandons it — a thread
+        // that never started included: its cursor is released and nothing will feed the index.
+        let abandon =
+            super::AbandonIfStill(Arc::clone(&search_consumer), super::ConsumerPhase::Pending);
         let spawned = std::thread::Builder::new()
             .name("bsl-search-init".to_owned())
             .spawn(move || {
@@ -545,6 +624,7 @@ impl SharedState {
                     }
                 }
                 let _initializing = InitializingGuard(initializing_for_thread);
+                let _abandon = abandon;
                 tracing::info!("search engine initialization started in background");
 
                 // The graph is a boot subsystem like the resident, not a lazy one. In
@@ -585,6 +665,7 @@ impl SharedState {
                     external_baseline,
                     &graph,
                     &lease,
+                    &owners,
                 );
 
                 let mut init = match init {
@@ -631,38 +712,35 @@ impl SharedState {
                 };
 
                 // `context_dirty` persists across restarts, so a prior run may have left marks
-                // the boot build's (unwired) publish did not clear. Capture whether any survive
-                // AND the mark-seq high-water bound at THIS instant — both read off the engine
-                // BEFORE it moves into the shared handle. The captured bound is what the leftover
-                // consume clears against: it predates any drift the now-running search sink may
-                // stamp after this point, so those newer marks (higher seq) are excluded and left
-                // to their own nudge→publish cycle rather than cleared against the boot graph. The
-                // consume itself runs AFTER the move so the publish hook can read the published
-                // engine.
+                // nothing of this run placed. Capture whether any survive AND the mark
+                // high-water at THIS instant — both read off the engine BEFORE it moves into the
+                // shared handle, and before the search consumer can stamp a mark of its own.
+                // They predate every fact this run's hub delivers, so they are handed to the
+                // graph as fact `0` once the engine is published and the hook can reach it.
                 let has_leftover_marks =
                     init.engine.context_dirty_paths("code").map(|m| !m.is_empty()).unwrap_or(false);
                 let leftover_bound = init.engine.mark_seq_handle().load(Ordering::SeqCst);
 
                 // Wire the resident snapshot source so the overlay reindex can read text+parse
                 // from the shared resident host. Set before publish so the first query already
-                // sees it; the resident read itself is prefetched off the engine lock by
-                // `prefetch_resident_overlay`, so the two locks never nest.
+                // sees it; the resident read itself happens in a point refresh's phase B, off the
+                // engine lock, so the two locks never nest.
                 init.engine.set_module_snapshot_source(snapshot_source);
 
                 // Bring the workspace overlay online BEFORE publishing. The overlay is inert until
-                // initialized (`reindex_dirty_from_snapshots` no-ops on `!initialized`), so the
+                // initialized (a point refresh captures nothing before that), so the
                 // resident-fed incremental reindex — and overlay edit-freshness generally — is
                 // unreachable in local SQLite mode without this. Done here, on the still-owned
                 // engine, so it holds NO engine lock: `Prime`'s disk scan must not serialize behind
                 // the shared lock (I3), and the cold FTS branch already indexes disk before
                 // publishing, so a warm prime delays publish no differently.
                 let overlay_result = match init.overlay_init {
-                    OverlayInit::Clean => Self::startup_apply_once(&lease, || {
+                    OverlayInit::Clean => Self::startup_apply_once(&lease, &owners, || {
                         init.engine.initialize_workspace_overlay_clean()
                     }),
                     OverlayInit::Prime => match init
                         .engine
-                        .prime_workspace_overlay_fenced(|apply| Self::startup_apply(&lease, apply))
+                        .prime_workspace_overlay_fenced(|apply| Self::startup_apply(&lease, &owners, apply))
                     {
                         Ok(bsl_search::FenceOutcome::Applied(())) => Ok(Some(())),
                         Ok(bsl_search::FenceOutcome::TransientRefusal) => {
@@ -700,28 +778,35 @@ impl SharedState {
                 // Host publication follows the long-lived order used by incremental mutations:
                 // engine mutex first, then the lease lifecycle mutex and file lock inside the
                 // callback. Status becomes visible in the same admitted group as the engine.
-                let mut guard = match search_engine.lock() {
-                    Ok(guard) => guard,
-                    Err(error) => {
-                        Self::set_semantic_runtime_status(
-                            &semantic_runtime,
-                            SemanticRuntimeStatus::Failed(format!(
-                                "workspace search engine lock error: {error}"
-                            )),
-                        );
-                        return;
-                    }
-                };
-                let published = Self::startup_apply_once(&lease, || {
-                    graph.set_mark_seq_source(init.engine.mark_seq_handle());
-                    *guard = Some(init.engine);
-                    Self::set_semantic_runtime_status(&semantic_runtime, status_after_publish);
-                    Ok(())
-                });
-                drop(guard);
+                let mut engine_to_publish = Some(init.engine);
+                let mut status_to_set = Some(status_after_publish);
+                let published = Self::publish_engine_with_retry(
+                    &search_engine,
+                    &owners,
+                    |slot| {
+                        Self::search_fence_outcome(lease.publish_short(&mut (), |_| {
+                            *slot = engine_to_publish.take();
+                            if let Some(status) = status_to_set.take() {
+                                Self::set_semantic_runtime_status(&semantic_runtime, status);
+                            }
+                            Ok(())
+                        }))
+                    },
+                    std::time::Instant::now,
+                    |delay| owners.sleep(delay),
+                );
                 match published {
                     Ok(Some(())) => {}
                     Ok(None) => {
+                        // Superseded, handed over, or told to go. Leaving is not failing: the
+                        // stop gets the terminal status the embed pass already writes for it,
+                        // and a takeover writes nothing over the owner that won.
+                        if owners.is_stopped() {
+                            Self::set_semantic_runtime_status(
+                                &semantic_runtime,
+                                SemanticRuntimeStatus::Stopped,
+                            );
+                        }
                         if let Some(retry) = &overlay_retry {
                             retry.disarm();
                         }
@@ -738,22 +823,39 @@ impl SharedState {
 
                 graph.ensure_loading();
 
-                // Only now, and only if the watch is up: the sink drains into the published
-                // engine, and a sink started before this point would drop every batch it
-                // read into an engine that was not there yet.
-                if init.watch_armed {
-                    if let Some(cursor) = sink_lease.cursor() {
-                        if Self::spawn_search_sink(
-                            change_hub.clone(),
-                            cursor,
-                            Arc::clone(&search_engine),
-                            graph.clone(),
-                            overlay_retry.clone(),
-                            Arc::clone(&root_drift_epoch),
-                            lease.clone(),
-                        ) {
-                            sink_lease.handed_over();
-                        }
+                // Only now: the consumer drains into the published engine, and one started
+                // before this point would drop every batch it read into an engine that was
+                // not there yet. Whatever became of the watch — armed, polling, or still
+                // arming — the cursor has been collecting since the boot subscribed it.
+                if !overlay_backlog.start(
+                    Arc::clone(&search_engine),
+                    lease.clone(),
+                    overlay_retry.clone(),
+                    owners.clone(),
+                ) {
+                    // The marks still get placed; what is missing is the owner that reads
+                    // them back. That state is reported — the backlog says `Stopped` and
+                    // every search answer carries the degraded reason — but it is worth
+                    // saying once in the log too, because nothing will start this owner
+                    // again for the life of the daemon.
+                    tracing::warn!(
+                        "the overlay backlog owner could not start; changed files stay unread                          and search answers degrade until the daemon restarts"
+                    );
+                }
+                if let Some(cursor) = sink_lease.cursor() {
+                    if Self::spawn_search_sink(
+                        change_hub.clone(),
+                        cursor,
+                        Arc::clone(&search_engine),
+                        graph.clone(),
+                        overlay_retry.clone(),
+                        Arc::clone(&root_drift_epoch),
+                        lease.clone(),
+                        owners.clone(),
+                        overlay_backlog.clone(),
+                        Arc::clone(&search_consumer),
+                    ) {
+                        sink_lease.handed_over();
                     }
                 }
 
@@ -766,8 +868,7 @@ impl SharedState {
                 // The publish that followed could not hand the request anywhere, so it is
                 // honoured here — otherwise files the build skipped as byte-identical keep the
                 // contexts they were given under the old topology.
-                graph.flush_pending_topology_refresh();
-                graph.flush_pending_search_roots_refresh();
+                graph.flush_hook_obligations();
 
                 tracing::info!("search engine initialization complete");
 
@@ -777,6 +878,7 @@ impl SharedState {
                     // picked up by boot's rerun loop) instead of racing a second index swap.
                     Self::spawn_embed_pass(
                         Arc::clone(&search_engine),
+                        owners.clone(),
                         Arc::clone(&semantic_runtime),
                         Arc::clone(&index_progress),
                         Arc::clone(&embed_flight),
@@ -814,7 +916,7 @@ impl SharedState {
         Self {
             workspace_root: None,
             source_root: None,
-            standalone_notice: None,
+            standalone_notice: Arc::new(Mutex::new(super::StandaloneNotice::default())),
             onec_client: None,
             onec_connections: Default::default(),
             debug_session: Arc::new(Mutex::new(None)),
@@ -833,6 +935,9 @@ impl SharedState {
             workspace_lease: crate::workspace_lease::WorkspaceLease::unmanaged(),
             overlay_retry: None,
             tasks: rmcp::task_manager::TaskManager::new(),
+            owners: super::OwnerStop::default(),
+            overlay_backlog: Default::default(),
+            search_consumer: Arc::new(Mutex::new(super::ConsumerPhase::Stopped)),
         }
     }
 
@@ -841,11 +946,11 @@ impl SharedState {
         Self {
             workspace_root: None,
             source_root: None,
-            standalone_notice: None,
+            standalone_notice: Arc::new(Mutex::new(super::StandaloneNotice::default())),
             onec_client: None,
             onec_connections: Default::default(),
             debug_session: Arc::new(Mutex::new(None)),
-            search_engine: Arc::new(Mutex::new(None)),
+            search_engine: super::shared_engine(None),
             workspace_search_initializing: Arc::new(AtomicBool::new(false)),
             embed_flight: EmbedFlight::new(),
             index_progress: IndexProgress::new(),
@@ -860,6 +965,9 @@ impl SharedState {
             workspace_lease: crate::workspace_lease::WorkspaceLease::unmanaged(),
             overlay_retry: None,
             tasks: rmcp::task_manager::TaskManager::new(),
+            owners: super::OwnerStop::default(),
+            overlay_backlog: Default::default(),
+            search_consumer: Arc::new(Mutex::new(super::ConsumerPhase::Stopped)),
         }
     }
 
@@ -978,17 +1086,21 @@ impl SharedState {
 
     pub(super) fn startup_apply<T>(
         lease: &crate::workspace_lease::WorkspaceLease,
+        stop: &super::OwnerStop,
         mut apply: impl FnMut() -> Result<T, bsl_search::SearchError>,
     ) -> bsl_search::FenceOutcome<Result<T, bsl_search::SearchError>> {
         Self::startup_retry(
             || Self::search_fence_outcome(lease.publish_short(&mut (), |_| apply())),
             std::time::Instant::now,
-            std::thread::sleep,
+            // The boot is an owner like any other: its pauses end when the daemon stops, and
+            // it leaves instead of trying again.
+            |delay| stop.sleep(delay),
         )
     }
 
     pub(super) fn startup_apply_checkpointed(
         lease: &crate::workspace_lease::WorkspaceLease,
+        stop: &super::OwnerStop,
         mut apply: impl FnMut(
             &mut dyn FnMut() -> std::ops::ControlFlow<()>,
         ) -> std::ops::ControlFlow<(), Result<(), bsl_search::SearchError>>,
@@ -1000,14 +1112,18 @@ impl SharedState {
                 )
             },
             std::time::Instant::now,
-            std::thread::sleep,
+            |delay| stop.sleep(delay),
         )
     }
 
+    /// `sleep` answers whether the daemon stopped while it waited. A pause that ends because
+    /// the daemon is leaving is not a pause to retry after: the boot has nothing left to
+    /// publish, and a loop that ignored the answer would spend its whole budget in an instant
+    /// — `stop.sleep` returns at once once the stop is raised.
     fn startup_retry<T>(
         mut attempt: impl FnMut() -> bsl_search::FenceOutcome<Result<T, bsl_search::SearchError>>,
         mut now: impl FnMut() -> std::time::Instant,
-        mut sleep: impl FnMut(std::time::Duration),
+        mut sleep: impl FnMut(std::time::Duration) -> bool,
     ) -> bsl_search::FenceOutcome<Result<T, bsl_search::SearchError>> {
         use super::retry_window::{RetryDecision, RetryOwner, RetryWindow};
 
@@ -1016,7 +1132,13 @@ impl SharedState {
             match attempt() {
                 bsl_search::FenceOutcome::TransientRefusal => {
                     match retry.refused(now(), std::time::Duration::from_secs(2)) {
-                        RetryDecision::RetryAfter(delay) => sleep(delay),
+                        RetryDecision::RetryAfter(delay) => {
+                            if sleep(delay) {
+                                // Left, not published: the same answer a handover gives, and
+                                // every caller already reads it as "nothing was written".
+                                return bsl_search::FenceOutcome::Released;
+                            }
+                        }
                         RetryDecision::Stop(_) => {
                             return bsl_search::FenceOutcome::Applied(Err(
                                 bsl_search::SearchError::Index(
@@ -1031,13 +1153,60 @@ impl SharedState {
         }
     }
 
+    /// Publish the engine into the shared slot, retrying the lease the way every startup
+    /// publication does — and holding the engine for the ATTEMPT only.
+    ///
+    /// The order the long-lived mutations use, engine mutex first and then the lease, is a
+    /// property of one attempt. The pause between attempts is not: a transient refusal means
+    /// another process holds the lease lock, and sleeping that out under the engine mutex
+    /// stops every graph publication, every mark consumption and every request that needs the
+    /// engine — for as long as the FOREIGN holder lasts. A request path cannot wait that out:
+    /// it is capped at thirty seconds and answers `TimedOut`.
+    fn publish_engine_with_retry(
+        shared: &super::SharedSearchEngine,
+        owners: &super::OwnerStop,
+        mut publish: impl FnMut(
+            &mut Option<bsl_search::SearchEngine>,
+        )
+            -> bsl_search::FenceOutcome<Result<(), bsl_search::SearchError>>,
+        now: impl FnMut() -> std::time::Instant,
+        sleep: impl FnMut(std::time::Duration) -> bool,
+    ) -> Result<Option<()>, bsl_search::SearchError> {
+        let outcome = Self::startup_retry(
+            || match shared.acquire_for_owner(owners) {
+                Ok(mut guard) => publish(&mut guard),
+                // Leaving is not failing. `Released` is what every caller already reads as
+                // "nothing was written", and it is what a handover answers too.
+                Err(crate::tools::search::OwnerLockRefused::Closing) => {
+                    bsl_search::FenceOutcome::Released
+                }
+                Err(error) => {
+                    bsl_search::FenceOutcome::Applied(Err(bsl_search::SearchError::Index(format!(
+                        "workspace search engine lock poisoned: {error}"
+                    ))))
+                }
+            },
+            now,
+            sleep,
+        );
+        match outcome {
+            bsl_search::FenceOutcome::Applied(Ok(())) => Ok(Some(())),
+            bsl_search::FenceOutcome::Applied(Err(error)) => Err(error),
+            bsl_search::FenceOutcome::Superseded | bsl_search::FenceOutcome::Released => Ok(None),
+            bsl_search::FenceOutcome::TransientRefusal => {
+                unreachable!("startup_retry retries transient refusals")
+            }
+        }
+    }
+
     fn startup_apply_once<T>(
         lease: &crate::workspace_lease::WorkspaceLease,
+        stop: &super::OwnerStop,
         operation: impl FnOnce() -> Result<T, bsl_search::SearchError>,
     ) -> Result<Option<T>, bsl_search::SearchError> {
         let mut operation = Some(operation);
         let mut value = None;
-        let outcome = Self::startup_apply(lease, || {
+        let outcome = Self::startup_apply(lease, stop, || {
             value = Some(operation.take().expect("startup apply runs once")()?);
             Ok(())
         });
@@ -1053,14 +1222,15 @@ impl SharedState {
 
     fn startup_apply_checkpointed_value<T>(
         lease: &crate::workspace_lease::WorkspaceLease,
+        stop: &super::OwnerStop,
         mut operation: impl FnMut(
             &mut dyn FnMut() -> std::ops::ControlFlow<()>,
         )
             -> std::ops::ControlFlow<(), Result<T, bsl_search::SearchError>>,
     ) -> Result<Option<T>, bsl_search::SearchError> {
         let mut value = None;
-        let outcome =
-            Self::startup_apply_checkpointed(lease, |checkpoint| match operation(checkpoint) {
+        let outcome = Self::startup_apply_checkpointed(lease, stop, |checkpoint| {
+            match operation(checkpoint) {
                 std::ops::ControlFlow::Break(()) => std::ops::ControlFlow::Break(()),
                 std::ops::ControlFlow::Continue(Err(error)) => {
                     std::ops::ControlFlow::Continue(Err(error))
@@ -1069,7 +1239,8 @@ impl SharedState {
                     value = Some(result);
                     std::ops::ControlFlow::Continue(Ok(()))
                 }
-            });
+            }
+        });
         match outcome {
             bsl_search::FenceOutcome::Applied(Ok(())) => Ok(value),
             bsl_search::FenceOutcome::Applied(Err(error)) => Err(error),
@@ -1083,13 +1254,14 @@ impl SharedState {
     fn open_search_engine_fenced(
         db_path: &Path,
         lease: &crate::workspace_lease::WorkspaceLease,
+        stop: &super::OwnerStop,
     ) -> Result<Option<SearchEngine>, bsl_search::SearchError> {
         let opened = match Self::embedding_config() {
             Some(config) => SearchEngine::new_fenced(db_path, config, |apply| {
-                Self::startup_apply_checkpointed(lease, apply)
+                Self::startup_apply_checkpointed(lease, stop, apply)
             }),
             None => SearchEngine::fts_only_fenced(db_path, |apply| {
-                Self::startup_apply_checkpointed(lease, apply)
+                Self::startup_apply_checkpointed(lease, stop, apply)
             }),
         }?;
         Ok(match opened {
@@ -1104,13 +1276,14 @@ impl SharedState {
     fn open_workspace_overlay_search_engine_fenced(
         db_path: &Path,
         lease: &crate::workspace_lease::WorkspaceLease,
+        stop: &super::OwnerStop,
     ) -> Result<Option<SearchEngine>, bsl_search::SearchError> {
         let opened = match Self::embedding_config() {
             Some(config) => SearchEngine::semantic_overlay_only_fenced(db_path, config, |apply| {
-                Self::startup_apply_checkpointed(lease, apply)
+                Self::startup_apply_checkpointed(lease, stop, apply)
             }),
             None => SearchEngine::fts_only_fenced(db_path, |apply| {
-                Self::startup_apply_checkpointed(lease, apply)
+                Self::startup_apply_checkpointed(lease, stop, apply)
             }),
         }?;
         Ok(match opened {
@@ -1119,6 +1292,27 @@ impl SharedState {
                 unreachable!("startup_apply retries transient refusals")
             }
             bsl_search::FenceOutcome::Superseded | bsl_search::FenceOutcome::Released => None,
+        })
+    }
+
+    /// Configure the engine and declare whether it serves an external baseline.
+    ///
+    /// Written as one named step because the two halves belong to different worlds: the
+    /// configuration mutates PROCESS state (`initialize_workspace_roots` refuses a second
+    /// table outright), while the declaration is a store transaction the startup retry may
+    /// roll back and run again. Keeping the configuration inside that retried closure is what
+    /// turns ordinary lock contention into `workspace roots are already initialized`.
+    fn configure_and_declare_baseline(
+        engine: &mut SearchEngine,
+        roots: bsl_search::WorkspaceRoots,
+        hash_mode: BaselineHashMode,
+        serves_external_baseline: bool,
+        lease: &crate::workspace_lease::WorkspaceLease,
+        stop: &super::OwnerStop,
+    ) -> Result<Option<()>, bsl_search::SearchError> {
+        Self::configure_workspace_engine(engine, roots, hash_mode)?;
+        Self::startup_apply_checkpointed_value(lease, stop, |checkpoint| {
+            engine.set_serves_external_baseline_checkpointed(serves_external_baseline, checkpoint)
         })
     }
 
@@ -1171,13 +1365,14 @@ impl SharedState {
     fn clear_baseline_manifest_best_effort(
         store: &bsl_search::Store,
         lease: &crate::workspace_lease::WorkspaceLease,
+        stop: &super::OwnerStop,
     ) {
-        let cleared = Self::startup_apply_checkpointed_value(lease, |checkpoint| {
-            match store.clear_baseline_manifest_checkpointed(checkpoint) {
-                Ok(std::ops::ControlFlow::Continue(())) => std::ops::ControlFlow::Continue(Ok(())),
-                Ok(std::ops::ControlFlow::Break(())) => std::ops::ControlFlow::Break(()),
-                Err(error) => std::ops::ControlFlow::Continue(Err(error)),
-            }
+        let cleared = Self::startup_apply_checkpointed_value(lease, stop, |checkpoint| match store
+            .clear_baseline_manifest_checkpointed(checkpoint)
+        {
+            Ok(std::ops::ControlFlow::Continue(())) => std::ops::ControlFlow::Continue(Ok(())),
+            Ok(std::ops::ControlFlow::Break(())) => std::ops::ControlFlow::Break(()),
+            Err(error) => std::ops::ControlFlow::Continue(Err(error)),
         });
         if let Err(error) = cleared {
             tracing::warn!("failed to clear stale workspace baseline manifest: {error}");
@@ -1198,6 +1393,7 @@ impl SharedState {
         external_baseline: Option<Arc<ExternalBaselineService>>,
         graph: &GraphState,
         lease: &crate::workspace_lease::WorkspaceLease,
+        stop: &super::OwnerStop,
     ) -> Result<Option<WorkspaceSearchInit>, bsl_search::SearchError> {
         // The graph carries the resolved cache layout, so this pass reads the tree
         // through the same hole the watch does instead of re-deriving where the cache is.
@@ -1205,10 +1401,19 @@ impl SharedState {
             .cache()
             .map(|cache| cache.spellings().iter().map(|path| path.to_path_buf()).collect())
             .unwrap_or_default();
-        let watch_armed = match watch {
-            Some((hub, policy)) => Self::await_watch(hub, policy),
-            None => false,
-        };
+        // Every read below is a baseline, so it waits for the watch first: from then on the
+        // stream covers everything after it. A hub that cannot watch polls instead, and its
+        // consumers reconcile once — either way the consumer below runs.
+        if let Some((hub, policy)) = watch {
+            Self::await_watch(hub, stop, policy);
+        }
+        // The wait above ends on a stop as readily as on an armed watch, and what follows is
+        // the whole boot: opening the store, walking the tree, indexing it. A daemon that has
+        // been told to go does none of that — the caller reads `None` as "nothing was
+        // published", which is exactly what happened.
+        if stop.is_stopped() {
+            return Ok(None);
+        }
         let cache = graph
             .cache()
             .cloned()
@@ -1246,32 +1451,32 @@ impl SharedState {
                 ));
             };
             let Some(mut engine) =
-                Self::open_workspace_overlay_search_engine_fenced(&db_path, lease)?
+                Self::open_workspace_overlay_search_engine_fenced(&db_path, lease, stop)?
             else {
                 return Ok(None);
             };
             let roots = Self::roots_of(&project, &excluded);
-            let Some(()) = Self::startup_apply_checkpointed_value(lease, |checkpoint| {
-                if let Err(error) = Self::configure_workspace_engine(
-                    &mut engine,
-                    roots.clone(),
-                    BaselineHashMode::NormalizedChunks,
-                ) {
-                    return std::ops::ControlFlow::Continue(Err(error));
-                }
-                engine.set_serves_external_baseline_checkpointed(true, checkpoint)
-            })?
+            let Some(()) = Self::configure_and_declare_baseline(
+                &mut engine,
+                roots,
+                BaselineHashMode::NormalizedChunks,
+                true,
+                lease,
+                stop,
+            )?
             else {
                 return Ok(None);
             };
 
             let store = engine.store();
-            let Some(()) = Self::startup_apply_checkpointed_value(lease, |checkpoint| match store
-                .clear_workspace_overlay_checkpointed("code", checkpoint)
-            {
-                Ok(std::ops::ControlFlow::Continue(())) => std::ops::ControlFlow::Continue(Ok(())),
-                Ok(std::ops::ControlFlow::Break(())) => std::ops::ControlFlow::Break(()),
-                Err(error) => std::ops::ControlFlow::Continue(Err(error)),
+            let Some(()) = Self::startup_apply_checkpointed_value(lease, stop, |checkpoint| {
+                match store.clear_workspace_overlay_checkpointed("code", checkpoint) {
+                    Ok(std::ops::ControlFlow::Continue(())) => {
+                        std::ops::ControlFlow::Continue(Ok(()))
+                    }
+                    Ok(std::ops::ControlFlow::Break(())) => std::ops::ControlFlow::Break(()),
+                    Err(error) => std::ops::ControlFlow::Continue(Err(error)),
+                }
             })?
             else {
                 return Ok(None);
@@ -1315,8 +1520,10 @@ impl SharedState {
                         {
                             Ok(manifest) => {
                                 let manifest_files = manifest.files.len();
-                                match Self::startup_apply_checkpointed_value(lease, |checkpoint| {
-                                    match store
+                                match Self::startup_apply_checkpointed_value(
+                                    lease,
+                                    stop,
+                                    |checkpoint| match store
                                         .save_baseline_manifest_checkpointed(&manifest, checkpoint)
                                     {
                                         Ok(std::ops::ControlFlow::Continue(())) => {
@@ -1326,15 +1533,17 @@ impl SharedState {
                                             std::ops::ControlFlow::Break(())
                                         }
                                         Err(error) => std::ops::ControlFlow::Continue(Err(error)),
-                                    }
-                                }) {
+                                    },
+                                ) {
                                     Ok(Some(())) => {}
                                     Ok(None) => return Ok(None),
                                     Err(error) => {
                                         tracing::warn!(
                                             "failed to persist workspace baseline manifest: {error}"
                                         );
-                                        Self::clear_baseline_manifest_best_effort(store, lease);
+                                        Self::clear_baseline_manifest_best_effort(
+                                            store, lease, stop,
+                                        );
                                         return Err(error);
                                     }
                                 }
@@ -1349,7 +1558,7 @@ impl SharedState {
                                 tracing::warn!(
                                     "failed to load workspace baseline manifest: {error}"
                                 );
-                                Self::clear_baseline_manifest_best_effort(store, lease);
+                                Self::clear_baseline_manifest_best_effort(store, lease, stop);
                                 return Err(error);
                             }
                         },
@@ -1359,14 +1568,14 @@ impl SharedState {
                     tracing::warn!(
                         "workspace baseline manifest unavailable for configured Postgres mode"
                     );
-                    Self::clear_baseline_manifest_best_effort(store, lease);
+                    Self::clear_baseline_manifest_best_effort(store, lease, stop);
                     return Err(bsl_search::SearchError::ExternalBaseline(
                         "workspace baseline manifest is unavailable".to_owned(),
                     ));
                 }
                 Err(error) => {
                     tracing::warn!("failed to resolve workspace baseline snapshot: {error}");
-                    Self::clear_baseline_manifest_best_effort(store, lease);
+                    Self::clear_baseline_manifest_best_effort(store, lease, stop);
                     return Err(error);
                 }
             };
@@ -1377,7 +1586,6 @@ impl SharedState {
             );
 
             return Ok(Some(WorkspaceSearchInit {
-                watch_armed,
                 engine,
                 mode: WorkspaceSearchMode::PostgresRemoteOverlay,
                 pending_embed: None,
@@ -1385,7 +1593,7 @@ impl SharedState {
             }));
         }
 
-        let Some(mut engine) = Self::open_search_engine_fenced(&db_path, lease)? else {
+        let Some(mut engine) = Self::open_search_engine_fenced(&db_path, lease, stop)? else {
             return Ok(None);
         };
 
@@ -1403,16 +1611,14 @@ impl SharedState {
         // a row surviving the local period would suppress a same-stat edit after a switch
         // back to the same snapshot. A failed clear leaves that lie standing, so the boot
         // fails closed, exactly like the Postgres branch does on its own failed clears.
-        let Some(()) = Self::startup_apply_checkpointed_value(lease, |checkpoint| {
-            if let Err(error) = Self::configure_workspace_engine(
-                &mut engine,
-                roots.clone(),
-                BaselineHashMode::RawFileBytes,
-            ) {
-                return std::ops::ControlFlow::Continue(Err(error));
-            }
-            engine.set_serves_external_baseline_checkpointed(false, checkpoint)
-        })?
+        let Some(()) = Self::configure_and_declare_baseline(
+            &mut engine,
+            roots,
+            BaselineHashMode::RawFileBytes,
+            false,
+            lease,
+            stop,
+        )?
         else {
             return Ok(None);
         };
@@ -1435,13 +1641,13 @@ impl SharedState {
             // deleted while the daemon was down. Reconcile the store to disk so the overlay baseline
             // truly == working tree before asserting Clean; a walk that could not prove this
             // downgrades to a prime (which never asserts a false clean).
-            let Some(reconciled) = Self::reconcile_boot_store_with_disk_fenced(&mut engine, lease)
+            let Some(reconciled) =
+                Self::reconcile_boot_store_with_disk_fenced(&mut engine, lease, stop)
             else {
                 return Ok(None);
             };
             let overlay_init = if reconciled { OverlayInit::Clean } else { OverlayInit::Prime };
             return Ok(Some(WorkspaceSearchInit {
-                watch_armed,
                 engine,
                 mode: WorkspaceSearchMode::SqliteLocal,
                 pending_embed,
@@ -1491,7 +1697,7 @@ impl SharedState {
             // the chunks, so the deferred vectors are graph-enriched just as
             // `index_directory` would have produced.
             match engine.index_directory_deferred_fenced(&source_path, |apply| {
-                Self::startup_apply_checkpointed(lease, apply)
+                Self::startup_apply_checkpointed(lease, stop, apply)
             }) {
                 Ok(bsl_search::FenceOutcome::Applied(indexed)) => {
                     if indexed > 0 {
@@ -1520,13 +1726,13 @@ impl SharedState {
             // (incl. edits made while the daemon was down) but did not remove rows for a `.bsl`
             // deleted while down. Reconcile the store to disk so the overlay baseline == working tree
             // before asserting Clean; a walk that could not prove this downgrades to a prime.
-            let Some(reconciled) = Self::reconcile_boot_store_with_disk_fenced(&mut engine, lease)
+            let Some(reconciled) =
+                Self::reconcile_boot_store_with_disk_fenced(&mut engine, lease, stop)
             else {
                 return Ok(None);
             };
             let overlay_init = if reconciled { OverlayInit::Clean } else { OverlayInit::Prime };
             return Ok(Some(WorkspaceSearchInit {
-                watch_armed,
                 engine,
                 mode: WorkspaceSearchMode::SqliteLocal,
                 pending_embed,
@@ -1543,7 +1749,7 @@ impl SharedState {
         let overlay_init = if engine.chunk_count().unwrap_or(0) == 0 {
             tracing::info!(?source_path, "building FTS index from source files");
             match engine.index_directory_fts_fenced(&source_path, |apply| {
-                Self::startup_apply_checkpointed(lease, apply)
+                Self::startup_apply_checkpointed(lease, stop, apply)
             }) {
                 Ok(bsl_search::FenceOutcome::Applied(indexed)) => {
                     tracing::info!(indexed, "FTS index built")
@@ -1556,7 +1762,8 @@ impl SharedState {
                 }
                 Err(error) => return Err(error),
             }
-            let Some(reconciled) = Self::reconcile_boot_store_with_disk_fenced(&mut engine, lease)
+            let Some(reconciled) =
+                Self::reconcile_boot_store_with_disk_fenced(&mut engine, lease, stop)
             else {
                 return Ok(None);
             };
@@ -1571,7 +1778,7 @@ impl SharedState {
             // A root DECLARED while down is neither: it has no rows to refresh and no rows to
             // remove, so the skip is taken per root and only the unindexed ones are ingested.
             match engine.index_unindexed_roots_fts_fenced(|apply| {
-                Self::startup_apply_checkpointed(lease, apply)
+                Self::startup_apply_checkpointed(lease, stop, apply)
             }) {
                 Ok(bsl_search::FenceOutcome::Applied(indexed)) if indexed > 0 => {
                     tracing::info!(
@@ -1588,14 +1795,13 @@ impl SharedState {
                 }
                 Err(error) => return Err(error),
             }
-            if Self::reconcile_boot_store_with_disk_fenced(&mut engine, lease).is_none() {
+            if Self::reconcile_boot_store_with_disk_fenced(&mut engine, lease, stop).is_none() {
                 return Ok(None);
             }
             OverlayInit::Prime
         };
 
         Ok(Some(WorkspaceSearchInit {
-            watch_armed,
             engine,
             mode: WorkspaceSearchMode::SqliteLocal,
             pending_embed: None,
@@ -1618,6 +1824,7 @@ impl SharedState {
             external_baseline,
             graph,
             &crate::workspace_lease::WorkspaceLease::unmanaged(),
+            &super::OwnerStop::default(),
         )
         .ok()
         .flatten()
@@ -1822,6 +2029,65 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
 
+    /// A transient refusal means ANOTHER process holds the lease lock. Waiting that out is
+    /// right; waiting it out under the engine mutex is not — every graph publication, every
+    /// mark consumption and every `search_code` queues behind a pause whose length is set by a
+    /// foreign holder, not by this daemon.
+    ///
+    /// The order the comment at the call site asks for — engine first, then the lease — is
+    /// about one ATTEMPT. The pause between attempts belongs to nobody.
+    #[test]
+    fn the_engine_is_free_while_a_publication_waits_out_a_foreign_lease_hold() {
+        use crate::state::OwnerStop;
+        let shared = Arc::new(crate::state::shared_engine(None));
+        let owners = OwnerStop::default();
+        let free_while_paused = Arc::new(AtomicUsize::new(0));
+        let held_while_paused = Arc::new(AtomicUsize::new(0));
+
+        let attempts = AtomicUsize::new(0);
+        let probe_engine = Arc::clone(&shared);
+        let free = Arc::clone(&free_while_paused);
+        let held = Arc::clone(&held_while_paused);
+        let published = SharedState::publish_engine_with_retry(
+            &shared,
+            &owners,
+            |_slot| {
+                // Two foreign holds, then the lock frees and the publication lands.
+                if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                    bsl_search::FenceOutcome::TransientRefusal
+                } else {
+                    bsl_search::FenceOutcome::Applied(Ok(()))
+                }
+            },
+            std::time::Instant::now,
+            |_delay| {
+                // What a co-tenant sees during the pause. A request path cannot wait for a
+                // background owner, so "free" here has to mean free right now.
+                match crate::tools::search::try_acquire_engine(
+                    &probe_engine,
+                    &tokio_util::sync::CancellationToken::new(),
+                ) {
+                    Ok(_) => free.fetch_add(1, Ordering::SeqCst),
+                    Err(_) => held.fetch_add(1, Ordering::SeqCst),
+                };
+                false
+            },
+        );
+
+        assert!(matches!(published, Ok(Some(()))), "the publication should land: {published:?}");
+        assert_eq!(
+            held_while_paused.load(Ordering::SeqCst),
+            0,
+            "the engine was held through {} of the pauses between lease attempts",
+            held_while_paused.load(Ordering::SeqCst),
+        );
+        assert_eq!(
+            free_while_paused.load(Ordering::SeqCst),
+            2,
+            "both pauses should have left the engine acquirable",
+        );
+    }
+
     #[test]
     fn embedding_publish_retry_budget_requires_positive_representable_seconds() {
         let _lock = env_lock();
@@ -1871,7 +2137,7 @@ mod tests {
                     calls.fetch_add(1, Ordering::SeqCst);
                     Ok(())
                 };
-                SharedState::startup_apply(&lease, &mut apply)
+                SharedState::startup_apply(&lease, &crate::state::OwnerStop::default(), &mut apply)
             })
         };
         std::thread::sleep(std::time::Duration::from_millis(2100));
@@ -1888,7 +2154,11 @@ mod tests {
             Ok(())
         };
         assert!(matches!(
-            SharedState::startup_apply(&old, &mut terminal_apply),
+            SharedState::startup_apply(
+                &old,
+                &crate::state::OwnerStop::default(),
+                &mut terminal_apply
+            ),
             bsl_search::FenceOutcome::Superseded
         ));
         assert!(old.is_superseded());
@@ -1898,12 +2168,15 @@ mod tests {
         let released = crate::workspace_lease::WorkspaceLease::claim(released_dir.path());
         released.release();
         assert!(matches!(
-            SharedState::startup_apply(&released, &mut || Ok(())),
+            SharedState::startup_apply(&released, &crate::state::OwnerStop::default(), &mut || Ok(
+                ()
+            )),
             bsl_search::FenceOutcome::Released
         ));
 
         let error = SharedState::startup_apply(
             &crate::workspace_lease::WorkspaceLease::unmanaged(),
+            &crate::state::OwnerStop::default(),
             &mut || Err::<(), _>(bsl_search::SearchError::Index("expected".to_owned())),
         );
         assert!(matches!(
@@ -1911,6 +2184,30 @@ mod tests {
             bsl_search::FenceOutcome::Applied(Err(bsl_search::SearchError::Index(message)))
                 if message == "expected"
         ));
+    }
+
+    /// A pause that ends because the daemon stopped is not a pause to try again after. The
+    /// boot's own sleep returns at once from then on, so a loop that ignored the answer would
+    /// not merely retry — it would spend the whole ten-minute budget in a tight spin, still
+    /// writing into a workspace that is being handed over.
+    #[test]
+    fn a_startup_retry_leaves_when_the_daemon_stops() {
+        let attempts = std::cell::Cell::new(0_u16);
+        let outcome = SharedState::startup_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                bsl_search::FenceOutcome::<Result<(), bsl_search::SearchError>>::TransientRefusal
+            },
+            std::time::Instant::now,
+            // What `OwnerStop::sleep` answers once the stop is raised.
+            |_| true,
+        );
+
+        assert!(
+            matches!(outcome, bsl_search::FenceOutcome::Released),
+            "a boot told to go must read as 'nothing was published', got {outcome:?}"
+        );
+        assert_eq!(attempts.get(), 1, "the boot tried again after it was told to leave");
     }
 
     #[test]
@@ -1924,7 +2221,10 @@ mod tests {
                 bsl_search::FenceOutcome::<Result<(), bsl_search::SearchError>>::TransientRefusal
             },
             || clock.get(),
-            |delay| clock.set(clock.get().checked_add(delay).unwrap()),
+            |delay| {
+                clock.set(clock.get().checked_add(delay).unwrap());
+                false
+            },
         );
 
         assert!(matches!(
@@ -1936,6 +2236,54 @@ mod tests {
         assert_eq!(attempts.get(), 301);
     }
 
+    /// The configuration mutates process state; the declaration is a retryable transaction.
+    /// A refused checkpoint must roll back the second and leave the first alone — otherwise
+    /// ordinary contention reports `workspace roots are already initialized` and workspace
+    /// search stays offline for the life of the daemon.
+    #[test]
+    fn a_refused_checkpoint_does_not_poison_the_configured_engine() {
+        let dir = tempdir().unwrap();
+        let mut engine = SearchEngine::fts_only(&dir.path().join("search.db")).unwrap();
+        let (roots, _) = bsl_search::WorkspaceRoots::build(dir.path(), dir.path(), &[]);
+        let lease = crate::workspace_lease::WorkspaceLease::claim(dir.path());
+        lease.fail_next_checkpoint_lock_for_test();
+
+        let declared = SharedState::configure_and_declare_baseline(
+            &mut engine,
+            roots,
+            bsl_search::BaselineHashMode::RawFileBytes,
+            false,
+            &lease,
+            &crate::state::OwnerStop::default(),
+        )
+        .expect("a refused checkpoint retries the transaction, not the engine configuration");
+
+        assert_eq!(declared, Some(()));
+    }
+
+    /// The store open takes several checkpoints of its own (`finish_open_checkpointed`), and
+    /// each one releases and re-takes the interprocess lock. A refusal there rolls the open
+    /// back and the host runs it again — which only works if the adapter under it can be run
+    /// twice. This drives the real production wiring, not a hand-built copy of it.
+    #[test]
+    fn checkpoint_refusal_retries_the_real_store_open() {
+        let dir = tempdir().unwrap();
+        let lease = crate::workspace_lease::WorkspaceLease::claim(dir.path());
+        lease.fail_checkpoint_lock_after_for_test(1);
+
+        let opened =
+            bsl_search::SearchEngine::fts_only_fenced(&dir.path().join("search.db"), |apply| {
+                SharedState::startup_apply_checkpointed(
+                    &lease,
+                    &crate::state::OwnerStop::default(),
+                    apply,
+                )
+            })
+            .expect("a refused checkpoint is retried, not turned into an initialization error");
+
+        assert!(matches!(opened, bsl_search::FenceOutcome::Applied(_)));
+    }
+
     #[test]
     fn checkpoint_refusal_retries_the_startup_transaction() {
         let dir = tempdir().unwrap();
@@ -1943,13 +2291,17 @@ mod tests {
         lease.fail_next_checkpoint_lock_for_test();
         let mut attempts = 0_u8;
 
-        let result = SharedState::startup_apply_checkpointed_value(&lease, |checkpoint| {
-            attempts += 1;
-            if checkpoint().is_break() {
-                return std::ops::ControlFlow::Break(());
-            }
-            std::ops::ControlFlow::Continue(Ok(attempts))
-        })
+        let result = SharedState::startup_apply_checkpointed_value(
+            &lease,
+            &crate::state::OwnerStop::default(),
+            |checkpoint| {
+                attempts += 1;
+                if checkpoint().is_break() {
+                    return std::ops::ControlFlow::Break(());
+                }
+                std::ops::ControlFlow::Continue(Ok(attempts))
+            },
+        )
         .unwrap();
 
         assert_eq!(result, Some(2));
@@ -1976,8 +2328,10 @@ mod tests {
         let _newer = crate::workspace_lease::WorkspaceLease::claim(dir.path());
 
         let result =
-            SharedState::startup_apply_once(&old, || engine.store().clear_baseline_manifest())
-                .unwrap();
+            SharedState::startup_apply_once(&old, &crate::state::OwnerStop::default(), || {
+                engine.store().clear_baseline_manifest()
+            })
+            .unwrap();
         assert!(result.is_none());
         assert!(old.is_superseded());
         assert!(engine.store().load_baseline_manifest().unwrap().is_some());
@@ -2006,7 +2360,11 @@ mod tests {
                     prepared_tx.send(()).unwrap();
                     announced = true;
                 }
-                SharedState::startup_apply_checkpointed(&lease, apply)
+                SharedState::startup_apply_checkpointed(
+                    &lease,
+                    &crate::state::OwnerStop::default(),
+                    apply,
+                )
             });
             (result, engine)
         });
@@ -2041,7 +2399,11 @@ mod tests {
                 if admitted == bsl_search::WORKSPACE_APPLY_BATCH_ROWS {
                     newer = Some(crate::workspace_lease::WorkspaceLease::claim(partial_dir.path()));
                 }
-                let result = SharedState::startup_apply_checkpointed(&old, apply);
+                let result = SharedState::startup_apply_checkpointed(
+                    &old,
+                    &crate::state::OwnerStop::default(),
+                    apply,
+                );
                 if matches!(result, bsl_search::FenceOutcome::Applied(Ok(()))) {
                     admitted += 1;
                 }
@@ -2064,7 +2426,7 @@ mod tests {
         assert!(matches!(
             partial
                 .reconcile_workspace_files_fenced(&present, |apply| {
-                    SharedState::startup_apply(&old, apply)
+                    SharedState::startup_apply(&old, &crate::state::OwnerStop::default(), apply)
                 })
                 .unwrap(),
             bsl_search::FenceOutcome::Superseded
@@ -2094,7 +2456,7 @@ mod tests {
             prime
                 .prime_workspace_overlay_fenced(|apply| {
                     newer = Some(crate::workspace_lease::WorkspaceLease::claim(prime_dir.path()));
-                    SharedState::startup_apply(&old, apply)
+                    SharedState::startup_apply(&old, &crate::state::OwnerStop::default(), apply)
                 })
                 .unwrap(),
             bsl_search::FenceOutcome::Superseded
@@ -2111,7 +2473,7 @@ mod tests {
             .unwrap();
         let old = crate::workspace_lease::WorkspaceLease::claim(overlay_dir.path());
         let _newer = crate::workspace_lease::WorkspaceLease::claim(overlay_dir.path());
-        assert!(SharedState::startup_apply_once(&old, || {
+        assert!(SharedState::startup_apply_once(&old, &crate::state::OwnerStop::default(), || {
             overlay.initialize_workspace_overlay_clean()
         })
         .unwrap()
@@ -2122,9 +2484,9 @@ mod tests {
         let engine = SearchEngine::fts_only(&publish_dir.path().join("search.db")).unwrap();
         let old = crate::workspace_lease::WorkspaceLease::claim(publish_dir.path());
         let _newer = crate::workspace_lease::WorkspaceLease::claim(publish_dir.path());
-        let slot: crate::state::SharedSearchEngine = Arc::new(Mutex::new(None));
+        let slot: crate::state::SharedSearchEngine = crate::state::shared_engine(None);
         let mut guard = slot.lock().unwrap();
-        assert!(SharedState::startup_apply_once(&old, || {
+        assert!(SharedState::startup_apply_once(&old, &crate::state::OwnerStop::default(), || {
             *guard = Some(engine);
             Ok(())
         })
@@ -2141,7 +2503,7 @@ mod tests {
             let lease = lease.clone();
             let calls = Arc::clone(&calls);
             std::thread::spawn(move || {
-                SharedState::startup_apply_once(&lease, || {
+                SharedState::startup_apply_once(&lease, &crate::state::OwnerStop::default(), || {
                     calls.fetch_add(1, Ordering::SeqCst);
                     Ok(())
                 })
@@ -2360,7 +2722,7 @@ mod tests {
         assert!(hub.wait_until_watching(std::time::Duration::from_secs(5)), "the watch must arm");
 
         SharedState::spawn_workspace_search_init(
-            Arc::new(Mutex::new(None)),
+            crate::state::shared_engine(None),
             Arc::new(std::sync::atomic::AtomicBool::new(true)),
             IndexProgress::new(),
             Arc::new(Mutex::new(SemanticRuntimeStatus::Disabled)),
@@ -2378,6 +2740,9 @@ mod tests {
             None,
             Arc::new(AtomicU64::new(0)),
             DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
+            crate::state::OwnerStop::default(),
+            Default::default(),
+            Arc::new(Mutex::new(crate::state::ConsumerPhase::Pending)),
         );
 
         for _ in 0..600 {
@@ -2441,6 +2806,9 @@ mod tests {
             None,
             Arc::new(AtomicU64::new(0)),
             DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
+            crate::state::OwnerStop::default(),
+            Default::default(),
+            Arc::new(Mutex::new(crate::state::ConsumerPhase::Pending)),
         );
     }
 
@@ -2535,24 +2903,36 @@ mod tests {
     }
 
     /// A cursor is subscribed before the thread that will read it exists, so every way out
-    /// that does not end in a running sink has to release it — and there are more of those
-    /// than a list would hold: a watch that never arms, an init that publishes nothing, a
-    /// spawn the operating system refuses. A cursor nobody drains holds entries back for
-    /// the life of the process.
+    /// that does not end in a running consumer has to release it — and there are more of
+    /// those than a list would hold: an init that fails, one that publishes nothing, a spawn
+    /// the operating system refuses. A cursor nobody drains holds entries back for the life
+    /// of the process. (A watch that never arms is no longer one of them: the consumer runs
+    /// in every watch mode.)
     #[test]
-    fn a_boot_without_a_watch_leaves_no_cursor_behind() {
+    fn a_boot_that_publishes_no_engine_leaves_no_cursor_behind() {
         let _env_lock = env_lock();
         let _embedding_url = EnvVarGuard::unset("EMBEDDING_URL");
 
         let dir = tempdir().unwrap();
         let (workspace, baseline) = local_workspace_for_boot(dir.path());
+        // A store that cannot be opened: the init fails and publishes nothing.
+        fs::create_dir_all(
+            crate::cache::WorkspaceCacheLayout::for_workspace(&workspace).search_db_path(),
+        )
+        .unwrap();
         let hub = WorkspaceChangeHub::start_with_unstartable_thread(vec![
             crate::change_hub::WatchTarget::recursive(workspace.clone()),
         ]);
         let lease = crate::change_hub::CursorLease::new(hub.clone());
         assert_eq!(hub.active_cursor_count(), 1, "the boot holds a cursor from the start");
 
-        spawn_local_boot(workspace, hub.clone(), lease, baseline, Arc::new(Mutex::new(None)));
+        spawn_local_boot(
+            workspace,
+            hub.clone(),
+            lease,
+            baseline,
+            crate::state::shared_engine(None),
+        );
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while hub.active_cursor_count() > 0 && std::time::Instant::now() < deadline {
@@ -2561,7 +2941,7 @@ mod tests {
         assert_eq!(
             hub.active_cursor_count(),
             0,
-            "a boot that started no sink must not leave its cursor subscribed",
+            "a boot that started no consumer must not leave its cursor subscribed",
         );
     }
 
@@ -2579,7 +2959,7 @@ mod tests {
         let hub = WorkspaceChangeHub::start(vec![workspace.clone()]);
         assert!(hub.wait_until_watching(std::time::Duration::from_secs(5)), "the watch must arm");
         let lease = crate::change_hub::CursorLease::new(hub.clone());
-        let engine: super::SharedSearchEngine = Arc::new(Mutex::new(None));
+        let engine: super::SharedSearchEngine = crate::state::shared_engine(None);
 
         spawn_local_boot(workspace, hub.clone(), lease, baseline, Arc::clone(&engine));
 
@@ -3098,7 +3478,7 @@ mod tests {
         }
 
         // Observe the workspace watcher independently so the edit's delivery is confirmed before we
-        // rely on the resident's own cursor (which `prefetch_resident_overlay` drains via catch_up).
+        // rely on the resident's own cursor (which a point refresh drains via catch_up).
         let hub = state.change_hub().expect("workspace boot owns a change hub").clone();
         assert!(hub.wait_until_watching(Duration::from_secs(10)), "the watcher must arm");
         let mut observer = hub.subscribe();
@@ -3126,42 +3506,14 @@ mod tests {
         }
         assert!(delivered, "the watcher delivered the edit");
 
-        // Prove the SINK marked the edit — do NOT hand-mark. The search sink (spawned by
-        // `SharedState::workspace`) drains the hub and marks the edited `.bsl` dirty in the overlay.
-        // That is only reachable once the boot brought the overlay online; revert that wiring and the
-        // overlay stays uninitialized, the sink's mark lands nowhere, and this poll never trips. So
-        // waiting for the sink's OWN mark exercises hub -> sink -> mark end-to-end.
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            let marked = {
-                let guard = state.search_engine().lock().unwrap();
-                let engine = guard.as_ref().unwrap();
-                engine
-                    .workspace_overlay_dirty_paths_snapshot()
-                    .unwrap()
-                    .keys()
-                    .any(|key| key.path.ends_with("Module.bsl"))
-            };
-            if marked {
-                break;
-            }
-            assert!(Instant::now() < deadline, "the sink never marked the edited path dirty");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-
-        // With the sink's mark in place, drive the resident-fed prefetch exactly as the search tool
-        // does — NO dirty-marking of our own. `prefetch_resident_overlay` catch_ups the resident to
-        // the new bytes (off the engine lock) BEFORE it reads the snapshot, so the very call that
-        // consumes the dirty path already sees fresh bytes and feeds the reindex from the SHARED
-        // parse. This proves mark -> prefetch -> resident-fed.
+        // Nothing is marked or refreshed by hand: the consumer (spawned by
+        // `SharedState::workspace`) marks the edited `.bsl` dirty in the overlay, and the backlog
+        // owner reads it back — catching the resident up first, so its shared parse matches the
+        // new bytes. That is only reachable once the boot brought the overlay online; revert that
+        // wiring and the overlay stays uninitialized, the mark lands nowhere, and this never
+        // trips. So waiting for a resident-fed entry exercises hub -> consumer -> mark -> owner.
         let deadline = Instant::now() + Duration::from_secs(20);
         let fed = loop {
-            SharedState::prefetch_resident_overlay_fenced(
-                state.search_engine(),
-                &crate::workspace_lease::WorkspaceLease::unmanaged(),
-                &tokio_util::sync::CancellationToken::new(),
-            )
-            .expect("an uncancelled prefetch completes");
             let fed = state
                 .search_engine()
                 .lock()
@@ -3176,7 +3528,11 @@ mod tests {
             assert!(Instant::now() < deadline, "the resident-fed reindex never ran");
             std::thread::sleep(Duration::from_millis(20));
         };
-        assert_eq!(fed, 1, "the edited file was reindexed from the resident's shared parse");
+        // One feed per batch, and the owner takes a batch per delivered mark — a single disk
+        // write reaches the watcher as one batch or as several, so the count is bounded by
+        // delivery, not by the edit. What it has to show is that the reindex came from the
+        // resident's shared parse at all, rather than from a second disk read of the same file.
+        assert!(fed >= 1, "the edited file was reindexed from the resident's shared parse");
 
         // Fresh bytes are served: the new symbol is found through the overlay (the lexical path the
         // search tool drives), though it is absent from the v1 store baseline.
@@ -3487,6 +3843,278 @@ mod tests {
             Some(workspace.join("src").join("cf").as_path()),
             "the configuration root stays the base of stored relative paths",
         );
+    }
+
+    /// The graph's drift has an owner of its own. With search down for good — its store cannot
+    /// even be opened — nothing search-side will ever run, and a body edit still has to
+    /// reach the graph.
+    #[test]
+    fn the_graph_follows_edits_after_search_init_failed() {
+        let _env_lock = env_lock();
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().to_path_buf();
+        let cf = workspace.join("cf");
+        fs::create_dir_all(&cf).unwrap();
+        fs::write(cf.join("Configuration.xml"), "<Configuration/>").unwrap();
+        crate::graph::test_support::sample_workspace(&cf);
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(&workspace);
+        fs::create_dir_all(cache.search_db_path()).unwrap();
+
+        let state = SharedState::workspace(workspace.clone()).expect("valid workspace project");
+        wait_until_graph_ready(state.graph());
+        assert!(
+            crate::change_hub::test_support::eventually(std::time::Duration::from_secs(30), || {
+                matches!(
+                    *state.semantic_runtime().lock().unwrap(),
+                    SemanticRuntimeStatus::Failed(_)
+                )
+            }),
+            "the stand needs a search init that failed"
+        );
+        let before = state.graph().status_report().revision.expect("ready");
+
+        fs::write(
+            cf.join("CommonModules").join("Сервер").join("Ext").join("Module.bsl"),
+            "&НаСервере\nФункция Считать() Экспорт Возврат 7; КонецФункции",
+        )
+        .unwrap();
+
+        let reloaded =
+            crate::change_hub::test_support::eventually(std::time::Duration::from_secs(30), || {
+                state.graph().status_report().revision.is_some_and(|revision| revision > before)
+            });
+        state.shutdown();
+        assert!(reloaded, "the edit never reached the graph with search down");
+    }
+
+    /// A workspace whose watch never came up is not a workspace nobody watches: the hub polls
+    /// it, and both the search consumer and the graph watcher take the poll's records. The
+    /// consumer runs although the boot's wait for the watch ended in failure.
+    #[test]
+    fn a_workspace_without_a_watch_follows_edits_through_the_poll() {
+        struct PollOff;
+        impl Drop for PollOff {
+            fn drop(&mut self) {
+                crate::change_hub::POLL_INSTEAD_OF_WATCHING.with(|poll| poll.set(None));
+            }
+        }
+        let _env_lock = env_lock();
+        crate::change_hub::POLL_INSTEAD_OF_WATCHING.with(|poll| {
+            poll.set(Some(crate::change_hub::PollConfig {
+                period: std::time::Duration::from_millis(200),
+                verify_bytes: 1 << 20,
+            }))
+        });
+        let _poll_off = PollOff;
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().to_path_buf();
+        let cf = workspace.join("cf");
+        fs::create_dir_all(&cf).unwrap();
+        fs::write(cf.join("Configuration.xml"), "<Configuration/>").unwrap();
+        crate::graph::test_support::sample_workspace(&cf);
+
+        let state = SharedState::workspace(workspace.clone()).expect("valid workspace project");
+        let eventually = |f: &dyn Fn() -> bool| {
+            crate::change_hub::test_support::eventually(std::time::Duration::from_secs(30), f)
+        };
+        assert!(
+            eventually(&|| state.change_hub().unwrap().is_polling()),
+            "the stand needs a hub that polls"
+        );
+        wait_until_graph_ready(state.graph());
+        let before = state.graph().status_report().revision.expect("ready");
+        assert!(
+            eventually(&|| state.search_engine().lock().unwrap().is_some()),
+            "the search engine was never published"
+        );
+
+        fs::write(
+            cf.join("CommonModules").join("Сервер").join("Ext").join("Module.bsl"),
+            "&НаСервере\nФункция ОпросНайден() Экспорт КонецФункции",
+        )
+        .unwrap();
+
+        let searched = eventually(&|| {
+            state.search_engine().lock().unwrap().as_ref().is_some_and(|engine| {
+                engine
+                    .text_search_read_only("ОпросНайден", 10, Some("code"))
+                    .is_ok_and(|hits| !hits.is_empty())
+            })
+        });
+        let reloaded = eventually(&|| {
+            state.graph().status_report().revision.is_some_and(|revision| revision > before)
+        });
+        state.shutdown();
+        assert!(searched, "search never saw the polled edit");
+        assert!(reloaded, "the graph never saw the polled edit");
+    }
+
+    /// A quiet boot on a healthy hub: both workspace sources say they are watched, and the
+    /// graph calls itself fresh after its watcher's first look with no event at all. After the
+    /// daemon stops, both say nobody watches, and the graph stops calling itself fresh.
+    #[test]
+    fn the_search_and_the_graph_say_who_watches_them() {
+        use crate::tools::location::DriftWatch;
+        let _env_lock = env_lock();
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().to_path_buf();
+        let cf = workspace.join("cf");
+        fs::create_dir_all(&cf).unwrap();
+        fs::write(cf.join("Configuration.xml"), "<Configuration/>").unwrap();
+        crate::graph::test_support::sample_workspace(&cf);
+        let state = SharedState::workspace(workspace).expect("valid workspace project");
+        let eventually = |f: &dyn Fn() -> bool| {
+            crate::change_hub::test_support::eventually(std::time::Duration::from_secs(30), f)
+        };
+        assert!(eventually(&|| state.search_watch().drift_watch == Some(DriftWatch::Watching)));
+        wait_until_graph_ready(state.graph());
+        assert!(
+            eventually(&|| {
+                let report = state.graph().status_report();
+                report.drift_watch == Some("watching") && report.stale == Some(false)
+            }),
+            "a quiet, watched boot never read fresh: {:?}",
+            state.graph().status_report().stale
+        );
+
+        state.shutdown();
+        assert!(eventually(&|| state.search_watch().drift_watch == Some(DriftWatch::Unobserved)));
+        assert!(eventually(&|| {
+            let report = state.graph().status_report();
+            report.drift_watch == Some("unobserved") && report.stale == Some(true)
+        }));
+    }
+
+    /// A quiet boot on a healthy hub costs nothing past the boot itself: no reconcile is asked
+    /// of the hub, no context mark is placed, and the graph is neither reloaded nor rebuilt,
+    /// however many coverage ticks follow.
+    #[test]
+    fn a_quiet_healthy_boot_asks_for_no_reconcile_mark_or_reload() {
+        use crate::tools::location::DriftWatch;
+        let _env_lock = env_lock();
+        let _embedding_url = EnvVarGuard::unset("EMBEDDING_URL");
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().to_path_buf();
+        let cf = workspace.join("cf");
+        fs::create_dir_all(&cf).unwrap();
+        fs::write(cf.join("Configuration.xml"), "<Configuration/>").unwrap();
+        crate::graph::test_support::sample_workspace(&cf);
+        let state = SharedState::workspace(workspace).expect("valid workspace project");
+        let eventually = |f: &dyn Fn() -> bool| {
+            crate::change_hub::test_support::eventually(std::time::Duration::from_secs(30), f)
+        };
+        assert!(eventually(&|| state.search_watch().drift_watch == Some(DriftWatch::Watching)));
+        wait_until_graph_ready(state.graph());
+        assert!(eventually(&|| state.graph().status_report().drift_watch == Some("watching")));
+        let revision = state.graph().status_report().revision;
+
+        let hub = state.change_hub().expect("a workspace boot owns a hub").clone();
+        for _ in 0..3 {
+            assert!(hub.tick_now(std::time::Duration::from_secs(10)), "the hub stopped ticking");
+        }
+        assert_eq!(hub.rescan_request_count(), 0, "a healthy hub was asked to reconcile");
+        assert_eq!(state.graph().owes_forced(), None, "a quiet boot reloaded the project");
+        assert_eq!(state.graph().status_report().revision, revision, "a quiet boot rebuilt");
+        assert!(!state.graph().marks_pending(), "a quiet boot placed marks");
+        {
+            let guard = state.search_engine().lock().unwrap();
+            let engine = guard.as_ref().expect("the local index is published");
+            assert_eq!(engine.mark_seq_handle().load(Ordering::SeqCst), 0);
+            assert!(engine.context_dirty_paths("code").unwrap().is_empty());
+        }
+        state.shutdown();
+    }
+
+    /// A newer daemon takes the workspace while edits keep arriving: the search consumer and
+    /// the graph watcher of this one leave on their own — no shutdown — releasing their
+    /// cursors, and the edits after the takeover change nothing this daemon owns.
+    #[test]
+    fn a_superseded_daemon_applies_nothing_more_and_releases_its_cursors() {
+        use crate::tools::location::DriftWatch;
+        let _env_lock = env_lock();
+        let _embedding_url = EnvVarGuard::unset("EMBEDDING_URL");
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().to_path_buf();
+        let cf = workspace.join("cf");
+        fs::create_dir_all(&cf).unwrap();
+        fs::write(cf.join("Configuration.xml"), "<Configuration/>").unwrap();
+        crate::graph::test_support::sample_workspace(&cf);
+        let state = SharedState::workspace(workspace.clone()).expect("valid workspace project");
+        let eventually = |f: &dyn Fn() -> bool| {
+            crate::change_hub::test_support::eventually(std::time::Duration::from_secs(30), f)
+        };
+        assert!(eventually(&|| state.search_watch().drift_watch == Some(DriftWatch::Watching)));
+        wait_until_graph_ready(state.graph());
+        assert!(eventually(&|| state.graph().status_report().drift_watch == Some("watching")));
+        let hub = state.change_hub().expect("a workspace boot owns a hub").clone();
+        let revision = state.graph().status_report().revision;
+        let cursors = hub.active_cursor_count();
+
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(&workspace);
+        let _newer = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
+        fs::write(
+            cf.join("CommonModules/Сервер/Ext/Module.bsl"),
+            "Функция Считать() Экспорт\nВозврат 2;\nКонецФункции",
+        )
+        .unwrap();
+        fs::write(
+            cf.join("CommonModules/Клиент/Ext/Module.bsl"),
+            "Процедура Главная() Экспорт\nКонецПроцедуры",
+        )
+        .unwrap();
+
+        assert!(
+            eventually(&|| state.search_watch().drift_watch == Some(DriftWatch::Unobserved)
+                && state.graph().status_report().drift_watch == Some("unobserved")),
+            "an owner stayed on a workspace it no longer owns"
+        );
+        // None left at all: the search consumer, the graph's watcher, and the cursor the
+        // graph's own comparison keeps for its scan cache — which is subscribed lazily, so it
+        // need not have existed when `cursors` was sampled. A cursor nobody drains keeps the
+        // hub holding entries for a consumer that has left.
+        assert!(cursors >= 2, "control: the consumers were subscribed, got {cursors}");
+        assert!(
+            eventually(&|| hub.active_cursor_count() == 0),
+            "the owners left their cursors behind: {} of {cursors}",
+            hub.active_cursor_count()
+        );
+        {
+            let guard = state.search_engine().lock().unwrap();
+            let engine = guard.as_ref().expect("the local index is published");
+            // Nothing is left that could still apply them: both consumers are gone, and the
+            // backlog owner answers marks, of which there are none.
+            let stats = engine.workspace_overlay_stats_read_only().unwrap().expect("workspace");
+            assert_eq!(
+                (stats.overlay_files, stats.pending_dirty_paths),
+                (0, 0),
+                "an edit was applied"
+            );
+        }
+        assert_eq!(state.graph().status_report().revision, revision, "the graph was rebuilt");
+        state.shutdown();
+    }
+
+    /// A search init that publishes nothing abandons its consumer: `search_code` says nobody
+    /// watches the workspace for the index, instead of `starting` for ever.
+    #[test]
+    fn a_search_init_that_publishes_nothing_leaves_the_index_unobserved() {
+        use crate::tools::location::DriftWatch;
+        let _env_lock = env_lock();
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().to_path_buf();
+        let cf = workspace.join("cf");
+        fs::create_dir_all(&cf).unwrap();
+        fs::write(cf.join("Configuration.xml"), "<Configuration/>").unwrap();
+        crate::graph::test_support::sample_workspace(&cf);
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(&workspace);
+        fs::create_dir_all(cache.search_db_path()).unwrap();
+        let state = SharedState::workspace(workspace).expect("valid workspace project");
+        let abandoned =
+            crate::change_hub::test_support::eventually(std::time::Duration::from_secs(30), || {
+                state.search_watch().drift_watch == Some(DriftWatch::Unobserved)
+            });
+        state.shutdown();
+        assert!(abandoned, "a consumer nothing will ever start still reads as starting");
     }
 
     /// Drive a graph to `Ready`, or say which state it got stuck in.

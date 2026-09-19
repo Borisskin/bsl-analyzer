@@ -18,18 +18,21 @@ use crate::tools::response::structured;
 /// firing a data action just to read its `loading` envelope.
 pub(crate) fn status(
     report: &StatusReport,
-    owns_caches: bool,
+    owns_caches: Option<bool>,
     standalone_extension: Option<&str>,
 ) -> CallToolResult {
     let mut body = json!({
         "state": report.state,
         "generation": report.generation,
         "reload": report.reload,
-        // A superseded backend keeps answering from what it already holds but
-        // produces no new derived state. Without saying so, its answers slowly
-        // drift from the sources with nothing in the protocol to explain why.
-        "owns_caches": owns_caches,
     });
+    // A superseded backend keeps answering from what it already holds but produces no new
+    // derived state. Without saying so, its answers slowly drift from the sources with nothing
+    // in the protocol to explain why. Present once the verdict exists — before that nobody has
+    // established it, and a `false` there would be a guess wearing the shape of an answer.
+    if let Some(owns) = owns_caches {
+        body["owns_caches"] = json!(owns);
+    }
     // The project is analyzed without its main configuration — the workspace is
     // an extension, or it declares external objects and no base. Calls into that
     // configuration cannot resolve, so the findings this backend is about to
@@ -110,8 +113,9 @@ mod tests {
     /// reads the same fields.
     #[test]
     fn status_reports_the_lifecycle_snapshot() {
-        let body =
-            status(&ready_report(), true, None).structured_content.expect("structuredContent");
+        let body = status(&ready_report(), Some(true), None)
+            .structured_content
+            .expect("structuredContent");
 
         assert_eq!(body["state"], "ready");
         assert_eq!(body["generation"], 3);
@@ -122,10 +126,12 @@ mod tests {
 
     #[test]
     fn status_carries_the_standalone_extension_notice_when_there_is_one() {
-        let silent = status(&ready_report(), true, None).structured_content.expect("structured");
-        let warned = status(&ready_report(), true, Some("/ws/ext is a configuration extension"))
-            .structured_content
-            .expect("structured");
+        let silent =
+            status(&ready_report(), Some(true), None).structured_content.expect("structured");
+        let warned =
+            status(&ready_report(), Some(true), Some("/ws/ext is a configuration extension"))
+                .structured_content
+                .expect("structured");
 
         assert!(silent.get("standalone_extension").is_none(), "no notice, no field");
         assert_eq!(warned["standalone_extension"], "/ws/ext is a configuration extension");
@@ -135,13 +141,22 @@ mod tests {
     fn status_states_whether_this_backend_owns_the_derived_caches() {
         // A superseded backend answers from what it holds and produces no new
         // derived state; a client has no other way to learn that.
-        let owning =
-            status(&ready_report(), true, None).structured_content.expect("structuredContent");
-        let superseded =
-            status(&ready_report(), false, None).structured_content.expect("structuredContent");
+        let owning = status(&ready_report(), Some(true), None)
+            .structured_content
+            .expect("structuredContent");
+        let superseded = status(&ready_report(), Some(false), None)
+            .structured_content
+            .expect("structuredContent");
+        // And the third state, which is not a verdict at all: nothing has established one yet.
+        let unknown =
+            status(&ready_report(), None, None).structured_content.expect("structuredContent");
 
         assert_eq!(owning["owns_caches"], true);
         assert_eq!(superseded["owns_caches"], false);
+        assert!(
+            unknown.get("owns_caches").is_none(),
+            "a verdict nobody has established is published as one: {unknown}",
+        );
     }
 
     /// A failed build reports the reason instead of an eternal "loading": an agent polling
@@ -160,7 +175,7 @@ mod tests {
         };
 
         let status_body =
-            status(&report, true, None).structured_content.expect("structuredContent");
+            status(&report, Some(true), None).structured_content.expect("structuredContent");
         assert_eq!(status_body["state"], "failed");
         assert_eq!(status_body["error"], "builder panicked");
 

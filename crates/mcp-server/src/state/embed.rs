@@ -46,14 +46,21 @@ impl EmbedFlight {
     /// Try to claim the flight. `true` = THIS caller won and must run the pass; `false` = a
     /// pass is already running and a rerun was recorded so it loops again for this caller's
     /// (later-NULLed) chunks.
-    /// The ONE writer of the claim and its mirror, and the reason they cannot drift apart:
-    /// it takes `&mut EmbedFlightState`, which exists only while the caller holds the lock.
+    /// The ONE writer of the claim, and the reason it and its mirror cannot drift apart: both
+    /// go through a `&mut EmbedFlightState`, which exists only while the caller holds the lock.
     /// Written by hand, the mirror is one careless statement away from landing after the
     /// guard is dropped — and an interleaved `claim` would then be blinded by that late
     /// store, leaving a running pass invisible to the broker.
     fn set_in_flight(&self, st: &mut EmbedFlightState, value: bool) {
         st.in_flight = value;
-        self.in_flight_now.store(value, Ordering::SeqCst);
+        self.publish_working(st, value);
+    }
+
+    /// The ONE writer of the mirror. `working` is what the pass is doing right now; the claim
+    /// is the ceiling on it, so a pause that ends after the claim was released — the pass left
+    /// while the pause was being lifted — cannot resurrect a mirror for a pass that is gone.
+    fn publish_working(&self, st: &mut EmbedFlightState, working: bool) {
+        self.in_flight_now.store(working && st.in_flight, Ordering::SeqCst);
     }
 
     fn claim(&self) -> bool {
@@ -65,6 +72,20 @@ impl EmbedFlight {
             self.set_in_flight(&mut st, true);
             true
         }
+    }
+
+    /// The pass is waiting, not working. The claim stays — no second pass may start — but the
+    /// backend stops counting it as live work: a backoff sat out is no reason to hold a whole
+    /// process, and this one grows to half an hour.
+    fn pause(&self) {
+        let mut st = self.lock();
+        self.publish_working(&mut st, false);
+    }
+
+    /// The pause is over and the pass is working again.
+    fn resume(&self) {
+        let mut st = self.lock();
+        self.publish_working(&mut st, true);
     }
 
     /// Start of a pass iteration: clear the rerun flag so a request arriving DURING this
@@ -223,7 +244,7 @@ impl SharedState {
     /// The production publish hook: after a graph publish it re-renders the search chunks
     /// marked context-dirty by an `.xml` drift, then re-embeds them. Extracted so a test can
     /// wire the SAME closure the daemon does rather than calling the refresh by hand. The
-    /// hook receives `(drift_pending, build_start_seq)`: `build_start_seq` bounds which marks
+    /// hook receives `(drift_pending, mark_bound)`: `mark_bound` bounds which marks
     /// the refresh may clear (only drifts this build already reflects), while `drift_pending`
     /// is a fast-path hint to skip a round when a fresher reload is imminent.
     // Each handle is an independent owner used by the long-lived publish closure; grouping them
@@ -231,6 +252,7 @@ impl SharedState {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn build_publish_hook(
         search_engine: SharedSearchEngine,
+        stop: super::OwnerStop,
         cache: crate::cache::WorkspaceCacheLayout,
         semantic_runtime: Arc<Mutex<SemanticRuntimeStatus>>,
         index_progress: Arc<IndexProgress>,
@@ -248,6 +270,7 @@ impl SharedState {
             let (roots_handled, pending_collection_embeddings, pending_overlay_embeddings) =
                 Self::refresh_search_roots_after_graph(
                     &search_engine,
+                    &stop,
                     &cache,
                     &root_drift_epoch,
                     &lease,
@@ -255,6 +278,7 @@ impl SharedState {
                 );
             let topology_handled = Self::refresh_search_contexts_after_graph_with_cache(
                 &search_engine,
+                &stop,
                 &cache,
                 &semantic_runtime,
                 &index_progress,
@@ -268,6 +292,7 @@ impl SharedState {
             if pending_collection_embeddings {
                 Self::kick_context_reembed(
                     &search_engine,
+                    &stop,
                     &semantic_runtime,
                     &index_progress,
                     &embed_flight,
@@ -289,6 +314,7 @@ impl SharedState {
     /// with searches and watcher attribution.
     fn refresh_search_roots_after_graph(
         engine: &SharedSearchEngine,
+        stop: &super::OwnerStop,
         cache: &crate::cache::WorkspaceCacheLayout,
         root_drift_epoch: &AtomicU64,
         lease: &crate::workspace_lease::WorkspaceLease,
@@ -313,8 +339,15 @@ impl SharedState {
             return (false, false, false);
         };
         let seed = {
-            let Ok(mut guard) = engine.lock() else {
-                tracing::warn!("search engine lock poisoned while capturing root transition");
+            let guard = match engine.acquire_for_owner(stop) {
+                Ok(guard) => Some(guard),
+                Err(crate::tools::search::OwnerLockRefused::Closing) => None,
+                Err(_) => {
+                    tracing::warn!("search engine lock poisoned while capturing root transition");
+                    None
+                }
+            };
+            let Some(mut guard) = guard else {
                 return (false, false, false);
             };
             let Some(engine) = guard.as_mut() else {
@@ -337,7 +370,7 @@ impl SharedState {
             }
         };
         let Some(seed) = seed else {
-            return match Self::apply_workspace_search(engine, lease, |engine| {
+            return match Self::apply_workspace_search(engine, stop, lease, |engine| {
                 engine.replace_published_graph_context_provider(provider)
             }) {
                 super::WorkspaceSearchApply::Applied(()) => (true, false, false),
@@ -346,6 +379,7 @@ impl SharedState {
                     (false, false, false)
                 }
                 super::WorkspaceSearchApply::TransientRefusal
+                | super::WorkspaceSearchApply::Stopping
                 | super::WorkspaceSearchApply::Superseded
                 | super::WorkspaceSearchApply::Released => (false, false, false),
             };
@@ -396,8 +430,15 @@ impl SharedState {
             }
         };
         let mut staged = {
-            let Ok(mut guard) = engine.lock() else {
-                tracing::warn!("search engine lock poisoned while staging root transition");
+            let guard = match engine.acquire_for_owner(stop) {
+                Ok(guard) => Some(guard),
+                Err(crate::tools::search::OwnerLockRefused::Closing) => None,
+                Err(_) => {
+                    tracing::warn!("search engine lock poisoned while staging root transition");
+                    None
+                }
+            };
+            let Some(mut guard) = guard else {
                 return (false, false, false);
             };
             let Some(engine) = guard.as_mut() else {
@@ -419,6 +460,7 @@ impl SharedState {
         };
         let outcome = match Self::apply_workspace_search_checkpointed(
             engine,
+            stop,
             lease,
             |engine, checkpoint| {
                 if root_drift_epoch.load(Ordering::SeqCst) != validation_epoch {
@@ -463,6 +505,7 @@ impl SharedState {
                 return (false, false, false);
             }
             super::WorkspaceSearchApply::TransientRefusal
+            | super::WorkspaceSearchApply::Stopping
             | super::WorkspaceSearchApply::Superseded
             | super::WorkspaceSearchApply::Released => return (false, false, false),
         };
@@ -544,12 +587,13 @@ impl SharedState {
 
     pub(super) fn run_overlay_warmup(
         search_engine: &SharedSearchEngine,
+        stop: &super::OwnerStop,
         overlay_warmup: &Arc<Mutex<OverlayWarmupState>>,
         lease: &crate::workspace_lease::WorkspaceLease,
         keep_going: &dyn Fn() -> bool,
         retry_transient: &mut dyn FnMut() -> bool,
     ) -> super::WorkspaceSearchApply<OverlayWarmupState, String> {
-        let cloned = match search_engine.lock() {
+        let cloned = match search_engine.acquire_for_owner(stop) {
             Ok(guard) => match guard.as_ref() {
                 Some(engine) => {
                     let Some(embedder_config) = engine.embedder_config() else {
@@ -613,6 +657,12 @@ impl SharedState {
                 }
                 None => None,
             },
+            // Leaving is not failing: a stop refuses the admission the same way a poisoned
+            // lock does, and writing `Failed` here would latch the driver's own failure flag
+            // over a clean shutdown.
+            Err(crate::tools::search::OwnerLockRefused::Closing) => {
+                return super::WorkspaceSearchApply::Stopping;
+            }
             Err(e) => {
                 tracing::warn!("overlay warmup: engine lock error: {e}");
                 Self::set_overlay_warmup_state(
@@ -692,6 +742,13 @@ impl SharedState {
         // The stop/ownership signal is honoured even when the embed set was EMPTY (the
         // in-batch checks never ran): a stopped driver must not publish anything.
         if !keep_going() {
+            // Which of the two it was decides what the caller does with it. A stop is
+            // answered by leaving, with nothing written and no obligation touched; only a
+            // lease that is really gone is the terminal "ownership lost" that disarms the
+            // driver for good.
+            if stop.is_stopped() {
+                return super::WorkspaceSearchApply::Stopping;
+            }
             tracing::warn!("overlay warmup: stopped before publish");
             Self::set_overlay_warmup_state(
                 overlay_warmup,
@@ -699,7 +756,7 @@ impl SharedState {
             );
             return super::WorkspaceSearchApply::Released;
         }
-        let mut prepared = match search_engine.lock() {
+        let mut prepared = match search_engine.acquire_for_owner(stop) {
             Ok(guard) => match guard.as_ref() {
                 Some(engine) => match engine.stage_workspace_overlay_publication(
                     plan,
@@ -721,6 +778,9 @@ impl SharedState {
                     );
                 }
             },
+            Err(crate::tools::search::OwnerLockRefused::Closing) => {
+                return super::WorkspaceSearchApply::Stopping;
+            }
             Err(error) => {
                 return super::WorkspaceSearchApply::OperationError(format!(
                     "engine lock error: {error}"
@@ -729,6 +789,9 @@ impl SharedState {
         };
         let published = loop {
             if !keep_going() {
+                if stop.is_stopped() {
+                    return super::WorkspaceSearchApply::Stopping;
+                }
                 return super::WorkspaceSearchApply::Released;
             }
             #[cfg(test)]
@@ -745,12 +808,18 @@ impl SharedState {
             }
             match Self::apply_workspace_search_checkpointed(
                 search_engine,
+                stop,
                 lease,
                 |engine, checkpoint| {
                     engine.apply_staged_workspace_overlay_publication(&mut prepared, checkpoint)
                 },
             ) {
                 super::WorkspaceSearchApply::Applied(published) => break Ok(published),
+                // Told to leave: not a refusal, so no pause and no retry. Nothing of this pass
+                // is lost that a later one cannot redo.
+                super::WorkspaceSearchApply::Stopping => {
+                    return super::WorkspaceSearchApply::Stopping
+                }
                 super::WorkspaceSearchApply::TransientRefusal if retry_transient() => {}
                 super::WorkspaceSearchApply::TransientRefusal => {
                     return super::WorkspaceSearchApply::TransientRefusal
@@ -826,20 +895,24 @@ impl SharedState {
     /// search chunk whose owning file was marked context-dirty by an `.xml` drift, so a
     /// metadata edit becomes visible without waiting for the owning `.bsl` to change. This
     /// runs on the graph's background publish thread — never on a query path — because the
-    /// freshly published graph is the "caught up" state a re-render must read. `build_start_seq`
+    /// freshly published graph is the "caught up" state a re-render must read. `mark_bound`
     /// (captured when this build STARTED) bounds the marks it may clear: only drifts this
     /// build already reflects, never one stamped after it began, so a mark is never cleared
     /// against a graph that predates its `.xml` change. Opens the just-published graph
     /// database for the render; when the graph is unavailable nothing is cleared and the
     /// marks persist for the next publish. Never touches the resident mutex.
     /// Returns whether the render actually ran to completion. The caller turns that into its
-    /// own obligation: a requested topology refresh is re-raised for the next publish, and a
-    /// leftover-marks pickup keeps its captured bound. Reporting a skip as done would discharge
+    /// own obligation: a requested topology refresh is re-raised for the next publish, and the
+    /// marks offered stay placed for the next consume. Reporting a skip as done would discharge
     /// an obligation nothing has met, so every path answers for what was DONE — never for what
     /// was asked.
+    // The test-side spelling of the call the hook makes, argument for argument; naming a
+    // struct for it would only rename the hook's own inputs.
+    #[allow(clippy::too_many_arguments)]
     #[cfg(test)]
     fn refresh_search_contexts_after_graph(
         engine: &SharedSearchEngine,
+        stop: &super::OwnerStop,
         workspace_root: &Path,
         semantic_runtime: &Arc<Mutex<SemanticRuntimeStatus>>,
         index_progress: &Arc<IndexProgress>,
@@ -850,6 +923,7 @@ impl SharedState {
         let cache = crate::cache::WorkspaceCacheLayout::for_workspace(workspace_root);
         Self::refresh_search_contexts_after_graph_with_cache(
             engine,
+            stop,
             &cache,
             semantic_runtime,
             index_progress,
@@ -867,6 +941,7 @@ impl SharedState {
     )]
     fn refresh_search_contexts_after_graph_with_cache(
         engine: &SharedSearchEngine,
+        stop: &super::OwnerStop,
         cache: &crate::cache::WorkspaceCacheLayout,
         semantic_runtime: &Arc<Mutex<SemanticRuntimeStatus>>,
         index_progress: &Arc<IndexProgress>,
@@ -877,14 +952,14 @@ impl SharedState {
     ) -> bool {
         let crate::graph::GraphPublishSignal {
             drift_pending,
-            build_start_seq,
+            mark_bound,
             topology_changed,
             topology,
             ..
         } = signal;
         // Fast-path skip (an optimization, not correctness): a follow-up reload is already
         // catching up, so let ITS publish re-render against the fresher graph. Correctness
-        // does not depend on this — the `build_start_seq` bound below already prevents
+        // does not depend on this — the `mark_bound` bound below already prevents
         // clearing a mark against a graph that predates its drift. Nothing was rendered, so
         // the caller keeps whatever obligation it was discharging.
         if drift_pending {
@@ -917,7 +992,7 @@ impl SharedState {
             }
         }
         let provider = crate::graph_query::GraphDbContextProvider::new(graph_db);
-        let refreshed = match engine.lock() {
+        let refreshed = match engine.acquire_for_owner(stop) {
             Ok(guard) => match guard.as_ref() {
                 Some(engine) => {
                     let mut apply = |operation: &mut dyn FnMut(
@@ -931,7 +1006,7 @@ impl SharedState {
                     };
                     engine.refresh_dirty_contexts_fenced(
                         &provider,
-                        build_start_seq,
+                        mark_bound,
                         topology_changed,
                         &mut apply,
                     )
@@ -940,6 +1015,12 @@ impl SharedState {
                     "workspace search engine is not published".to_owned(),
                 )),
             },
+            // Either way the hook reports the obligation unhandled and it stays owed; only
+            // the wording differs, and calling a stop a poisoning would send a reader after
+            // a failure that never happened.
+            Err(crate::tools::search::OwnerLockRefused::Closing) => {
+                Err(bsl_search::SearchError::Index("the daemon is shutting down".to_owned()))
+            }
             Err(error) => Err(bsl_search::SearchError::Index(format!(
                 "workspace search engine lock poisoned: {error}"
             ))),
@@ -977,6 +1058,7 @@ impl SharedState {
         {
             Self::kick_context_reembed(
                 engine,
+                stop,
                 semantic_runtime,
                 index_progress,
                 embed_flight,
@@ -993,6 +1075,7 @@ impl SharedState {
     /// results, already fresh from the refresh, are the whole story).
     fn kick_context_reembed(
         engine: &SharedSearchEngine,
+        stop: &super::OwnerStop,
         semantic_runtime: &Arc<Mutex<SemanticRuntimeStatus>>,
         index_progress: &Arc<IndexProgress>,
         embed_flight: &Arc<EmbedFlight>,
@@ -1001,7 +1084,7 @@ impl SharedState {
     ) {
         // A no-embedder engine has nothing to re-embed; resolve the DB path only if semantic
         // is live so we never claim the flight for a pass that would do nothing.
-        let db_path = engine.lock().ok().and_then(|guard| {
+        let db_path = engine.acquire_for_owner(stop).ok().and_then(|guard| {
             guard
                 .as_ref()
                 .and_then(|engine| engine.has_semantic().then(|| engine.db_path().to_path_buf()))
@@ -1011,6 +1094,7 @@ impl SharedState {
 
         Self::spawn_embed_pass(
             Arc::clone(engine),
+            stop.clone(),
             Arc::clone(semantic_runtime),
             Arc::clone(index_progress),
             Arc::clone(embed_flight),
@@ -1037,6 +1121,7 @@ impl SharedState {
     )]
     pub(super) fn spawn_embed_pass(
         engine: SharedSearchEngine,
+        stop: super::OwnerStop,
         semantic_runtime: Arc<Mutex<SemanticRuntimeStatus>>,
         index_progress: Arc<IndexProgress>,
         embed_flight: Arc<EmbedFlight>,
@@ -1079,10 +1164,20 @@ impl SharedState {
         let worker_lease = lease.clone();
         let keep_running = {
             let lease = lease.clone();
-            move || !lease.is_superseded() && !lease.is_released()
+            // The daemon's stop belongs in the same predicate as the lease: after it, an
+            // owner takes no new resources, and a batch is a network call plus a fenced
+            // write. What has already been paid for finishes; nothing new begins.
+            let stop = stop.clone();
+            move || !stop.is_stopped() && !lease.is_superseded() && !lease.is_released()
         };
+        // Counted before the thread starts, and dropped on every way out: a pass about to run
+        // is an owner a shutdown must still see leave. Without it `owners.live()` could read
+        // zero while this pass was mid-batch, and "every owner has gone" would be a count of
+        // the owners that had bothered to register.
+        let live = stop.enter();
         let spawned =
             std::thread::Builder::new().name("bsl-search-embed".to_owned()).spawn(move || {
+                let _live = live;
                 // Restore the flight claim on any abnormal exit; a clean release calls
                 // `disarm()` first so this never stomps a later owner that already re-claimed.
                 let mut claim_guard = EmbedClaimGuard::new(Arc::clone(&flight));
@@ -1155,8 +1250,17 @@ impl SharedState {
                                 RetryDecision::RetryAfter(delay) => delay,
                                 RetryDecision::Stop(_) => return false,
                             };
-                            std::thread::sleep(delay);
-                            !publish_retry.expired(Instant::now())
+                            // Waiting is not working: the claim stays (nobody else may start a
+                            // pass), but the backend is free to go idle while the pause runs.
+                            // BOTH signals have to say so — `background_work_active` reads the
+                            // flight AND the index progress, and the progress flag is raised
+                            // for the whole enclosing pass, so lowering only the flight left
+                            // the process pinned for a backoff of up to half an hour.
+                            flight.pause();
+                            let _paused = index_progress.pause_pass();
+                            let stopped = stop.sleep(delay);
+                            flight.resume();
+                            !stopped && !publish_retry.expired(Instant::now())
                         },
                     ) {
                         Ok(bsl_search::FenceOutcome::Applied(index)) => {
@@ -1171,7 +1275,7 @@ impl SharedState {
                                 {
                                     hook(EmbedFencePoint::Swap);
                                 }
-                                let swapped = match engine.lock() {
+                                let swapped = match engine.acquire_for_owner(&stop) {
                                     Ok(mut guard) => match guard.as_mut() {
                                         Some(engine) => worker_lease.publish_short(
                                             &mut prepared_index,
@@ -1194,6 +1298,20 @@ impl SharedState {
                                             return;
                                         }
                                     },
+                                    // Told to go with the index already built: the pass leaves
+                                    // it unpublished, and says so as a SHUTDOWN rather than a
+                                    // failed publication. Saying nothing at all is what left
+                                    // `Indexing` standing after the daemon had stopped — a
+                                    // status that reads "come back in a moment" when nothing
+                                    // is coming.
+                                    Err(crate::tools::search::OwnerLockRefused::Closing) => {
+                                        Self::set_semantic_runtime_status(
+                                            &runtime,
+                                            SemanticRuntimeStatus::Stopped,
+                                        );
+                                        status_guard.finish();
+                                        return;
+                                    }
                                     Err(e) => {
                                         tracing::warn!("embedding pass: engine lock error: {e}");
                                         Self::set_semantic_runtime_status(
@@ -1224,13 +1342,30 @@ impl SharedState {
                                         if let RetryDecision::RetryAfter(delay) =
                                             publish_retry.refused(Instant::now(), delay)
                                         {
-                                            std::thread::sleep(delay);
-                                            if !publish_retry.expired(Instant::now()) {
+                                            flight.pause();
+                                            let stopped = stop.sleep(delay);
+                                            flight.resume();
+                                            if !stopped && !publish_retry.expired(Instant::now()) {
                                                 continue;
                                             }
                                         }
                                         retry_refusal = true;
                                         break;
+                                    }
+                                    crate::workspace_lease::LeaseOperationOutcome::Superseded
+                                    | crate::workspace_lease::LeaseOperationOutcome::Released
+                                        if stop.is_stopped() =>
+                                    {
+                                        // The pass's own `keep_running` reads the stop, so a
+                                        // shutdown reaches here as a released fence. Reporting
+                                        // it as a superseded ownership names a takeover that
+                                        // never happened.
+                                        Self::set_semantic_runtime_status(
+                                            &runtime,
+                                            SemanticRuntimeStatus::Stopped,
+                                        );
+                                        status_guard.finish();
+                                        return;
                                     }
                                     crate::workspace_lease::LeaseOperationOutcome::Superseded
                                     | crate::workspace_lease::LeaseOperationOutcome::Released => {
@@ -1247,10 +1382,22 @@ impl SharedState {
                                     crate::workspace_lease::LeaseOperationOutcome::OperationError(
                                         error,
                                     ) => {
+                                        // The wrapper has no Display of its own, and its
+                                        // Debug reaches `search status` verbatim — the
+                                        // variant name and its braces where a message
+                                        // belongs. The error inside is what a reader needs.
+                                        let error = match error {
+                                            crate::workspace_lease::LeaseOperationError::Lease(
+                                                error,
+                                            ) => error.to_string(),
+                                            crate::workspace_lease::LeaseOperationError::Operation(
+                                                error,
+                                            ) => error.to_string(),
+                                        };
                                         Self::set_semantic_runtime_status(
                                             &runtime,
                                             SemanticRuntimeStatus::Failed(format!(
-                                                "embedding publication failed: {error:?}"
+                                                "embedding publication failed: {error}"
                                             )),
                                         );
                                         status_guard.finish();
@@ -1260,7 +1407,30 @@ impl SharedState {
                             }
                         }
                         Ok(bsl_search::FenceOutcome::TransientRefusal) => {
+                            // Counted HERE, where the refusal happened. Without this the only
+                            // call on this path was the one that deliberately does not count
+                            // (`refused_again`, for a refusal already counted), so the streak
+                            // never moved and every pause it asked for was `retry_delay(0)` —
+                            // zero. The whole pass, embedder calls included, repeated back to
+                            // back until the budget ran out, where every other branch backs
+                            // off thirty seconds, then a minute, and so on.
+                            let delay = super::overlay_retry::retry_delay(publish_retry.streak());
+                            let _ = publish_retry.refused(Instant::now(), delay);
                             retry_refusal = true;
+                        }
+                        Ok(
+                            bsl_search::FenceOutcome::Superseded
+                            | bsl_search::FenceOutcome::Released,
+                        ) if stop.is_stopped() => {
+                            // Same fence, same reason as the publication arm above: the pass's
+                            // own `keep_running` reads the stop, so a shutdown arrives here as
+                            // a released fence rather than as a takeover.
+                            Self::set_semantic_runtime_status(
+                                &runtime,
+                                SemanticRuntimeStatus::Stopped,
+                            );
+                            status_guard.finish();
+                            return;
                         }
                         Ok(
                             bsl_search::FenceOutcome::Superseded
@@ -1289,8 +1459,11 @@ impl SharedState {
                         }
                     }
                     let retry_wait = if retry_refusal {
+                        // The refusal was counted where it happened. Counting it again here
+                        // would double every step of the backoff against the schedule every
+                        // other retry owner follows.
                         let delay = super::overlay_retry::retry_delay(publish_retry.streak());
-                        match publish_retry.refused(Instant::now(), delay) {
+                        match publish_retry.refused_again(Instant::now(), delay) {
                             RetryDecision::RetryAfter(delay) => {
                                 let _ = flight.claim();
                                 Some(delay)
@@ -1320,7 +1493,19 @@ impl SharedState {
                     }
                     // A rerun was requested during the pass; loop again for its NULL chunks.
                     if let Some(delay) = retry_wait {
-                        std::thread::sleep(delay);
+                        flight.pause();
+                        let stopped = stop.sleep(delay);
+                        flight.resume();
+                        if stopped {
+                            claim_guard.disarm();
+                            flight.release();
+                            Self::set_semantic_runtime_status(
+                                &runtime,
+                                SemanticRuntimeStatus::Stopped,
+                            );
+                            status_guard.finish();
+                            return;
+                        }
                     }
                 }
             });
@@ -1336,9 +1521,111 @@ impl SharedState {
 }
 
 #[cfg(test)]
+mod publication_retry_accounting {
+    /// One refusal moves the backoff one step. The publication counts a refusal where it
+    /// happens and asks for the pause afterwards, so the same refusal reaches the window
+    /// twice — and the second call must be the form that does not count it again. The
+    /// schedule itself is proved by `state::retry_window::tests`; what a unit test cannot
+    /// see from there is which form this file calls, so it is counted here.
+    ///
+    /// The needles are assembled at run time: spelled out, they would match this gate's own
+    /// source and pass for the wrong reason.
+    #[test]
+    fn one_refusal_of_a_publication_reaches_the_window_once() {
+        let source = include_str!("embed.rs");
+        // A CRLF checkout (core.autocrlf on Windows, no .gitattributes pinning LF) gives this
+        // file "\r\n" endings, and a needle anchored on "\n" would then match nothing — the
+        // gate would fail on the line endings rather than on the code, in the very CI step that
+        // runs it by name. Normalised first, so the gate is about the source and not the
+        // checkout.
+        let source = &source.replace("\r\n", "\n");
+        let cut = ["\n#[cfg(test)]\n", "mod tests {"].concat();
+        assert_eq!(
+            source.matches(&cut).count(),
+            1,
+            "the production/test cut moved; this gate scans only what it can prove it scanned"
+        );
+        let production = source.split(&cut).next().unwrap_or(source);
+        let counted = ["publish_retry", ".refused("].concat();
+        let again = ["publish_retry", ".refused_again("].concat();
+        assert_eq!(
+            production.matches(&counted).count(),
+            3,
+            "a refusal is counted where it happens: once per place that observes one — the \
+             publication's own refusal, the fence's, and the swap's"
+        );
+        assert_eq!(
+            production.matches(&again).count(),
+            1,
+            "the pause for a refusal already counted is asked for with `refused_again`; \
+             counting it again doubles every step of the backoff"
+        );
+    }
+}
+
+#[cfg(test)]
+mod embed_exit_status {
+    /// Every way out of the pass writes a terminal runtime status before it silences the
+    /// guard.
+    ///
+    /// `EmbedStatusGuard` exists to make sure `Indexing` never outlives the pass: on any exit
+    /// that did not write a status of its own, its drop writes `Failed`. `finish()` silences
+    /// that fallback, so a `finish()` with no terminal write ahead of it leaves `Indexing`
+    /// standing — a status that says "come back in a moment" after the daemon has stopped, and
+    /// nothing is coming. The stop exits were exactly that: deliberately quiet, because a
+    /// shutdown is not a failed publication, and quiet is what left the lie behind.
+    ///
+    /// Counted rather than reviewed, because the next exit added will be added by someone who
+    /// has not read this. The needles are assembled at run time: spelled out, they would match
+    /// this gate's own source and pass for the wrong reason.
+    #[test]
+    fn every_exit_of_the_pass_says_how_it_ended() {
+        let source = include_str!("embed.rs");
+        // A CRLF checkout (core.autocrlf on Windows, no .gitattributes pinning LF) gives this
+        // file "\r\n" endings, and a needle anchored on "\n" would then match nothing — the
+        // gate would fail on the line endings rather than on the code, in the very CI step that
+        // runs it by name. Normalised first, so the gate is about the source and not the
+        // checkout.
+        let source = &source.replace("\r\n", "\n");
+        let cut = ["\n#[cfg(test)]\n", "mod tests {"].concat();
+        assert_eq!(
+            source.matches(&cut).count(),
+            1,
+            "the production/test cut moved; this gate scans only what it can prove it scanned",
+        );
+        let production = source.split(&cut).next().unwrap_or(source);
+        let finish = ["status_guard", ".finish();"].concat();
+        let writes = ["set_semantic_runtime_status", "("].concat();
+        let terminal = ["SemanticRuntimeStatus::", "Ready"].concat();
+        let failed = ["SemanticRuntimeStatus::", "Failed"].concat();
+        let stopped = ["SemanticRuntimeStatus::", "Stopped"].concat();
+
+        let exits = production.match_indices(&finish).count();
+        assert!(exits > 0, "the pass has no exits at all; the needle must have moved");
+        for (at, _) in production.match_indices(&finish) {
+            // The window between this exit and the previous one: the status it wrote, if any.
+            let from = production[..at].rfind(&finish).map_or(0, |prev| prev + finish.len());
+            let window = &production[from..at];
+            assert!(
+                window.contains(&writes)
+                    && (window.contains(&terminal)
+                        || window.contains(&failed)
+                        || window.contains(&stopped)),
+                "an exit of the embedding pass silences the guard without saying how it ended, \
+                 which leaves the runtime reading `Indexing` for a pass that is over:\n{window}",
+            );
+        }
+        assert!(
+            production.contains(&stopped),
+            "a stop is a terminal outcome of its own and must be said as one",
+        );
+    }
+}
+
+#[cfg(test)]
 mod flight_mirror_ownership {
     /// The mirror exists so the broker can read the claim without waiting, and it is only
-    /// trustworthy while it is written under the same lock as the field. `set_in_flight` is
+    /// trustworthy while it is written under the same lock as the field. `publish_working` is
     /// the one place that can do that safely, so a second hand-written store is a defect by
     /// construction — this counts them rather than trusting review to notice the next one.
     ///
@@ -1347,6 +1634,12 @@ mod flight_mirror_ownership {
     #[test]
     fn only_one_writer_publishes_the_claim_mirror() {
         let source = include_str!("embed.rs");
+        // A CRLF checkout (core.autocrlf on Windows, no .gitattributes pinning LF) gives this
+        // file "\r\n" endings, and a needle anchored on "\n" would then match nothing — the
+        // gate would fail on the line endings rather than on the code, in the very CI step that
+        // runs it by name. Normalised first, so the gate is about the source and not the
+        // checkout.
+        let source = &source.replace("\r\n", "\n");
         let cut = ["\n#[cfg(test)]\n", "mod tests {"].concat();
         assert_eq!(
             source.matches(&cut).count(),
@@ -1358,7 +1651,7 @@ mod flight_mirror_ownership {
         assert_eq!(
             production.matches(&stores).count(),
             1,
-            "publish the claim mirror through set_in_flight, which holds the lock while it does"
+            "publish the claim mirror through publish_working, which holds the lock while it does"
         );
     }
 }
@@ -1488,13 +1781,14 @@ mod tests {
         cache.ensure().unwrap();
         let db_path = cache.search_db_path();
         seed_pending_embedding(&db_path);
-        let engine = Arc::new(Mutex::new(Some(
+        let engine = crate::state::shared_engine(Some(
             SearchEngine::new(&db_path, mock_semantic_config(server)).unwrap(),
-        )));
+        ));
         let runtime = Arc::new(Mutex::new(crate::state::SemanticRuntimeStatus::Indexing));
         let flight = super::EmbedFlight::new();
         SharedState::spawn_embed_pass(
             Arc::clone(&engine),
+            crate::state::OwnerStop::default(),
             Arc::clone(&runtime),
             bsl_search::IndexProgress::new(),
             Arc::clone(&flight),
@@ -1535,9 +1829,10 @@ mod tests {
         let index_progress = bsl_search::IndexProgress::new();
         let embed_flight = super::EmbedFlight::new();
         Arc::new(move |signal: crate::graph::GraphPublishSignal| {
-            let bound = signal.build_start_seq;
+            let bound = signal.mark_bound;
             let handled = SharedState::refresh_search_contexts_after_graph(
                 &engine_arc,
+                &crate::state::OwnerStop::default(),
                 &workspace,
                 &semantic_runtime,
                 &index_progress,
@@ -1611,12 +1906,13 @@ mod tests {
         engine.initialize_workspace_roots(boot_roots).unwrap();
         let boot_provider: Arc<dyn bsl_search::GraphContextProvider> = Arc::new(BootGraphProvider);
         engine.set_graph_context_provider(Arc::clone(&boot_provider));
-        let engine: super::SharedSearchEngine = Arc::new(Mutex::new(Some(engine)));
+        let engine: super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
         let semantic_runtime = Arc::new(Mutex::new(crate::state::SemanticRuntimeStatus::Disabled));
         let progress = bsl_search::IndexProgress::new();
         let flight = super::EmbedFlight::new();
         let hook = SharedState::build_publish_hook(
             Arc::clone(&engine),
+            crate::state::OwnerStop::default(),
             crate::cache::WorkspaceCacheLayout::for_workspace(&workspace),
             Arc::clone(&semantic_runtime),
             Arc::clone(&progress),
@@ -1671,9 +1967,10 @@ mod tests {
             bsl_search::WorkspaceRoots::build(&workspace, &workspace.join("cf"), &[]);
         engine.initialize_workspace_roots(boot_roots).unwrap();
         engine.set_graph_context_provider(Arc::new(BootGraphProvider));
-        let engine: super::SharedSearchEngine = Arc::new(Mutex::new(Some(engine)));
+        let engine: super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
         let hook = SharedState::build_publish_hook(
             Arc::clone(&engine),
+            crate::state::OwnerStop::default(),
             cache.clone(),
             Arc::new(Mutex::new(crate::state::SemanticRuntimeStatus::Disabled)),
             bsl_search::IndexProgress::new(),
@@ -1713,7 +2010,7 @@ mod tests {
         let (boot_roots, _) =
             bsl_search::WorkspaceRoots::build(&workspace, &workspace.join("cf"), &[]);
         search.initialize_workspace_roots(boot_roots).unwrap();
-        let engine: super::SharedSearchEngine = Arc::new(Mutex::new(Some(search)));
+        let engine: super::SharedSearchEngine = crate::state::shared_engine(Some(search));
         let observed = Arc::new(AtomicUsize::new(0));
         let observed_in_hook = Arc::clone(&observed);
         let checked_engine = Arc::clone(&engine);
@@ -1738,7 +2035,7 @@ mod tests {
         assert!(matches!(graph.status(), crate::graph::GraphStatus::Ready { .. }));
         let signal = crate::graph::GraphPublishSignal {
             drift_pending: false,
-            build_start_seq: 0,
+            mark_bound: 0,
             topology_changed: false,
             topology: built_graph_topology(&workspace),
             roots_refresh_requested: true,
@@ -1748,6 +2045,7 @@ mod tests {
         };
         let outcome = SharedState::refresh_search_roots_after_graph(
             &engine,
+            &crate::state::OwnerStop::default(),
             &crate::cache::WorkspaceCacheLayout::for_workspace(&workspace),
             &AtomicU64::new(0),
             &crate::workspace_lease::WorkspaceLease::unmanaged(),
@@ -1773,7 +2071,7 @@ mod tests {
         let (boot_roots, _) =
             bsl_search::WorkspaceRoots::build(&workspace, &workspace.join("cf"), &[]);
         search.initialize_workspace_roots(boot_roots).unwrap();
-        let engine: super::SharedSearchEngine = Arc::new(Mutex::new(Some(search)));
+        let engine: super::SharedSearchEngine = crate::state::shared_engine(Some(search));
 
         let graph = crate::graph::GraphState::for_workspace(workspace.clone());
         graph.ensure_loading();
@@ -1786,7 +2084,7 @@ mod tests {
         assert!(matches!(graph.status(), crate::graph::GraphStatus::Ready { .. }));
         let signal = crate::graph::GraphPublishSignal {
             drift_pending: false,
-            build_start_seq: 0,
+            mark_bound: 0,
             topology_changed: false,
             topology: built_graph_topology(&workspace),
             roots_refresh_requested: true,
@@ -1807,6 +2105,7 @@ mod tests {
         });
         let outcome = SharedState::refresh_search_roots_after_graph(
             &engine,
+            &crate::state::OwnerStop::default(),
             &crate::cache::WorkspaceCacheLayout::for_workspace(&workspace),
             root_drift_epoch.as_ref(),
             &crate::workspace_lease::WorkspaceLease::unmanaged(),
@@ -1870,11 +2169,12 @@ mod tests {
             SearchEngine::new(&workspace.join("search.db"), mock_semantic_config(&mock)).unwrap();
         let (roots, _) = bsl_search::WorkspaceRoots::build(workspace, workspace, &[]);
         engine.set_workspace_roots(roots);
-        let engine_arc: super::SharedSearchEngine = Arc::new(Mutex::new(Some(engine)));
+        let engine_arc: super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
         let overlay_warmup = Arc::new(Mutex::new(crate::state::OverlayWarmupState::Pending));
 
         SharedState::run_overlay_warmup(
             &engine_arc,
+            &crate::state::OwnerStop::default(),
             &overlay_warmup,
             &crate::workspace_lease::WorkspaceLease::unmanaged(),
             &|| false,
@@ -1908,13 +2208,14 @@ mod tests {
             SearchEngine::new(&workspace.join("search.db"), mock_semantic_config(&mock)).unwrap();
         let (roots, _) = bsl_search::WorkspaceRoots::build(workspace, workspace, &[]);
         engine.set_workspace_roots(roots);
-        let engine_arc: super::SharedSearchEngine = Arc::new(Mutex::new(Some(engine)));
+        let engine_arc: super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
         let overlay_warmup = Arc::new(Mutex::new(crate::state::OverlayWarmupState::Pending));
 
         // The first check (pre-publish) passes; the stop lands before the post-lock one.
         let calls = AtomicUsize::new(0);
         SharedState::run_overlay_warmup(
             &engine_arc,
+            &crate::state::OwnerStop::default(),
             &overlay_warmup,
             &crate::workspace_lease::WorkspaceLease::unmanaged(),
             &|| calls.fetch_add(1, Ordering::SeqCst) == 0,
@@ -1956,7 +2257,7 @@ mod tests {
             SearchEngine::new(&workspace.join("search.db"), mock_semantic_config(&mock)).unwrap();
         let (roots, _) = bsl_search::WorkspaceRoots::build(workspace, workspace, &[]);
         engine.set_workspace_roots(roots);
-        let engine_arc: super::SharedSearchEngine = Arc::new(Mutex::new(Some(engine)));
+        let engine_arc: super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
         let overlay_warmup = Arc::new(Mutex::new(crate::state::OverlayWarmupState::Pending));
 
         std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -1969,6 +2270,7 @@ mod tests {
         }
         SharedState::run_overlay_warmup(
             &engine_arc,
+            &crate::state::OwnerStop::default(),
             &overlay_warmup,
             &crate::workspace_lease::WorkspaceLease::unmanaged(),
             &|| true,
@@ -2013,7 +2315,7 @@ mod tests {
             SearchEngine::new(&workspace.join("search.db"), mock_semantic_config(&mock)).unwrap();
         let (roots, _) = bsl_search::WorkspaceRoots::build(workspace, workspace, &[]);
         engine.set_workspace_roots(roots);
-        let engine_arc: super::SharedSearchEngine = Arc::new(Mutex::new(Some(engine)));
+        let engine_arc: super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
         let overlay_warmup = Arc::new(Mutex::new(crate::state::OverlayWarmupState::Pending));
 
         std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -2023,6 +2325,7 @@ mod tests {
         }
         SharedState::run_overlay_warmup(
             &engine_arc,
+            &crate::state::OwnerStop::default(),
             &overlay_warmup,
             &crate::workspace_lease::WorkspaceLease::unmanaged(),
             &|| true,
@@ -2098,7 +2401,7 @@ mod tests {
             engine.search_with_embedding(&[1.0, 0.0, 0.0], 5, Some("code")).unwrap().is_empty(),
             "no vector is live before the kick",
         );
-        let engine_arc: super::SharedSearchEngine = Arc::new(Mutex::new(Some(engine)));
+        let engine_arc: super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
 
         let semantic_runtime = Arc::new(Mutex::new(crate::state::SemanticRuntimeStatus::Indexing));
         let index_progress = bsl_search::IndexProgress::new();
@@ -2106,6 +2409,7 @@ mod tests {
 
         SharedState::kick_context_reembed(
             &engine_arc,
+            &crate::state::OwnerStop::default(),
             &semantic_runtime,
             &index_progress,
             &embed_flight,
@@ -2171,7 +2475,7 @@ mod tests {
         }
         let mut engine = SearchEngine::new(&db_path, mock_semantic_config(&mock)).unwrap();
         engine.set_workspace_root(dir.path());
-        let engine_arc: super::SharedSearchEngine = Arc::new(Mutex::new(Some(engine)));
+        let engine_arc: super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
 
         let semantic_runtime = Arc::new(Mutex::new(crate::state::SemanticRuntimeStatus::Ready));
         let index_progress = bsl_search::IndexProgress::new();
@@ -2180,6 +2484,7 @@ mod tests {
 
         SharedState::kick_context_reembed(
             &engine_arc,
+            &crate::state::OwnerStop::default(),
             &semantic_runtime,
             &index_progress,
             &embed_flight,
@@ -2243,7 +2548,7 @@ mod tests {
         let mut engine = SearchEngine::new(&db_path, mock_semantic_config(&mock)).unwrap();
         engine.set_workspace_root(&workspace);
         engine.enable_workspace_watcher_mode();
-        let engine_arc: super::SharedSearchEngine = Arc::new(Mutex::new(Some(engine)));
+        let engine_arc: super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
 
         // Wire the SAME publish hook the daemon builds, so the graph's real publish — not a
         // hand-call — drives the context refresh and re-embed.
@@ -2252,6 +2557,7 @@ mod tests {
         let embed_flight = super::EmbedFlight::new();
         let hook = SharedState::build_publish_hook(
             Arc::clone(&engine_arc),
+            crate::state::OwnerStop::default(),
             crate::cache::WorkspaceCacheLayout::for_workspace(&workspace),
             Arc::clone(&semantic_runtime),
             Arc::clone(&index_progress),
@@ -2263,10 +2569,6 @@ mod tests {
         );
         let graph =
             crate::graph::GraphState::for_workspace(workspace.clone()).with_publish_hook(hook);
-        // Wire the mark-seq source as the daemon does at boot, so the nudged build captures a
-        // bound that covers the mark this drift stamps. An unwired build captures bound 0 and
-        // clears nothing.
-        graph.set_mark_seq_source(engine_arc.lock().unwrap().as_ref().unwrap().mark_seq_handle());
 
         // The xml drift marks the owned module context-dirty and nudges the graph; the nudged
         // build publishes and fires the hook automatically.
@@ -2277,7 +2579,13 @@ mod tests {
             kind: ChangeKind::MaybeChanged,
             seq: 1,
         };
-        SharedState::apply_search_drift(&engine_arc, &[entry], false, &graph);
+        SharedState::apply_search_drift(
+            &engine_arc,
+            &crate::state::OwnerStop::default(),
+            &[entry],
+            false,
+            &graph,
+        );
         {
             let guard = engine_arc.lock().unwrap();
             let dirty = guard.as_ref().unwrap().context_dirty_paths("code").unwrap();
@@ -2360,7 +2668,7 @@ mod tests {
         let mut engine = SearchEngine::fts_only(&db_path).unwrap();
         engine.set_workspace_root(&workspace);
         engine.enable_workspace_watcher_mode();
-        let engine_arc: super::SharedSearchEngine = Arc::new(Mutex::new(Some(engine)));
+        let engine_arc: super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
 
         // Mark the owned module context-dirty (disabled graph → the nudge is a no-op here).
         let xml = workspace.join("CommonModules/Сервер.xml");
@@ -2372,6 +2680,7 @@ mod tests {
         };
         SharedState::apply_search_drift(
             &engine_arc,
+            &crate::state::OwnerStop::default(),
             &[entry],
             false,
             &crate::graph::GraphState::disabled(),
@@ -2407,6 +2716,7 @@ mod tests {
         // An unbounded seq (i64::MAX) isolates the drift_pending skip from the seq bound.
         SharedState::refresh_search_contexts_after_graph(
             &engine_arc,
+            &crate::state::OwnerStop::default(),
             &workspace,
             &semantic_runtime,
             &index_progress,
@@ -2414,7 +2724,7 @@ mod tests {
             &crate::workspace_lease::WorkspaceLease::unmanaged(),
             crate::graph::GraphPublishSignal {
                 drift_pending: true,
-                build_start_seq: i64::MAX,
+                mark_bound: i64::MAX,
                 topology_changed: false,
                 topology: built_graph_topology(&workspace),
                 roots_refresh_requested: false,
@@ -2436,6 +2746,7 @@ mod tests {
         // drift_pending = false → consume: the mark is cleared against the fresh graph.
         SharedState::refresh_search_contexts_after_graph(
             &engine_arc,
+            &crate::state::OwnerStop::default(),
             &workspace,
             &semantic_runtime,
             &index_progress,
@@ -2443,7 +2754,7 @@ mod tests {
             &crate::workspace_lease::WorkspaceLease::unmanaged(),
             crate::graph::GraphPublishSignal {
                 drift_pending: false,
-                build_start_seq: i64::MAX,
+                mark_bound: i64::MAX,
                 topology_changed: false,
                 topology: built_graph_topology(&workspace),
                 roots_refresh_requested: false,
@@ -2463,13 +2774,11 @@ mod tests {
         }
     }
 
-    /// A graph whose mark-seq source is NOT yet wired (the boot window before
-    /// `set_mark_seq_source`) captures the unwired default bound (`0`), so its publish's
-    /// consume clears NOTHING — never a mark stamped before the source existed. Reverting the
-    /// unwired default from `0` back to `i64::MAX` makes the publish consume the mark and the
-    /// survival assertion fails.
+    /// A publication consumes only the marks it was handed, with the fact that caused them. A
+    /// mark nobody handed to the graph — stamped straight into the store — gets bound `0` and
+    /// survives the publish; an unbounded consume would clear it.
     #[test]
-    fn an_unwired_graph_publish_cannot_clear_context_marks() {
+    fn a_publication_clears_no_mark_nobody_handed_it() {
         use bsl_search::{Chunk, ChunkKind, SearchEngine, Store};
         use std::sync::atomic::Ordering;
         use std::time::{Duration, Instant};
@@ -2508,7 +2817,7 @@ mod tests {
         let mut engine = SearchEngine::fts_only(&db_path).unwrap();
         engine.set_workspace_root(&workspace);
         engine.enable_workspace_watcher_mode();
-        let engine_arc: super::SharedSearchEngine = Arc::new(Mutex::new(Some(engine)));
+        let engine_arc: super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
 
         let semantic_runtime = Arc::new(Mutex::new(crate::state::SemanticRuntimeStatus::Ready));
         let index_progress = bsl_search::IndexProgress::new();
@@ -2527,6 +2836,7 @@ mod tests {
             Arc::new(move |signal: crate::graph::GraphPublishSignal| {
                 let handled = SharedState::refresh_search_contexts_after_graph(
                     &engine_arc,
+                    &crate::state::OwnerStop::default(),
                     &workspace,
                     &semantic_runtime,
                     &index_progress,
@@ -2544,7 +2854,7 @@ mod tests {
                 >
         };
 
-        // The graph is never wired to a mark-seq source: its build captures the unwired default.
+        // The mark was never handed to the graph, so no publication has a bound that covers it.
         let graph =
             crate::graph::GraphState::for_workspace(workspace.clone()).with_publish_hook(hook);
         graph.ensure_loading();
@@ -2562,15 +2872,14 @@ mod tests {
                 .context_dirty_paths("code")
                 .unwrap()
                 .contains(&bsl_search::FileKey::configuration(module_rel)),
-            "an unwired build's publish (bound 0) clears no marks; the mark survives",
+            "a publication with nothing handed to it (bound 0) clears no marks; the mark survives",
         );
     }
 
-    /// Marks a PRIOR daemon run left in `context_dirty` survive the boot build's unwired publish
-    /// (as the test above shows), then are consumed by the explicit leftover pickup once the
-    /// mark-seq source is wired: a wired-bound consume against the already-fresh boot graph.
-    /// Removing the `consume_leftover_marks` call leaves the mark stranded and the final
-    /// assertion fails.
+    /// Marks a PRIOR daemon run left in `context_dirty` survive the boot build's publish — no
+    /// consumer had handed them to the graph yet — and are consumed by the explicit leftover
+    /// pickup against the already-fresh boot graph. Removing the `consume_leftover_marks` call
+    /// leaves the mark stranded and the final assertion fails.
     #[test]
     fn leftover_marks_are_consumed_after_boot_wiring() {
         use bsl_search::{Chunk, ChunkKind, SearchEngine, Store};
@@ -2611,7 +2920,7 @@ mod tests {
         engine.set_workspace_root(&workspace);
         engine.enable_workspace_watcher_mode();
         let mark_seq = engine.mark_seq_handle();
-        let engine_arc: super::SharedSearchEngine = Arc::new(Mutex::new(Some(engine)));
+        let engine_arc: super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
 
         let semantic_runtime = Arc::new(Mutex::new(crate::state::SemanticRuntimeStatus::Ready));
         let index_progress = bsl_search::IndexProgress::new();
@@ -2627,6 +2936,7 @@ mod tests {
             Arc::new(move |signal: crate::graph::GraphPublishSignal| {
                 let handled = SharedState::refresh_search_contexts_after_graph(
                     &engine_arc,
+                    &crate::state::OwnerStop::default(),
                     &workspace,
                     &semantic_runtime,
                     &index_progress,
@@ -2644,7 +2954,7 @@ mod tests {
                 >
         };
 
-        // Boot: the graph builds and publishes while UNWIRED, so the leftover mark survives.
+        // Boot: the graph builds and publishes before anyone handed it the leftover mark.
         let graph =
             crate::graph::GraphState::for_workspace(workspace.clone()).with_publish_hook(hook);
         graph.ensure_loading();
@@ -2662,13 +2972,12 @@ mod tests {
                 .context_dirty_paths("code")
                 .unwrap()
                 .contains(&bsl_search::FileKey::configuration(module_rel)),
-            "the leftover mark survives the unwired boot publish",
+            "the leftover mark survives the boot publish nobody handed it to",
         );
 
-        // Boot wiring, then the explicit pickup: a consume bounded by the seq captured at
-        // observation time clears the leftover mark synchronously (the graph is already `Ready`).
+        // The explicit pickup: a consume bounded by the seq captured at observation time
+        // clears the leftover mark synchronously (the graph is already `Ready`).
         let leftover_bound = mark_seq.load(Ordering::SeqCst);
-        graph.set_mark_seq_source(mark_seq);
         graph.consume_leftover_marks(leftover_bound);
 
         assert!(
@@ -2687,8 +2996,8 @@ mod tests {
     /// The leftover pickup must clear ONLY marks that existed when its bound was captured. A
     /// drift the running search sink stamps AFTER the capture (a higher mark seq) must survive
     /// the pickup — its own nudge→publish will resolve it against a graph that reflects it.
-    /// Reverting the direct (`Ready`) fire path to a LIVE `current_mark_seq()` read makes the
-    /// pickup clear the newer mark too, and the survival assertion fails.
+    /// A consume bounded by a LIVE counter read instead of the captured bound would clear the
+    /// newer mark too, and the survival assertion fails.
     #[test]
     fn a_newer_mark_survives_the_leftover_pickups_captured_bound() {
         use bsl_search::{Chunk, ChunkKind, SearchEngine, Store};
@@ -2735,7 +3044,7 @@ mod tests {
         let mark_seq = engine.mark_seq_handle();
         // The bound captured at observation time: the high-water at seq 1 (the leftover only).
         let leftover_bound = mark_seq.load(Ordering::SeqCst);
-        let engine_arc: super::SharedSearchEngine = Arc::new(Mutex::new(Some(engine)));
+        let engine_arc: super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
 
         let semantic_runtime = Arc::new(Mutex::new(crate::state::SemanticRuntimeStatus::Ready));
         let index_progress = bsl_search::IndexProgress::new();
@@ -2751,6 +3060,7 @@ mod tests {
             Arc::new(move |signal: crate::graph::GraphPublishSignal| {
                 let handled = SharedState::refresh_search_contexts_after_graph(
                     &engine_arc,
+                    &crate::state::OwnerStop::default(),
                     &workspace,
                     &semantic_runtime,
                     &index_progress,
@@ -2768,7 +3078,7 @@ mod tests {
                 >
         };
 
-        // Boot: build+publish while UNWIRED, so the leftover mark survives, then wire the source.
+        // Boot: build+publish before the leftover mark is handed over, so it survives.
         let graph =
             crate::graph::GraphState::for_workspace(workspace.clone()).with_publish_hook(hook);
         graph.ensure_loading();
@@ -2777,7 +3087,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(fired.load(Ordering::SeqCst) >= 1, "the boot build published and fired the hook");
-        graph.set_mark_seq_source(mark_seq);
 
         // The search sink stamps a NEW drift (seq 2) after the bound was captured — as it would
         // between publishing the engine and reaching its own nudge→publish.
@@ -2805,18 +3114,10 @@ mod tests {
         );
     }
 
-    /// The deferred (`Loading`) pickup path: arming while the graph is not yet `Ready` stores the
-    /// captured bound, and the build's own publish re-fires the consume with THAT stored bound. A
-    /// newer mark stamped after the capture must still survive. Reverting the deferred fire in
-    /// `notify_published` to a live `current_mark_seq()` read (which on this unwired graph is `0`)
-    /// makes the deferred consume clear nothing, so the leftover-consumed assertion fails.
-    ///
-    /// One publish fires the hook TWICE, and the marks may only be read once both are done: the
-    /// build's own fire carries the unwired `0` bound and clears nothing, and the leftover consume
-    /// that follows is the one that clears. Waiting for a fire COUNT of one would read the store
-    /// while the publish is still between the two, which is a state no caller ever observes. The
-    /// bounds each fire ran with are recorded and asserted, so the wait cannot be satisfied by two
-    /// fires of the wrong kind.
+    /// The deferred (`Loading`) pickup path: leftovers handed over while the graph is not yet
+    /// `Ready` wait in the ledger, and the build's own publish consumes them with the captured
+    /// bound — the one fire it makes. A newer mark stamped after the capture must still
+    /// survive: a consume bounded by a live counter read would clear it too.
     #[test]
     fn a_newer_mark_survives_the_deferred_leftover_pickup() {
         use bsl_search::{Chunk, ChunkKind, SearchEngine, Store};
@@ -2864,7 +3165,7 @@ mod tests {
             engine.mark_workspace_path_context_dirty(workspace.join(newer_rel)).unwrap(),
             "the newer path resolves to a workspace .bsl and receives a higher-seq mark",
         );
-        let engine_arc: super::SharedSearchEngine = Arc::new(Mutex::new(Some(engine)));
+        let engine_arc: super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
 
         let semantic_runtime = Arc::new(Mutex::new(crate::state::SemanticRuntimeStatus::Ready));
         let index_progress = bsl_search::IndexProgress::new();
@@ -2880,9 +3181,10 @@ mod tests {
             let embed_flight = Arc::clone(&embed_flight);
             let fire_bounds = Arc::clone(&fire_bounds);
             Arc::new(move |signal: crate::graph::GraphPublishSignal| {
-                let bound = signal.build_start_seq;
+                let bound = signal.mark_bound;
                 let handled = SharedState::refresh_search_contexts_after_graph(
                     &engine_arc,
+                    &crate::state::OwnerStop::default(),
                     &workspace,
                     &semantic_runtime,
                     &index_progress,
@@ -2900,21 +3202,20 @@ mod tests {
                 >
         };
 
-        // The graph is `Idle` (never wired): arming the pickup here stores the bound but cannot
-        // fire, so the build's own publish runs the deferred consume with the stored bound.
+        // The graph is `Idle`: the leftovers cannot be consumed yet, so they wait for the
+        // build's own publication, which observes every fact there is.
         let graph =
             crate::graph::GraphState::for_workspace(workspace.clone()).with_publish_hook(hook);
         graph.consume_leftover_marks(leftover_bound);
         graph.ensure_loading();
         let deadline = Instant::now() + Duration::from_secs(30);
-        while fire_bounds.lock().unwrap().len() < 2 && Instant::now() < deadline {
+        while fire_bounds.lock().unwrap().is_empty() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(
             *fire_bounds.lock().unwrap(),
-            vec![0, leftover_bound],
-            "the publish fired the build's own unwired consume, then the leftover one with the \
-             stored bound",
+            vec![leftover_bound],
+            "the publish consumed the leftovers with the captured bound, once",
         );
 
         let guard = engine_arc.lock().unwrap();
@@ -2973,7 +3274,7 @@ mod tests {
         let mut engine = SearchEngine::fts_only(&db_path).unwrap();
         engine.set_workspace_root(&workspace);
         engine.enable_workspace_watcher_mode();
-        let engine_arc: super::SharedSearchEngine = Arc::new(Mutex::new(Some(engine)));
+        let engine_arc: super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
 
         let semantic_runtime = Arc::new(Mutex::new(crate::state::SemanticRuntimeStatus::Ready));
         let index_progress = bsl_search::IndexProgress::new();
@@ -2981,6 +3282,7 @@ mod tests {
         let refresh = |topology: u64| {
             SharedState::refresh_search_contexts_after_graph(
                 &engine_arc,
+                &crate::state::OwnerStop::default(),
                 &workspace,
                 &semantic_runtime,
                 &index_progress,
@@ -2988,7 +3290,7 @@ mod tests {
                 &crate::workspace_lease::WorkspaceLease::unmanaged(),
                 crate::graph::GraphPublishSignal {
                     drift_pending: false,
-                    build_start_seq: i64::MAX,
+                    mark_bound: i64::MAX,
                     topology_changed: false,
                     topology,
                     roots_refresh_requested: false,
@@ -3066,7 +3368,7 @@ mod tests {
         engine.enable_workspace_watcher_mode();
         let leftover_bound = engine.mark_seq_handle().load(Ordering::SeqCst);
         assert!(leftover_bound != 0, "the seeded mark gives the pickup a non-empty bound");
-        let engine_arc: super::SharedSearchEngine = Arc::new(Mutex::new(Some(engine)));
+        let engine_arc: super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
 
         let fire_bounds: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
         let graph = crate::graph::GraphState::for_workspace(workspace.clone())
@@ -3084,16 +3386,14 @@ mod tests {
 
         graph.consume_leftover_marks(leftover_bound);
         assert!(
-            graph.leftover_consume_pending(),
+            graph.marks_pending(),
             "a pickup that could not run leaves the obligation armed for the next publish",
         );
     }
 
-    /// The obligation a skipped pickup kept is what actually clears the marks later: the next
-    /// publish re-runs the consume with the STORED bound. The graph here is never wired to the
-    /// mark-seq source, so its own publish captures the unwired `0` bound and clears nothing —
-    /// the kept obligation is the only thing that can clear the leftover mark, and the assertion
-    /// cannot pass through the ordinary path by accident.
+    /// The marks a skipped pickup kept are what the next publication consumes, with the bound
+    /// they were handed over with; nothing else could clear the leftover mark, so the assertion
+    /// cannot pass through another path by accident.
     #[test]
     fn a_kept_leftover_obligation_is_discharged_by_the_next_publish() {
         use bsl_search::{Chunk, ChunkKind, SearchEngine, Store};
@@ -3135,7 +3435,7 @@ mod tests {
         engine.enable_workspace_watcher_mode();
         let leftover_bound = engine.mark_seq_handle().load(Ordering::SeqCst);
         assert!(leftover_bound != 0, "the seeded mark gives the pickup a non-empty bound");
-        let engine_arc: super::SharedSearchEngine = Arc::new(Mutex::new(Some(engine)));
+        let engine_arc: super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
 
         let fire_bounds: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
         let graph = crate::graph::GraphState::for_workspace(workspace.clone())
@@ -3151,10 +3451,7 @@ mod tests {
         fs::rename(&graph_db, &taken).unwrap();
         graph.consume_leftover_marks(leftover_bound);
         fs::rename(&taken, &graph_db).unwrap();
-        assert!(
-            graph.leftover_consume_pending(),
-            "the skipped pickup kept an obligation to discharge"
-        );
+        assert!(graph.marks_pending(), "the skipped pickup kept an obligation to discharge");
         // The skipped pickup fired the hook too, with this very bound. Only fires AFTER this
         // point can be the publish's, so the wait below must not count what already happened.
         let fires_before_publish = fire_bounds.lock().unwrap().len();
@@ -3163,13 +3460,14 @@ mod tests {
         // nudge is a no-op and this test would wait on a publish that never comes — passing or
         // failing on how the machine was loaded rather than on the obligation.
         write_common_module(&workspace, "Клиент", "Функция Прочесть() Экспорт КонецФункции");
+        graph.nudge_rebuild();
         assert!(
-            matches!(graph.nudge_rebuild(), crate::graph::NudgeOutcome::ReloadClaimed),
+            graph.drift_pending(),
             "the drift claims the reload whose publish discharges the obligation",
         );
 
-        // Wait for the leftover fire ITSELF: its stored bound tells it apart from the build's
-        // own fire, which runs the unwired `0` and clears nothing.
+        // Wait for the fire that carries the leftover bound: the handed-over marks tell it
+        // apart from a fire with nothing to consume.
         let deadline = Instant::now() + Duration::from_secs(120);
         let discharged = |bounds: &Arc<Mutex<Vec<i64>>>| {
             bounds.lock().unwrap()[fires_before_publish..].contains(&leftover_bound)
@@ -3309,7 +3607,7 @@ mod tests {
         }
         let mut engine = SearchEngine::new(&db_path, mock_semantic_config(&mock)).unwrap();
         engine.set_workspace_root(dir.path());
-        let engine_arc: super::SharedSearchEngine = Arc::new(Mutex::new(Some(engine)));
+        let engine_arc: super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
 
         let embed_flight = super::EmbedFlight::new();
 
@@ -3358,6 +3656,7 @@ mod tests {
         let index_progress = bsl_search::IndexProgress::new();
         SharedState::spawn_embed_pass(
             Arc::clone(&engine_arc),
+            crate::state::OwnerStop::default(),
             semantic_runtime,
             index_progress,
             Arc::clone(&embed_flight),
@@ -3445,9 +3744,9 @@ mod tests {
             cache.ensure().unwrap();
             let db_path = cache.search_db_path();
             seed_pending_embedding(&db_path);
-            let engine = Arc::new(Mutex::new(Some(
+            let engine = crate::state::shared_engine(Some(
                 SearchEngine::new(&db_path, mock_semantic_config(&server)).unwrap(),
-            )));
+            ));
             let runtime = Arc::new(Mutex::new(crate::state::SemanticRuntimeStatus::Indexing));
             let flight = super::EmbedFlight::new();
             let lease = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
@@ -3477,6 +3776,7 @@ mod tests {
             }));
             SharedState::spawn_embed_pass(
                 Arc::clone(&engine),
+                crate::state::OwnerStop::default(),
                 Arc::clone(&runtime),
                 bsl_search::IndexProgress::new(),
                 Arc::clone(&flight),
@@ -3517,7 +3817,10 @@ mod tests {
         let (server, _) = spawn_counting_embedding_server();
         let dir = tempdir().unwrap();
         let cache = crate::cache::WorkspaceCacheLayout::for_workspace(dir.path());
-        super::FORCE_EMBED_PREFLIGHT_REFUSALS.store(1, Ordering::SeqCst);
+        // The PUBLICATION, which is what this test is named for. Forcing the preflight instead
+        // exercised the admission check and left the publish path — the one the deadline is
+        // supposed to bound — completely uncovered.
+        super::FORCE_EMBED_PUBLICATION_REFUSALS.store(u64::MAX, Ordering::SeqCst);
 
         let (_, runtime, flight) = start_test_embed(&cache, &server, Duration::ZERO);
         wait_for_embed_flight(&flight);
@@ -3527,6 +3830,70 @@ mod tests {
             crate::state::SemanticRuntimeStatus::Failed(message)
                 if message.contains("retry budget exhausted")
         ));
+    }
+
+    /// A pass sitting out a publication backoff is waiting, not working. The claim stays —
+    /// no second pass may start — but the backend is free to go idle meanwhile: this backoff
+    /// grows to half an hour, and counted as work it pins the whole process for it.
+    #[test]
+    fn an_embed_pass_in_its_retry_pause_is_not_live_work() {
+        use crate::change_hub::test_support::eventually;
+
+        let _lock = env_lock();
+        let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
+        let _env = mock_embedding_env(&mock);
+
+        let dir = tempdir().unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(dir.path());
+        cache.ensure().unwrap();
+        let db_path = cache.search_db_path();
+        seed_pending_embedding(&db_path);
+        let engine = crate::state::shared_engine(Some(
+            SearchEngine::new(&db_path, mock_semantic_config(&mock)).unwrap(),
+        ));
+        let runtime = Arc::new(Mutex::new(crate::state::SemanticRuntimeStatus::Indexing));
+        let flight = super::EmbedFlight::new();
+        let stop = crate::state::OwnerStop::default();
+        let lease = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
+
+        // A peer holds the lock the publication fence needs for longer than two of its waits,
+        // so two attempts are refused: the first backs off by nothing, the second by a whole
+        // tick — the pause this test is about.
+        let holder = crate::workspace_lease::WorkspaceLease::hold_cache_lock_for(
+            &cache,
+            Duration::from_secs(5),
+        );
+        SharedState::spawn_embed_pass(
+            Arc::clone(&engine),
+            stop.clone(),
+            Arc::clone(&runtime),
+            bsl_search::IndexProgress::new(),
+            Arc::clone(&flight),
+            lease,
+            db_path,
+            mock_semantic_config(&mock),
+            DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
+        );
+
+        assert!(
+            eventually(Duration::from_secs(10), || flight.is_in_flight()),
+            "no pass ever claimed the flight, so the pause below would prove nothing"
+        );
+        assert!(
+            eventually(Duration::from_secs(10), || !flight.is_in_flight()),
+            "the paused pass is still counted as live work"
+        );
+        assert!(
+            !flight.claim_for_test(),
+            "the pause gave up the claim; a second pass could start beside the first"
+        );
+        assert!(
+            crate::state::overlay_retry::retry_delay(1) >= Duration::from_secs(5),
+            "the pause is short enough that a finished pass would pass for a paused one"
+        );
+
+        stop.stop();
+        holder.join().unwrap();
     }
 
     #[test]
@@ -3584,7 +3951,7 @@ mod tests {
             let db_path = cache.search_db_path();
             seed(&db_path);
             let engine = SearchEngine::new(&db_path, mock_semantic_config(&mock)).unwrap();
-            let engine_arc: super::SharedSearchEngine = Arc::new(Mutex::new(Some(engine)));
+            let engine_arc: super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
             let old = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
             let newer = Arc::new(Mutex::new(None));
             let newer_hook = Arc::clone(&newer);
@@ -3599,6 +3966,7 @@ mod tests {
             let flight = super::EmbedFlight::new();
             SharedState::spawn_embed_pass(
                 Arc::clone(&engine_arc),
+                crate::state::OwnerStop::default(),
                 Arc::clone(&runtime),
                 bsl_search::IndexProgress::new(),
                 Arc::clone(&flight),
@@ -3641,9 +4009,9 @@ mod tests {
         cache.ensure().unwrap();
         let db_path = cache.search_db_path();
         seed(&db_path);
-        let engine = Arc::new(Mutex::new(Some(
+        let engine = crate::state::shared_engine(Some(
             SearchEngine::new(&db_path, mock_semantic_config(&mock)).unwrap(),
-        )));
+        ));
         let runtime = Arc::new(Mutex::new(crate::state::SemanticRuntimeStatus::Indexing));
         let flight = super::EmbedFlight::new();
         let lease = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
@@ -3653,6 +4021,7 @@ mod tests {
         );
         SharedState::spawn_embed_pass(
             Arc::clone(&engine),
+            crate::state::OwnerStop::default(),
             Arc::clone(&runtime),
             bsl_search::IndexProgress::new(),
             Arc::clone(&flight),
@@ -3723,13 +4092,14 @@ mod tests {
         }
         let mut engine = SearchEngine::new(&db_path, mock_semantic_config(&mock)).unwrap();
         engine.set_workspace_root(dir.path());
-        let engine_arc: super::SharedSearchEngine = Arc::new(Mutex::new(Some(engine)));
+        let engine_arc: super::SharedSearchEngine = crate::state::shared_engine(Some(engine));
 
         let semantic_runtime = Arc::new(Mutex::new(crate::state::SemanticRuntimeStatus::Indexing));
         let index_progress = bsl_search::IndexProgress::new();
         let embed_flight = super::EmbedFlight::new();
         SharedState::kick_context_reembed(
             &engine_arc,
+            &crate::state::OwnerStop::default(),
             &semantic_runtime,
             &index_progress,
             &embed_flight,

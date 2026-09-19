@@ -14,7 +14,7 @@ use bsl_search::{
 };
 use rmcp::ErrorData as McpError;
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -23,7 +23,7 @@ use tracing::warn;
     reason = "the lexical modality takes the tool-dispatch inputs plus the request's cancellation; a one-use context struct would only rename them"
 )]
 pub(super) fn lexical_code_hits(
-    engine: &Arc<Mutex<Option<SearchEngine>>>,
+    engine: &crate::state::SharedSearchEngine,
     cancel: &CancellationToken,
     workspace_search_mode: WorkspaceSearchMode,
     configured_baseline: Option<&ConfiguredBaselineStatus>,
@@ -55,7 +55,7 @@ pub(super) fn lexical_code_hits(
                         // with no reachable workspace root. Module-keyed methods still get a
                         // graph_id (root-independent); a path-fallback hit would be dropped,
                         // which is fine here — baseline paths are relative, not absolute.
-                        return Ok(CodeHits::Ready { hits, roots: None });
+                        return Ok(CodeHits::Ready { hits, roots: None, overlay: None });
                     }
                     DirectResult::Terminal(error) => {
                         return Err(external_baseline_mcp_error(&error).into());
@@ -150,7 +150,23 @@ pub(super) fn lexical_code_hits(
     };
 
     let roots = guard.as_ref().and_then(|engine| engine.workspace_roots().cloned());
-    Ok(CodeHits::Ready { hits, roots })
+    let overlay = overlay_debt_for_answer(
+        guard.as_ref().and_then(|engine| engine.workspace_overlay_debt().ok()),
+    );
+    Ok(CodeHits::Ready { hits, roots, overlay })
+}
+
+/// What the answer may state about the overlay's debt, from what the engine reported.
+///
+/// An overlay that has never been built owes every change on disk and can count none of them:
+/// its counts read the same zero a fully caught-up overlay reports. Only an initialized overlay
+/// can vouch for its own debt, so anything else is unknown — never zero. Without this the answer
+/// reads as complete for the whole life of a daemon whose overlay is never built at all, such as
+/// a remote-overlay profile with no embedder.
+fn overlay_debt_for_answer(
+    reported: Option<bsl_search::WorkspaceOverlayDebt>,
+) -> Option<(usize, usize)> {
+    reported.filter(|owed| owed.initialized).map(|owed| (owed.pending, owed.unread))
 }
 
 /// The actor's snapshot answer as a direct-serving outcome; `Ok` carries the snapshot.
@@ -298,10 +314,50 @@ mod tests {
     use super::super::test_support::lexical_hit;
     use super::super::types::DirectResult;
     use super::merge_direct_lexical_with_refill;
+    use super::overlay_debt_for_answer;
     use bsl_search::{
         lexical_hits_for_resolved_view, BaselineRef, CorpusId, IndexedDocument, ResolvedView,
     };
     use std::collections::HashSet;
+
+    /// Four overlays, one question each: can this answer state what the overlay still owes?
+    /// Only an initialized one can. The two uninitialized cases are the same answer for
+    /// opposite-looking counts — a marked overlay and one that has never had a mark in its
+    /// life, which is what a profile with no embedder looks like for ever.
+    #[test]
+    fn only_an_initialized_overlay_can_vouch_for_its_own_debt() {
+        use bsl_search::WorkspaceOverlayDebt;
+
+        let owed = |initialized, pending, unread| {
+            Some(WorkspaceOverlayDebt { initialized, pending, unread })
+        };
+
+        assert_eq!(
+            overlay_debt_for_answer(owed(false, 0, 0)),
+            None,
+            "an overlay that was never built owes an unknown amount, not nothing"
+        );
+        assert_eq!(
+            overlay_debt_for_answer(owed(false, 3, 1)),
+            None,
+            "its counts do not become trustworthy because they are nonzero"
+        );
+        assert_eq!(
+            overlay_debt_for_answer(owed(true, 0, 0)),
+            Some((0, 0)),
+            "an initialized overlay with nothing owed is a complete answer"
+        );
+        assert_eq!(
+            overlay_debt_for_answer(owed(true, 2, 1)),
+            Some((2, 1)),
+            "an initialized overlay states the count it owes"
+        );
+        assert_eq!(
+            overlay_debt_for_answer(None),
+            None,
+            "an engine that could not be read owes an unknown amount"
+        );
+    }
 
     #[test]
     fn direct_lexical_refill_recovers_results_hidden_by_overlay() {

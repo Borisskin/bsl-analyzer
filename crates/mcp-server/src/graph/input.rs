@@ -29,6 +29,12 @@ pub(crate) struct ProjectSnapshot {
     /// enumeration of one project state must never be mixed with the registration of
     /// another, and "what is not mine to read" is part of that enumeration.
     pub excluded: Vec<PathBuf>,
+    /// Whether these roots are a VALIDATED declaration or the restricted fallback below.
+    ///
+    /// A fallback declares nothing. It is what the loader does when it cannot read the
+    /// project, and a root it fails to mention is not a root that has gone away — so it may
+    /// never be the authority that retires an obligation belonging to one.
+    pub validated: bool,
 }
 
 impl ProjectSnapshot {
@@ -58,6 +64,7 @@ impl ProjectSnapshot {
                     configs: ide::WorkspaceConfigsSnapshot::default(),
                     search_roots: None,
                     excluded: excluded.to_vec(),
+                    validated: false,
                 }
             }
         }
@@ -85,6 +92,7 @@ impl ProjectSnapshot {
             configs: ide::WorkspaceConfigsSnapshot::from_project(project).canonicalized(),
             search_roots: Some(crate::project::workspace_roots(project, excluded).0),
             excluded: excluded.to_vec(),
+            validated: true,
         }
     }
 }

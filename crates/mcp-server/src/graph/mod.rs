@@ -12,6 +12,7 @@
 //! so a served response's revision always describes the exact build it serves.
 
 mod build;
+mod debt;
 pub(crate) mod input;
 pub(crate) mod mdo_files;
 pub(crate) mod scan;
@@ -23,6 +24,7 @@ mod state;
 pub(crate) mod test_support;
 mod types;
 pub(crate) mod universe;
+pub(crate) mod watcher;
 
 #[allow(
     unused_imports,
@@ -53,5 +55,5 @@ pub(crate) use state::GraphState;
 )]
 pub(crate) use types::{
     Freshness, FusedStartup, GraphPublishOutcome, GraphPublishSignal, GraphStatus,
-    GraphStatusReport, NudgeOutcome, SUPERSEDED_GRAPH_ERROR,
+    GraphStatusReport, SUPERSEDED_GRAPH_ERROR,
 };

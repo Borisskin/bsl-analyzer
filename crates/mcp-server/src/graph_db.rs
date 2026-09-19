@@ -460,6 +460,24 @@ pub(crate) fn write_unread_paths(
     Ok(())
 }
 
+/// The same modules, read STRICTLY: an absent key means "nothing was unread" — the schema
+/// version gates out artefacts that predate the key — but a query that fails or a payload that
+/// will not decode is a failure to LOOK, not an empty answer.
+///
+/// The lenient reader below serves the old public surface, where an empty list is harmless. It
+/// is not authority for retiring a recovery obligation: `unwrap_or_default` there turns a
+/// broken database into "this build read everything", which would retire every outstanding
+/// path on the strength of an error.
+pub(crate) fn read_unread_paths_strict(conn: &rusqlite::Connection) -> anyhow::Result<Vec<String>> {
+    use rusqlite::OptionalExtension;
+    let raw: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key = 'unread_paths'", [], |r| r.get(0))
+        .optional()
+        .context("reading unread_paths")?;
+    let Some(raw) = raw else { return Ok(Vec::new()) };
+    serde_json::from_str::<Vec<String>>(&raw).context("decoding unread_paths")
+}
+
 /// The modules an artefact recorded as unreadable when it was built or last patched.
 pub(crate) fn read_unread_paths(conn: &rusqlite::Connection) -> Vec<String> {
     let raw: Option<String> =

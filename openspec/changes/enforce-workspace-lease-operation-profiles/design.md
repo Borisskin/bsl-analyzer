@@ -2,7 +2,7 @@
 
 PR #54 (`75b8a978`) repaired the confirmed takeover races and is already contained by the exact v0.2.77 integration base `upstream/develop` / `edc78e22f3efbfe51ffd8e6dfd05b457976195ca`. Issue #71 remains open because current APIs still allow arbitrary work inside `with_ownership_outcome`, collapse terminal causes, and leave several transient-retry obligations unbounded.
 
-The production audit also found request-time ownership work outside the originally named graph handlers: lexical, semantic, and hybrid search can run fenced prefetch; metadata, diagnostics, and graph status can refresh ownership. Those paths are part of this change. This is a planning-only architecture gate; it does not restore the historical stacked change removed during PR #54 integration.
+The production audit also found request-time ownership work outside the originally named graph handlers: lexical, semantic, and hybrid search can run fenced prefetch; metadata, diagnostics, and graph status can refresh ownership. Those paths are part of this change. This architecture gate is implemented, not planning-only; it does not restore the historical stacked change removed during PR #54 integration.
 
 ## Architecture Readiness
 
@@ -136,7 +136,7 @@ Exact filters are wired into Linux `Check` and Windows `MCP transports + secure 
 
 Architecture is ready only when: the exact base and PR #54 ancestry are recorded; every production caller above has an atomic task; every scenario has a unique verification row; all constants, outcome precedence, retry owners, and terminal states are locked; independent review reports no blocker; and the line in this section is changed to `Architecture readiness: GO`.
 
-Implementation is complete only after all tasks are checked with captured evidence. The current change is planning-only, so every checkbox remains unchecked.
+Implementation is complete only after all tasks are checked with captured evidence; `tasks.md` records that state.
 
 ## Risks / Trade-offs
 

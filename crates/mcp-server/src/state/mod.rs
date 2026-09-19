@@ -1,7 +1,8 @@
 mod bootstrap;
 pub use bootstrap::WorkspaceInitError;
 mod embed;
-mod overlay_retry;
+pub(crate) mod overlay_backlog;
+pub(crate) mod overlay_retry;
 pub(crate) mod retry_window;
 mod sync;
 #[cfg(test)]
@@ -20,7 +21,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub(crate) use types::{
-    OverlayWarmupState, SemanticRuntimeStatus, SharedSearchEngine, WorkspaceSearchMode,
+    shared_engine, OverlayWarmupState, SemanticRuntimeStatus, SharedSearchEngine,
+    WorkspaceSearchMode,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,17 +41,215 @@ pub(crate) struct ReferenceSearchState {
     baseline: DeferredBaselineRuntime,
     lifecycle: Arc<Mutex<ReferenceSearchLifecycle>>,
     stopped: Arc<std::sync::atomic::AtomicBool>,
+    /// The reference profile's own stop, for the one thing it shares with the workspace one:
+    /// an engine acquisition that has to be callable off.
+    stop: OwnerStop,
     worker: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 }
 
-/// Per-query cap on how many dirty overlay paths [`SharedState::prefetch_resident_overlay`]
-/// resolves from the shared resident parse. A branch switch can dirty thousands of paths;
-/// prefetching them all on the query thread would be unbounded work. Paths beyond the cap stay
-/// dirty and are served by the query's own lazy disk refresh and by subsequent queries' prefetch
-/// passes, so nothing is lost — the cap is purely a per-query budget. 64 keeps the pre-pass cheap
-/// while covering the common "edit a handful of files, then search" case in one shot.
-#[cfg(test)]
-const MAX_RESIDENT_PREFETCH_PATHS_PER_QUERY: usize = 64;
+/// The "analyzed without its main configuration" advisory, and whether anybody still keeps it
+/// current.
+///
+/// Seeded at boot from the project the boot already parsed, and kept in step by the graph's
+/// drift watcher, which sees every config edit. A status read is a lock and a clone and never
+/// reads the project from disk. When the watcher has left, the last value is still served —
+/// with a note saying it is no longer tracked, because a config edit since then would go
+/// unnoticed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct StandaloneNotice {
+    notice: Option<String>,
+    abandoned: bool,
+}
+
+/// Appended to an advisory nobody keeps current any more.
+const UNTRACKED_ADVISORY_NOTE: &str =
+    "(no longer tracked: the workspace watcher has stopped; restart the server to refresh it)";
+
+impl StandaloneNotice {
+    /// A value someone keeps current: the boot's seed, or the watcher's latest derivation.
+    pub(crate) fn tracked(notice: Option<String>) -> Self {
+        Self { notice, abandoned: false }
+    }
+
+    /// Nobody keeps this value current from now on.
+    pub(crate) fn abandon(&mut self) {
+        self.abandoned = true;
+    }
+
+    fn rendered(&self) -> Option<String> {
+        let notice = self.notice.as_ref()?;
+        Some(if self.abandoned {
+            format!("{notice}\n{UNTRACKED_ADVISORY_NOTE}")
+        } else {
+            notice.clone()
+        })
+    }
+}
+
+/// Every "analyzed without its main configuration" advisory `project` carries, joined for
+/// one status line.
+pub(crate) fn standalone_notice_of(project: &project_model::Project) -> Option<String> {
+    let notices: Vec<String> =
+        [project.standalone_extension_notice(), project.standalone_external_notice()]
+            .into_iter()
+            .flatten()
+            .collect();
+    (!notices.is_empty()).then(|| notices.join("\n"))
+}
+
+/// [`standalone_notice_of`] for the project at `root`, read from disk — for the watcher,
+/// never for a request.
+pub(crate) fn derive_standalone_notice(root: &std::path::Path) -> Option<String> {
+    standalone_notice_of(&crate::project::at(root).ok()?)
+}
+
+/// The daemon's stop request to every background owner, and the count of owners still running.
+///
+/// One object for both, because a stop that cannot be observed is a stop nobody can prove: the
+/// count is how `shutdown` (and a test) learns the owners actually left. Every wait an owner
+/// makes is a wait on this signal or on the hub, which `shutdown` interrupts too, so no owner
+/// sleeps out a backoff after the daemon has asked it to go.
+#[derive(Clone, Default)]
+pub(crate) struct OwnerStop(Arc<OwnerStopInner>);
+
+#[derive(Default)]
+struct OwnerStopInner {
+    /// The stop as a lock-free fact, and the mirror `stopped` below waits on.
+    ///
+    /// Read without taking anything, because the readers are predicates handed to someone
+    /// else's wait — the hub's, the backlog's — and they run with that owner's lock held. A
+    /// read that took this stop's mutex would invert the two locks against `stop()`, which
+    /// holds this one while it wakes them.
+    raised: std::sync::atomic::AtomicBool,
+    stopped: Mutex<bool>,
+    wake: std::sync::Condvar,
+    live: std::sync::atomic::AtomicUsize,
+    /// Everything that has a wait of its own and must be released by the same call: the hub's
+    /// `closing`, an owner's signal condvar, the engine's admission queue. A stop that wakes
+    /// only its own condvar leaves an owner asleep on someone else's, and the order of the
+    /// shutdown steps then decides whether that owner leaves in a second or in thirty.
+    wakers: Mutex<Vec<Box<dyn Fn() + Send + Sync>>>,
+}
+
+/// Taken by whoever spawns an owner, before the thread starts, and moved into it: an owner
+/// about to run already counts, and the guard's drop is its exit on every way out, a panic
+/// or a thread that never started included.
+pub(crate) struct OwnerLive(OwnerStop);
+
+impl Drop for OwnerLive {
+    fn drop(&mut self) {
+        self.0 .0.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl crate::tools::search::OwnerWait for OwnerStop {
+    fn stopped(&self) -> bool {
+        self.is_stopped()
+    }
+}
+
+impl OwnerStop {
+    /// Ask every owner to leave, and release every wait they could be in — this call, not the
+    /// steps around it. What "release" means is the waiter's own business: a condvar notify, a
+    /// hub that starts closing, a queue that stops admitting.
+    pub(crate) fn stop(&self) {
+        self.0.raised.store(true, Ordering::SeqCst);
+        {
+            let mut stopped = self.0.stopped.lock().unwrap_or_else(|poison| poison.into_inner());
+            *stopped = true;
+        }
+        self.0.wake.notify_all();
+        // Outside this stop's own lock: a waker reaches into another owner's lock, and that
+        // owner's wait may be evaluating a predicate that reads this stop.
+        let wakers = self.0.wakers.lock().unwrap_or_else(|poison| poison.into_inner());
+        for wake in wakers.iter() {
+            wake();
+        }
+    }
+
+    /// Register a wait this stop must release. Called once per waiter, at wiring time.
+    pub(crate) fn wakes(&self, wake: impl Fn() + Send + Sync + 'static) {
+        let wake = Arc::new(wake);
+        let registered = Arc::clone(&wake);
+        self.0
+            .wakers
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(Box::new(move || registered()));
+        if self.is_stopped() {
+            // Registered after the stop was raised: released at once rather than never. Called
+            // with no lock of this stop's held, for the reason `stop` gives.
+            wake();
+        }
+    }
+
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.0.raised.load(Ordering::SeqCst)
+    }
+
+    /// Sleep for `delay` unless the stop arrives first; says whether it did.
+    pub(crate) fn sleep(&self, delay: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + delay;
+        let mut stopped = self.0.stopped.lock().unwrap_or_else(|poison| poison.into_inner());
+        loop {
+            if *stopped {
+                return true;
+            }
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return false;
+            };
+            stopped = self
+                .0
+                .wake
+                .wait_timeout(stopped, remaining)
+                .unwrap_or_else(|poison| poison.into_inner())
+                .0;
+        }
+    }
+
+    /// Count an owner as running until the returned guard drops.
+    pub(crate) fn enter(&self) -> OwnerLive {
+        self.0.live.fetch_add(1, Ordering::SeqCst);
+        OwnerLive(self.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn live(&self) -> usize {
+        self.0.live.load(Ordering::SeqCst)
+    }
+}
+
+/// Where the workspace search consumer is in its life — what `search_code`'s drift watch
+/// rests on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConsumerPhase {
+    /// Its cursor collects facts; it starts once an engine is published.
+    Pending,
+    /// Its thread runs, but its first fenced step has not passed: what it reads does not yet
+    /// reach the index.
+    Attaching,
+    /// Running: every fact on its cursor reaches the index.
+    Attached,
+    /// It has left: stopped, superseded or released.
+    Stopped,
+    /// The engine it would feed never came: the init failed or published nothing.
+    Abandoned,
+}
+
+/// Abandons a consumer that never got past `.1`: dropped while the phase is still that, it
+/// names the consumer abandoned. Moved into the closure of the thread that would take the
+/// consumer further, it fires on every way out that does not — the thread's own early exits,
+/// and a thread that never started, whose closure is dropped unrun.
+pub(super) struct AbandonIfStill(pub(super) Arc<Mutex<ConsumerPhase>>, pub(super) ConsumerPhase);
+
+impl Drop for AbandonIfStill {
+    fn drop(&mut self) {
+        let mut phase = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        if *phase == self.1 {
+            *phase = ConsumerPhase::Abandoned;
+        }
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum WorkspaceSearchApply<T, E> {
@@ -58,6 +258,10 @@ pub(super) enum WorkspaceSearchApply<T, E> {
     Superseded,
     Released,
     OperationError(E),
+    /// The owner was told to leave before it could apply anything. Its own outcome, because
+    /// the two things a caller does about it are the two things it must never confuse: a
+    /// transient refusal is slept on and retried, and a stop is answered by going.
+    Stopping,
 }
 
 #[derive(Clone)]
@@ -67,7 +271,7 @@ pub struct SharedState {
     /// which may be nested under `workspace_root`. File-tree lookups such as
     /// `metadata(form)` resolve object directories relative to THIS root, not the repo root.
     source_root: Option<PathBuf>,
-    standalone_notice: Option<String>,
+    standalone_notice: Arc<Mutex<StandaloneNotice>>,
     onec_client: Option<OnecClient>,
     onec_connections: BTreeMap<String, OnecConnection>,
     debug_session: Arc<Mutex<Option<bsl_debug::session::DebugSession>>>,
@@ -113,6 +317,12 @@ pub struct SharedState {
     /// same tasks. Its durability ends where the process does — an idle-TTL exit takes
     /// the handles with it, and the contract names that as a lawful `-32602`.
     tasks: rmcp::task_manager::TaskManager,
+    /// The stop every background owner of this backend waits on.
+    owners: OwnerStop,
+    /// The owner of the overlay's point backlog; started once an engine is published.
+    overlay_backlog: overlay_backlog::OverlayBacklog,
+    /// Where the workspace search consumer is (see [`ConsumerPhase`]).
+    search_consumer: Arc<Mutex<ConsumerPhase>>,
 }
 
 #[derive(Clone)]
@@ -132,6 +342,25 @@ impl OnecConnection {
 
     pub fn allow_execute(&self) -> bool {
         self.allow_execute
+    }
+}
+
+/// Who watches the workspace for the index. An attached consumer vouches for what reaches it,
+/// and a hub still arming delivers nothing yet: until it has armed or fallen back to polling,
+/// the consumer is still starting.
+fn consumer_drift_watch(
+    phase: ConsumerPhase,
+    hub: &crate::change_hub::WorkspaceChangeHub,
+) -> crate::tools::location::DriftWatch {
+    use crate::tools::location::DriftWatch;
+    match phase {
+        ConsumerPhase::Pending | ConsumerPhase::Attaching => DriftWatch::Starting,
+        ConsumerPhase::Attached if hub.is_polling() || hub.is_partially_blind() => {
+            DriftWatch::Polling
+        }
+        ConsumerPhase::Attached if hub.is_watching() => DriftWatch::Watching,
+        ConsumerPhase::Attached => DriftWatch::Starting,
+        ConsumerPhase::Stopped | ConsumerPhase::Abandoned => DriftWatch::Unobserved,
     }
 }
 
@@ -164,11 +393,17 @@ impl SharedState {
 
     pub(super) fn apply_workspace_search<T>(
         shared: &SharedSearchEngine,
+        stop: &OwnerStop,
         lease: &crate::workspace_lease::WorkspaceLease,
         apply: impl FnOnce(&mut bsl_search::SearchEngine) -> Result<T, bsl_search::SearchError>,
     ) -> WorkspaceSearchApply<T, bsl_search::SearchError> {
-        let mut guard = match shared.lock() {
+        let mut guard = match shared.acquire_for_owner(stop) {
             Ok(guard) => guard,
+            // Leaving is not failing, and it is not a refusal either: an owner told to go must
+            // not sleep a backoff and come back. Its own outcome, so no caller can mistake it.
+            Err(crate::tools::search::OwnerLockRefused::Closing) => {
+                return WorkspaceSearchApply::Stopping;
+            }
             Err(error) => {
                 return WorkspaceSearchApply::OperationError(bsl_search::SearchError::Index(
                     format!("workspace search engine lock poisoned: {error}"),
@@ -204,14 +439,18 @@ impl SharedState {
 
     pub(super) fn apply_workspace_search_checkpointed<T>(
         shared: &SharedSearchEngine,
+        stop: &OwnerStop,
         lease: &crate::workspace_lease::WorkspaceLease,
         apply: impl FnOnce(
             &mut bsl_search::SearchEngine,
             &mut dyn FnMut() -> std::ops::ControlFlow<()>,
         ) -> std::ops::ControlFlow<(), Result<T, bsl_search::SearchError>>,
     ) -> WorkspaceSearchApply<T, bsl_search::SearchError> {
-        let mut guard = match shared.lock() {
+        let mut guard = match shared.acquire_for_owner(stop) {
             Ok(guard) => guard,
+            Err(crate::tools::search::OwnerLockRefused::Closing) => {
+                return WorkspaceSearchApply::Stopping;
+            }
             Err(error) => {
                 return WorkspaceSearchApply::OperationError(bsl_search::SearchError::Index(
                     format!("workspace search engine lock poisoned: {error}"),
@@ -222,7 +461,7 @@ impl SharedState {
     }
 
     /// The lease-gated write against a guard the caller already holds. Background writers
-    /// take the guard with a plain `lock()` above; a request path takes it through the
+    /// take the guard through the admission above; a request path takes it through the
     /// cancellable acquire and applies here, so the two differ only in how they waited.
     pub(super) fn apply_to_engine<T>(
         guard: &mut std::sync::MutexGuard<'_, Option<bsl_search::SearchEngine>>,
@@ -263,19 +502,21 @@ impl SharedState {
         &self.graph
     }
 
-    /// Whether a newer daemon generation has taken this workspace's derived caches over (see
-    /// [`crate::workspace_lease`]). Such a backend still serves everything it holds, but it
-    /// produces no new derived state — so once its last session leaves there is nothing left
-    /// to stay warm for.
     /// Every "analyzed without its main configuration" advisory the project
     /// carries, joined for one status line — the state in which valid calls into
     /// that configuration are reported as unresolved. An extension's and an
     /// external object's are distinct conditions and both can hold at once.
-    /// Captured at bootstrap and refreshed by rebuilding the workspace state.
+    ///
+    /// Read from the slot the boot seeded and the drift watcher keeps current; see
+    /// [`StandaloneNotice`]. The request path never reads the project from disk.
     pub(crate) fn standalone_notice(&self) -> Option<String> {
-        self.standalone_notice.clone()
+        self.standalone_notice.lock().unwrap_or_else(|p| p.into_inner()).rendered()
     }
 
+    /// Whether a newer daemon generation has taken this workspace's derived caches over (see
+    /// [`crate::workspace_lease`]). Such a backend still serves everything it holds, but it
+    /// produces no new derived state — so once its last session leaves there is nothing left
+    /// to stay warm for.
     pub(crate) fn superseded(&self) -> bool {
         self.workspace_lease.is_superseded()
     }
@@ -283,6 +524,44 @@ impl SharedState {
     #[cfg(test)]
     pub(crate) fn owns_caches(&self) -> bool {
         self.workspace_lease.owns_caches()
+    }
+
+    /// The unthrottled refresh the graph's owners make per pass ([`crate::graph`] reaches it
+    /// through `is_superseded`). A stand about what a COMPLETED refresh leaves behind needs
+    /// the check to actually run: the paced entry point above returns the cached verdict for
+    /// as long as the pacing lasts, without asking disk anything.
+    #[cfg(test)]
+    pub(crate) fn refresh_ownership_now(&self) -> bool {
+        self.workspace_lease.owns_caches_now()
+    }
+
+    /// The threads those questions were asked on. Background owners are named; a request is
+    /// served on a runtime worker or on the caller's own thread, and neither may appear.
+    #[cfg(test)]
+    pub(crate) fn lease_disk_check_threads(&self) -> Vec<String> {
+        self.workspace_lease.disk_check_threads()
+    }
+
+    /// Whether the lease's own lifecycle lock is held right now — for a test that must put a
+    /// request against a background check that is inside it. Test-only introspection: nothing
+    /// in production decides anything on a `try_lock`.
+    #[cfg(test)]
+    pub(crate) fn lease_lifecycle_is_busy(&self) -> bool {
+        self.workspace_lease.lifecycle_is_busy()
+    }
+
+    /// Whether this backend's ownership verdict has been established at all — for a test that
+    /// must tell the unknown window from an answer.
+    #[cfg(test)]
+    pub(crate) fn ownership_verdict_established(&self) -> bool {
+        self.workspace_lease.ownership_was_checked()
+    }
+
+    /// Whether the boot's workspace-search initialization is still running. A test that needs
+    /// the graph to stay unbuilt has to know when the thread that would claim it has gone.
+    #[cfg(test)]
+    pub(crate) fn search_init_running(&self) -> bool {
+        self.workspace_search_initializing.load(Ordering::Relaxed)
     }
 
     /// Whether work this backend owns is still running, and so whether the broker must keep
@@ -302,11 +581,25 @@ impl SharedState {
             || self.index_progress.is_active()
             || self.embed_flight.is_in_flight()
             || self.overlay_retry.as_ref().is_some_and(|retry| retry.pass_active())
+            || self.overlay_backlog.is_active()
     }
 
-    /// Cached request-path view backed only by lease atomics.
-    pub(crate) fn owns_caches_cached(&self) -> bool {
-        self.workspace_lease.owns_caches_cached()
+    /// Ownership for a STATUS answer: the cached verdict, when there IS one.
+    ///
+    /// Two things this must not do. It must not read the lease — that is a file, and a lock a
+    /// peer may hold for seconds, on the thread serving a request. And it must not answer from
+    /// the cached value before anything has established it: the startup claim can fail — a peer
+    /// holding the lock, a record that could not be written — and the initial `false` then says
+    /// "a newer generation owns these caches" about a question nobody has asked yet. The two
+    /// are indistinguishable to a client, and only one of them is true.
+    ///
+    /// So the unknown window answers nothing at all, and the background check that runs anyway
+    /// closes it: the value appears once it means something, exactly as every other
+    /// present-when-known field in that envelope does.
+    pub(crate) fn owns_caches_for_status(&self) -> Option<bool> {
+        self.workspace_lease
+            .ownership_was_checked()
+            .then(|| self.workspace_lease.owns_caches_cached())
     }
 
     /// Start building the diagnostics resident now instead of on the first tool call.
@@ -400,7 +693,7 @@ impl SharedState {
         &self.debug_session
     }
 
-    pub fn search_engine(&self) -> &SharedSearchEngine {
+    pub(crate) fn search_engine(&self) -> &SharedSearchEngine {
         &self.search_engine
     }
 
@@ -416,10 +709,55 @@ impl SharedState {
         Arc::clone(&self.overlay_warmup)
     }
 
+    /// What `search_code` says about its own currency beyond the hits: who watches the
+    /// workspace for the index, whether the backlog is being read back, whether the poll
+    /// standing in for the watch is overdue. Process-local reads only.
+    pub(crate) fn search_watch(&self) -> crate::tools::search::WorkspaceFacts {
+        let Some(hub) = &self.change_hub else {
+            return crate::tools::search::WorkspaceFacts::default();
+        };
+        let phase = *self.search_consumer.lock().unwrap_or_else(|poison| poison.into_inner());
+        let drift_watch = consumer_drift_watch(phase, hub);
+        let backlog_stalled = match self.overlay_backlog.state() {
+            overlay_backlog::BacklogState::Exhausted { .. } => {
+                Some("its retry budget ran out or a batch failed")
+            }
+            overlay_backlog::BacklogState::Stopped { reason } => Some(reason),
+            overlay_backlog::BacklogState::Running
+            | overlay_backlog::BacklogState::Backoff { .. } => None,
+        };
+        crate::tools::search::WorkspaceFacts {
+            drift_watch: Some(drift_watch),
+            backlog_stalled,
+            poll_overdue: hub.poll_overdue(),
+            ..Default::default()
+        }
+    }
+
+    /// How long an edit that keeps its size and mtime can go unnoticed while the hub polls.
+    pub(crate) fn poll_cycle(&self) -> Option<std::time::Duration> {
+        self.change_hub.as_ref()?.poll_report().map(|(_, cycle)| cycle)
+    }
+
+    /// Where the overlay's backlog owner is.
+    pub(crate) fn overlay_backlog_state(&self) -> overlay_backlog::BacklogState {
+        self.overlay_backlog.state()
+    }
+
+    /// How many overlay batches held the engine past their bound.
+    pub(crate) fn overlay_backlog_slow_holds(&self) -> u64 {
+        self.overlay_backlog.slow_holds()
+    }
+
     /// Coalesce a request-observed stale resident into the existing background owner.
     pub(crate) fn request_overlay_refresh(&self) {
+        // A wake, not a fact: the owner may not step around its backoff on this.
+        self.overlay_backlog.wake();
         if let Some(retry) = &self.overlay_retry {
-            retry.kick_fresh();
+            // Coalesce, not kick: a search has observed no new fact about the workspace, so it
+            // may wake the driver but must not reset its backoff or revive an obligation that
+            // already ran out of budget.
+            retry.coalesce();
         }
     }
 
@@ -456,6 +794,13 @@ impl SharedState {
         self.reference_search.lifecycle()
     }
 
+    /// Stop the daemon's background work, in an order whose OUTCOME does not depend on the
+    /// order: every wait an owner can be in is released by `owners.stop()` itself (the hub's
+    /// `closing`, the backlog's signal, the retry driver's condvar, the admission queue), so
+    /// no step here is load-bearing for how long an owner takes to leave.
+    ///
+    /// What the order still decides is who is told first, and that only matters for the
+    /// subsystems with protocols of their own.
     pub fn shutdown(&self) {
         // The reference worker stops FIRST: in the reference profile its baseline and this one
         // are the same `Arc`, and closing the baseline before the worker is told to stop leaves
@@ -464,51 +809,37 @@ impl SharedState {
         self.reference_search.shutdown();
         self.baseline.shutdown();
         self.diagnostics.shutdown();
-        // The retry driver stops BEFORE the lease is released: its Arc-held worker would
-        // otherwise outlive the handover and publish over the next owner's caches.
-        if let Some(retry) = &self.overlay_retry {
-            retry.stop();
+        // One call, every owner, every wait they could be in.
+        self.owners.stop();
+        // An owner queued behind someone else's hold of the engine leaves instead of waiting it
+        // out. Redundant with the stop above by design: a queued owner is released by either.
+        self.search_engine.close();
+        if let Some(hub) = &self.change_hub {
+            // Stops the transport, not just the waiting: the hub's own threads — the event
+            // thread and the blind poll — go with it. Left running, a hub in fallback mode
+            // keeps walking the workspace after the daemon it serves has stopped.
+            hub.shutdown();
         }
         // Handing the workspace back on the way out is what keeps a short-lived server (a
         // stdio session, a broker fallback) from demoting a long-running daemon for the whole
-        // staleness window just by having started later.
+        // staleness window just by having started later. LAST, so nothing this daemon still
+        // has in flight can publish over the next owner's caches.
         self.workspace_lease.release();
-    }
-
-    /// Prefetch resident snapshots for the overlay's dirty paths and feed them into the
-    /// incremental reindex, so a following query serves chunks cut from the SHARED resident
-    /// parse instead of a second disk read+parse. Called at the top of a code-search request,
-    /// before the query acquires the engine lock.
-    ///
-    /// Bounded to [`MAX_RESIDENT_PREFETCH_PATHS_PER_QUERY`] paths per call.
-    ///
-    /// Lock discipline: the resident read must never overlap the engine lock. So this
-    /// reads the dirty-path list and the source handle under a brief engine lock, RELEASES it,
-    /// fetches the snapshots with NO lock held, then applies them under a second brief engine
-    /// lock that only touches the overlay cache (never the resident). A resident that is
-    /// absent/loading, or a path it cannot serve, is simply missing from the map and the
-    /// reindex disk-reads it — so search never regresses when the resident is unavailable.
-    #[cfg(test)]
-    pub(crate) fn prefetch_resident_overlay_fenced(
-        engine: &SharedSearchEngine,
-        lease: &crate::workspace_lease::WorkspaceLease,
-        cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<(), crate::tools::search::Withdrawn> {
-        sync::prefetch_resident_overlay(engine, lease, cancel)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{SharedSearchEngine, SharedState, WorkspaceSearchApply};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[test]
     fn workspace_search_missing_engine_is_an_operation_error() {
-        let shared: SharedSearchEngine = Arc::new(Mutex::new(None));
+        let shared: SharedSearchEngine = crate::state::shared_engine(None);
         let outcome = SharedState::apply_workspace_search(
             &shared,
+            &super::OwnerStop::default(),
             &crate::workspace_lease::WorkspaceLease::unmanaged(),
             |_| Ok(()),
         );
@@ -520,9 +851,52 @@ mod tests {
         ));
     }
 
+    /// Leaving is neither a refusal nor a failure, and the outcome says which it is. Read as
+    /// a transient refusal an owner sleeps a backoff and comes back; read as an operation
+    /// error the daemon reports its own shutdown as a broken engine.
+    #[test]
+    fn an_owner_told_to_leave_answers_stopping_even_with_the_engine_held() {
+        let shared: SharedSearchEngine = crate::state::shared_engine(None);
+        let stop = super::OwnerStop::default();
+        let lease = crate::workspace_lease::WorkspaceLease::unmanaged();
+
+        // Someone else holds the engine, which is the case that used to cost an owner the
+        // whole hold: the queue is what it gives up, not the daemon's time.
+        let (holding_tx, holding) = std::sync::mpsc::channel();
+        let (release_tx, release) = std::sync::mpsc::channel();
+        let held = Arc::clone(&shared);
+        let holder = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            holding_tx.send(()).unwrap();
+            release.recv().unwrap();
+        });
+        holding.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        stop.stop();
+
+        let asked = std::time::Instant::now();
+        assert!(matches!(
+            SharedState::apply_workspace_search(&shared, &stop, &lease, |_| Ok(())),
+            WorkspaceSearchApply::Stopping
+        ));
+        assert!(matches!(
+            SharedState::apply_workspace_search_checkpointed(&shared, &stop, &lease, |_, _| {
+                std::ops::ControlFlow::Continue(Ok(()))
+            }),
+            WorkspaceSearchApply::Stopping
+        ));
+        assert!(
+            asked.elapsed() < Duration::from_secs(1),
+            "the owner waited out someone else's hold instead of leaving"
+        );
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+    }
+
     #[test]
     fn workspace_search_poisoned_mutex_is_an_operation_error() {
-        let shared: SharedSearchEngine = Arc::new(Mutex::new(None));
+        let shared: SharedSearchEngine = crate::state::shared_engine(None);
         let poison = Arc::clone(&shared);
         let _ = std::thread::spawn(move || {
             let _guard = poison.lock().unwrap();
@@ -532,6 +906,7 @@ mod tests {
 
         let outcome = SharedState::apply_workspace_search(
             &shared,
+            &super::OwnerStop::default(),
             &crate::workspace_lease::WorkspaceLease::unmanaged(),
             |_| Ok(()),
         );
@@ -547,11 +922,12 @@ mod tests {
     fn workspace_search_flattens_callback_error_once() {
         let dir = tempfile::tempdir().unwrap();
         let engine = bsl_search::SearchEngine::fts_only(&dir.path().join("search.db")).unwrap();
-        let shared: SharedSearchEngine = Arc::new(Mutex::new(Some(engine)));
+        let shared: SharedSearchEngine = crate::state::shared_engine(Some(engine));
         let calls = std::sync::atomic::AtomicUsize::new(0);
 
         let outcome = SharedState::apply_workspace_search(
             &shared,
+            &super::OwnerStop::default(),
             &crate::workspace_lease::WorkspaceLease::unmanaged(),
             |_| {
                 calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -658,7 +1034,7 @@ mod onec_connection_tests {
 
 #[cfg(test)]
 mod standalone_extension_tests {
-    use super::SharedState;
+    use super::{SharedState, StandaloneNotice};
 
     fn configuration(root: &std::path::Path, rel: &str, extension: bool) {
         let dir = root.join(rel);
@@ -678,23 +1054,126 @@ mod standalone_extension_tests {
         .unwrap();
     }
 
+    fn wait_for_notice(state: &SharedState, want: impl Fn(Option<&str>) -> bool) -> bool {
+        crate::change_hub::test_support::eventually(std::time::Duration::from_secs(20), || {
+            want(state.standalone_notice().as_deref())
+        })
+    }
+
+    /// The advisory comes from the project the boot parsed, and then from the graph's drift
+    /// watcher, which sees a config edit arrive. A config edit can move the resolved root
+    /// between a main configuration and an extension, and a status line that kept the boot-time
+    /// answer would describe a project that is no longer being analyzed.
     #[test]
-    fn the_notice_is_cached_for_request_status() {
+    fn the_advisory_is_seeded_at_boot_and_follows_config_edits() {
+        let _env = super::test_support::env_lock();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         configuration(root, "cf", false);
         configuration(root, "ext", true);
         let config = root.join("bsl-analyzer.toml");
-        std::fs::write(&config, "[source]\nroot = \"cf\"\nextensions = []\n").unwrap();
+        std::fs::write(&config, "[source]\nroot = \"ext\"\nextensions = []\n").unwrap();
 
         let state = SharedState::workspace(root.to_path_buf()).unwrap();
-        assert!(state.standalone_notice().is_none(), "a main configuration stays silent");
+        assert!(
+            state.standalone_notice().is_some(),
+            "the boot parsed an extension root, and the seed says so before anything else runs"
+        );
+
+        std::fs::write(&config, "[source]\nroot = \"cf\"\nextensions = []\n").unwrap();
+        assert!(
+            wait_for_notice(&state, |notice| notice.is_none()),
+            "the root is a main configuration again and the watcher did not follow"
+        );
 
         std::fs::write(&config, "[source]\nroot = \"ext\"\nextensions = []\n").unwrap();
-        assert!(state.standalone_notice().is_none(), "request status does not reparse the project");
+        assert!(wait_for_notice(&state, |notice| notice.is_some()), "and back to an extension");
+        state.shutdown();
+    }
 
-        let extension = SharedState::workspace(root.to_path_buf()).unwrap();
-        assert!(extension.standalone_notice().is_some());
+    /// A status read is the slot and nothing else. Once the watcher has gone, a config edit
+    /// changes nothing the read can see — reading the project from disk is exactly what a
+    /// request may not do — and the answer says it is no longer tracked.
+    #[test]
+    fn a_status_read_never_reads_the_project_from_disk() {
+        let _env = super::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        configuration(root, "cf", false);
+        configuration(root, "ext", true);
+        let config = root.join("bsl-analyzer.toml");
+        std::fs::write(&config, "[source]\nroot = \"ext\"\nextensions = []\n").unwrap();
+
+        let state = SharedState::workspace(root.to_path_buf()).unwrap();
+        let seeded = state.standalone_notice().expect("an extension root carries the advisory");
+        state.shutdown();
+        assert!(
+            crate::change_hub::test_support::eventually(
+                std::time::Duration::from_secs(5),
+                || state.owners.live() == 0
+            ),
+            "the watcher did not leave"
+        );
+
+        std::fs::write(&config, "[source]\nroot = \"cf\"\nextensions = []\n").unwrap();
+        let served = state.standalone_notice().expect("the last value is still served");
+        assert!(served.starts_with(&seeded), "the read re-derived the advisory: {served}");
+        assert!(served.contains("no longer tracked"), "an untracked value must say so: {served}");
+    }
+
+    #[test]
+    fn a_tracked_notice_is_served_verbatim_and_an_abandoned_one_says_so() {
+        let mut notice = StandaloneNotice::tracked(Some("standalone".to_owned()));
+        assert_eq!(notice.rendered().as_deref(), Some("standalone"));
+        notice.abandon();
+        let rendered = notice.rendered().unwrap();
+        assert!(rendered.starts_with("standalone\n") && rendered.contains("no longer tracked"));
+        assert_eq!(StandaloneNotice::tracked(None).rendered(), None);
+    }
+}
+
+#[cfg(test)]
+mod consumer_phase_tests {
+    use super::{consumer_drift_watch, AbandonIfStill, ConsumerPhase};
+    use crate::change_hub::{WatchTarget, WorkspaceChangeHub};
+    use crate::tools::location::DriftWatch;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// A thread that never starts drops its closure unrun, and the guard moved into it names
+    /// the consumer abandoned — the phase does not stay "starting" for the life of the process.
+    /// A consumer that got past the guarded phase is left alone.
+    #[test]
+    fn a_consumer_whose_thread_never_ran_is_abandoned() {
+        for (from, then) in [
+            (ConsumerPhase::Pending, ConsumerPhase::Pending),
+            (ConsumerPhase::Attaching, ConsumerPhase::Attaching),
+            (ConsumerPhase::Pending, ConsumerPhase::Attaching),
+        ] {
+            let phase = Arc::new(Mutex::new(then));
+            let guard = AbandonIfStill(Arc::clone(&phase), from);
+            let never_run = move || drop(guard);
+            drop(never_run);
+            let expected = if from == then { ConsumerPhase::Abandoned } else { then };
+            assert_eq!(*phase.lock().unwrap(), expected, "guarding {from:?}, found {then:?}");
+        }
+    }
+
+    /// Attached vouches only for what reaches it: until the hub has armed (or fallen back to
+    /// polling) nothing does, so the consumer still reads as starting.
+    #[test]
+    fn an_attached_consumer_on_a_hub_still_arming_is_starting() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hub, hold) = WorkspaceChangeHub::start_targets_held(vec![WatchTarget::recursive(
+            dir.path().to_path_buf(),
+        )]);
+        assert_eq!(consumer_drift_watch(ConsumerPhase::Attached, &hub), DriftWatch::Starting);
+        assert_eq!(consumer_drift_watch(ConsumerPhase::Attaching, &hub), DriftWatch::Starting);
+        hold.release();
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert_eq!(consumer_drift_watch(ConsumerPhase::Attached, &hub), DriftWatch::Watching);
+        assert_eq!(consumer_drift_watch(ConsumerPhase::Attaching, &hub), DriftWatch::Starting);
+        hub.shutdown();
     }
 }
 
@@ -702,6 +1181,216 @@ mod standalone_extension_tests {
 mod background_lifetime_tests {
     use super::{SemanticRuntimeStatus, SharedState};
     use std::sync::atomic::Ordering;
+
+    /// A shutdown is a request every background owner answers at once. The search consumer
+    /// used to park in a 30-second hub wait and in retry sleeps of up to half an hour, so a
+    /// daemon asked to stop kept writing into the workspace long after it had said goodbye.
+    #[test]
+    fn shutdown_stops_every_owner_within_a_second() {
+        use crate::change_hub::test_support::eventually;
+        use std::time::Duration;
+
+        let _env = super::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let cf = dir.path().join("cf");
+        std::fs::create_dir_all(cf.join("CommonModules").join("Общий").join("Ext")).unwrap();
+        std::fs::write(cf.join("Configuration.xml"), "<Configuration/>").unwrap();
+        std::fs::write(
+            cf.join("CommonModules").join("Общий").join("Ext").join("Module.bsl"),
+            "Процедура П() Экспорт КонецПроцедуры\n",
+        )
+        .unwrap();
+        let state = SharedState::workspace(dir.path().to_path_buf()).unwrap();
+        assert!(
+            eventually(Duration::from_secs(60), || state.owners.live() >= 1),
+            "no background owner ever started, so the stop below would prove nothing"
+        );
+        // Parked in its wait: a consumer caught mid-batch leaves on its own anyway.
+        std::thread::sleep(Duration::from_millis(300));
+
+        state.shutdown();
+
+        assert!(
+            eventually(Duration::from_secs(1), || state.owners.live() == 0),
+            "{} owner(s) still running a second after shutdown",
+            state.owners.live()
+        );
+    }
+
+    /// An owner waiting for the engine behind someone else's hold leaves on shutdown all the
+    /// same: its place in the queue is given up, and the hold is not waited out.
+    #[test]
+    fn shutdown_does_not_wait_out_an_engine_hold() {
+        use crate::change_hub::test_support::eventually;
+        use std::time::Duration;
+
+        let _env = super::test_support::env_lock();
+        let _embedding_url = super::test_support::EnvVarGuard::unset("EMBEDDING_URL");
+        let dir = tempfile::tempdir().unwrap();
+        let cf = dir.path().join("cf");
+        let module = cf.join("CommonModules").join("Общий").join("Ext").join("Module.bsl");
+        std::fs::create_dir_all(module.parent().unwrap()).unwrap();
+        std::fs::write(cf.join("Configuration.xml"), "<Configuration/>").unwrap();
+        std::fs::write(&module, "Процедура П() Экспорт КонецПроцедуры\n").unwrap();
+        let state = SharedState::workspace(dir.path().to_path_buf()).unwrap();
+        assert!(eventually(Duration::from_secs(30), || {
+            state.search_watch().drift_watch == Some(crate::tools::location::DriftWatch::Watching)
+        }));
+
+        let hold = state.search_engine().lock().unwrap();
+        std::fs::write(&module, "Процедура Н() Экспорт КонецПроцедуры\n").unwrap();
+        assert!(
+            eventually(Duration::from_secs(10), || state.search_engine().queued() >= 1),
+            "no owner came for the engine, so the stop below would prove nothing"
+        );
+        state.shutdown();
+        let left = eventually(Duration::from_secs(1), || state.owners.live() == 0);
+        let live = state.owners.live();
+        drop(hold);
+        assert!(left, "{live} owner(s) still waiting for the engine a second after shutdown");
+    }
+
+    /// The daemon's own shutdown stops the hub's fallback poll, through the production path a
+    /// daemon actually takes. A hub left running walks the whole workspace on a schedule
+    /// nobody owns any more; interrupting its waiters alone does not stop a poll that never
+    /// waits on them.
+    #[test]
+    fn shutdown_stops_a_polling_hub() {
+        use crate::change_hub::test_support::eventually;
+        use crate::change_hub::{PollConfig, WatchTarget, WorkspaceChangeHub};
+        use std::time::Duration;
+
+        const PERIOD: Duration = Duration::from_millis(20);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Модуль.bsl"), "Процедура П() КонецПроцедуры\n").unwrap();
+        let (hub, hold) = WorkspaceChangeHub::start_polling(
+            vec![WatchTarget::recursive(dir.path().to_path_buf())],
+            PollConfig { period: PERIOD, verify_bytes: 64 * 1024 },
+        );
+        hold.release();
+        assert!(
+            eventually(Duration::from_secs(5), || hub.poll_count() >= 2),
+            "the poll never ran, so stopping it would prove nothing"
+        );
+
+        let mut state = SharedState::shared();
+        state.change_hub = Some(hub.clone());
+        state.diagnostics.spawn_sweeper_for_test();
+        assert!(eventually(Duration::from_secs(5), || state.diagnostics.sweeper_running()));
+
+        state.shutdown();
+
+        let stopped = hub.poll_count();
+        std::thread::sleep(PERIOD * 6);
+        assert_eq!(hub.poll_count(), stopped, "the poll outlived the daemon that owned it");
+        assert!(
+            eventually(Duration::from_secs(1), || !state.diagnostics.sweeper_running()),
+            "the daemon's shutdown left the diagnostics sweeper running"
+        );
+    }
+
+    /// The same for a hub that watches most of the tree and polls the part it cannot watch:
+    /// that poller is a second thread with a stop of its own, and a shutdown that raises only
+    /// the hub thread's leaves it walking the blind roots for ever.
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_stops_the_poll_of_a_blind_root() {
+        use crate::change_hub::test_support::eventually;
+        use crate::change_hub::{PollConfig, RefusedWatches, WatchTarget, WorkspaceChangeHub};
+        use std::time::Duration;
+
+        const PERIOD: Duration = Duration::from_millis(20);
+        let dir = tempfile::tempdir().unwrap();
+        let watched = dir.path().join("наблюдаемый");
+        let blind = dir.path().join("слепой");
+        std::fs::create_dir_all(&watched).unwrap();
+        std::fs::create_dir_all(&blind).unwrap();
+        std::fs::write(blind.join("Модуль.bsl"), "Процедура П() КонецПроцедуры\n").unwrap();
+        let refusals = RefusedWatches::refusing(vec![blind.clone()]);
+        let hub = WorkspaceChangeHub::start_targets_refusing_polled(
+            vec![WatchTarget::recursive(watched), WatchTarget::recursive(blind)],
+            Duration::from_secs(3600),
+            &refusals,
+            PollConfig { period: PERIOD, verify_bytes: 64 * 1024 },
+        );
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(eventually(Duration::from_secs(5), || hub.is_partially_blind()));
+        assert!(
+            eventually(Duration::from_secs(5), || hub.poll_count() >= 2),
+            "the blind poll never ran, so stopping it would prove nothing"
+        );
+        assert!(hub.blind_poll_running());
+
+        let mut state = SharedState::shared();
+        state.change_hub = Some(hub.clone());
+
+        state.shutdown();
+
+        let stopped = hub.poll_count();
+        std::thread::sleep(PERIOD * 6);
+        assert_eq!(hub.poll_count(), stopped, "the blind poll outlived its daemon");
+        assert!(
+            eventually(Duration::from_secs(1), || !hub.blind_poll_running()),
+            "the blind poller thread is still there"
+        );
+    }
+
+    /// An owner asleep in a hub wait is released by the stop itself, not by the hub's own
+    /// timeout. That wait is thirty seconds long, so a stop the hub never hears about leaves
+    /// the daemon's search consumer parked for the rest of it — writing into the workspace
+    /// long after the daemon said goodbye.
+    #[test]
+    fn a_stop_releases_an_owner_asleep_in_a_hub_wait() {
+        use crate::change_hub::WorkspaceChangeHub;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+
+        // Positive control: with nothing stopped and no event coming, the wait runs out on its
+        // own — so the release below is the stop's doing and not the hub returning anyway.
+        let quiet = hub.clone();
+        let ran_out = {
+            let since = quiet.generation();
+            let started = Instant::now();
+            quiet.wait_for_change(since, Duration::from_millis(300));
+            started.elapsed()
+        };
+        assert!(
+            ran_out >= Duration::from_millis(250),
+            "the hub wait returned on its own in {ran_out:?}; it proves nothing about a stop"
+        );
+
+        let stop = super::OwnerStop::default();
+        let woken = hub.clone();
+        stop.wakes(move || woken.interrupt_waiters());
+
+        let (left_tx, left) = std::sync::mpsc::channel();
+        let owner_stop = stop.clone();
+        let owner_hub = hub.clone();
+        let live = stop.enter();
+        std::thread::spawn(move || {
+            let _live = live;
+            let since = owner_hub.generation();
+            owner_hub
+                .wait_for_change_or(since, Duration::from_secs(30), || owner_stop.is_stopped());
+            let _ = left_tx.send(());
+        });
+        // Asleep before the stop is raised: the ordering that used to cost a whole wait.
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(stop.live(), 1, "the owner never started, so its exit proves nothing");
+
+        let asked = Instant::now();
+        stop.stop();
+
+        assert!(
+            left.recv_timeout(Duration::from_secs(1)).is_ok(),
+            "the owner slept through its stop"
+        );
+        assert!(asked.elapsed() < Duration::from_secs(1));
+        hub.shutdown();
+    }
 
     #[test]
     fn active_indexing_keeps_the_backend_alive() {

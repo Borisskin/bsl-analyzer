@@ -22,11 +22,11 @@ pub(crate) struct GraphPublishSignal {
     /// A fresher reload is already catching up: a fast-path hint the consumer may use to
     /// skip this round and let that reload's publish do the re-render. Not correctness-bearing.
     pub(crate) drift_pending: bool,
-    /// The mark-seq captured when THIS build started (see [`crate::graph::GraphState::mark_seq`]). Bounds
-    /// which context-dirty marks the consumer may clear: only drifts this build already
-    /// reflects, never one stamped after it began. This bound is what makes the consumption
-    /// correct.
-    pub(crate) build_start_seq: i64,
+    /// The highest context-dirty mark this publication may consume: marks placed for facts
+    /// the publication observed (see [`crate::graph::GraphState::marks_placed`]), never one
+    /// whose fact reached the hub after its build scanned disk. `0` consumes nothing. This
+    /// bound is what makes the consumption correct.
+    pub(crate) mark_bound: i64,
     /// The published build's extension topology differs from the previously published
     /// one (or nothing was published before, so persisted search contexts cannot be
     /// trusted). The consumer must conservatively re-render EVERY document's graph
@@ -61,18 +61,6 @@ impl GraphPublishOutcome {
     pub(crate) const HANDLED: Self = Self { topology_handled: true, roots_handled: true };
 }
 
-/// What a [`crate::graph::GraphState::nudge_rebuild`] scheduled. Surfaced so the single-flight
-/// behavior is assertable in a test without racing the background build thread.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum NudgeOutcome {
-    /// The initial background load was started (`Idle → Loading`).
-    LoadStarted,
-    /// The single reload slot was claimed and a rebuild thread spawned.
-    ReloadClaimed,
-    /// Nothing scheduled: disabled, a build/reload already in flight, or no drift.
-    NoOp,
-}
-
 /// Freshness verdict for one `graph` response.
 pub(crate) struct Freshness {
     /// The generation of the snapshot that served this response.
@@ -84,6 +72,8 @@ pub(crate) struct Freshness {
     /// The extension topology the serving snapshot was built for, published so an answer
     /// names the root set it describes.
     pub topology: u64,
+    /// Who watches this graph's drift, and how: what `stale` rests on.
+    pub drift_watch: crate::tools::location::DriftWatch,
 }
 
 /// The graph's lifecycle snapshot for the `status` action — the parallel of the
@@ -110,6 +100,10 @@ pub(crate) struct GraphStatusReport {
     /// `stale` snapshot stays stale here. Emitted only when true — it explains a drift that
     /// never gets picked up, which would otherwise look like a reload that never runs.
     pub superseded: Option<bool>,
+    /// Who watches this graph's drift (when the graph is a workspace's).
+    pub drift_watch: Option<&'static str>,
+    /// While polling: how long an edit that keeps its size and mtime can go unnoticed.
+    pub poll_cycle_secs: Option<u64>,
 }
 
 /// Whether the SqliteLocal startup graph decision already populated the search index.

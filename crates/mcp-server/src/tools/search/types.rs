@@ -23,20 +23,35 @@ pub(super) const HYBRID_FETCH_MULTIPLIER: usize = 2;
 ///
 /// `3` adds the location contract: a `location` (or a machine `location_unavailable` reason)
 /// per code hit and, for `search_code`, a `freshness` envelope. The legacy 1-based
-/// `line_start`/`line_end` are untouched. The number is shared with the `reference` profile's
-/// documentation actions, whose own shape did not change.
-pub(super) const SEARCH_SCHEMA_VERSION: &str = "4";
+/// `line_start`/`line_end` are untouched.
+///
+/// `5` — `search_code` only — adds `freshness.drift_watch` and the completeness reasons the
+/// overlay's own state gives. The `reference` profile's documentation actions changed nothing
+/// and stay on `4`: their number is theirs from here on, not a shared one.
+pub(super) const SEARCH_CODE_SCHEMA_VERSION: &str = "5";
+pub(super) const DOCS_SCHEMA_VERSION: &str = "4";
 
+/// The schema version an action's answer carries.
+pub(super) fn search_schema_version(action: &str) -> &'static str {
+    if action == "search_code" {
+        SEARCH_CODE_SCHEMA_VERSION
+    } else {
+        DOCS_SCHEMA_VERSION
+    }
+}
+
+// `C` is the version `search_code` answers carry; everything else is the same union in both
+// profiles. Not a doc comment: it would land in the published schema as its description.
 #[derive(JsonSchema, Serialize)]
 #[serde(untagged)]
 #[allow(dead_code, reason = "schema-only union published by tools/list")]
-enum SearchOutput {
-    SearchCode(SearchHits<SearchCodeAction>),
-    FindDocs(SearchHits<FindDocsAction>),
-    SearchDocs(SearchHits<SearchDocsAction>),
-    SearchCodeNotReady(SearchNotReady<SearchCodeAction>),
-    FindDocsNotReady(SearchNotReady<FindDocsAction>),
-    SearchDocsNotReady(SearchNotReady<SearchDocsAction>),
+enum SearchOutput<C> {
+    SearchCode(SearchHits<SearchCodeAction, C>),
+    FindDocs(SearchHits<FindDocsAction, SearchSchemaVersion>),
+    SearchDocs(SearchHits<SearchDocsAction, SearchSchemaVersion>),
+    SearchCodeNotReady(SearchNotReady<SearchCodeAction, C>),
+    FindDocsNotReady(SearchNotReady<FindDocsAction, SearchSchemaVersion>),
+    SearchDocsNotReady(SearchNotReady<SearchDocsAction, SearchSchemaVersion>),
     ListPlatform {
         action: ListPlatformAction,
         schema_version: ListPlatformSchemaVersion,
@@ -55,9 +70,9 @@ enum SearchOutput {
 }
 
 #[derive(JsonSchema, Serialize)]
-struct SearchHits<A> {
+struct SearchHits<A, V> {
     action: A,
-    schema_version: SearchSchemaVersion,
+    schema_version: V,
     hits: Vec<Value>,
     shown: usize,
     total: usize,
@@ -68,9 +83,9 @@ struct SearchHits<A> {
 }
 
 #[derive(JsonSchema, Serialize)]
-struct SearchNotReady<A> {
+struct SearchNotReady<A, V> {
     action: A,
-    schema_version: SearchSchemaVersion,
+    schema_version: V,
     status: NotReadyStatus,
     retry_after_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -95,6 +110,7 @@ const_enum!(FindDocsAction, FindDocs, "find_docs");
 const_enum!(SearchDocsAction, SearchDocs, "search_docs");
 const_enum!(ListPlatformAction, ListPlatform, "list_platform");
 const_enum!(StatusAction, Status, "status");
+const_enum!(SearchCodeSchemaVersion, V5, "5");
 const_enum!(SearchSchemaVersion, V4, "4");
 const_enum!(ListPlatformSchemaVersion, V1, "1");
 const_enum!(StatusSchemaVersion, V1, "1");
@@ -118,8 +134,19 @@ enum SearchState {
     Failed,
 }
 
+/// The `workspace` profile's `search` answers: `search_code` on its own version.
 pub(crate) fn search_output_schema() -> Arc<serde_json::Map<String, Value>> {
-    let mut schema = (*rmcp::handler::server::tool::schema_for_type::<SearchOutput>()).clone();
+    output_schema::<SearchOutput<SearchCodeSchemaVersion>>()
+}
+
+/// The `reference` profile's `search` answers. It serves no `search_code`, and its schema is
+/// the one it published before `search_code` got a number of its own.
+pub(crate) fn reference_search_output_schema() -> Arc<serde_json::Map<String, Value>> {
+    output_schema::<SearchOutput<SearchSchemaVersion>>()
+}
+
+fn output_schema<T: JsonSchema + std::any::Any>() -> Arc<serde_json::Map<String, Value>> {
+    let mut schema = (*rmcp::handler::server::tool::schema_for_type::<T>()).clone();
     crate::contract::ensure_object_root(&mut schema);
     Arc::new(schema)
 }
@@ -132,7 +159,13 @@ pub(super) enum CodeHits {
     /// Hits (possibly empty) plus the root table the graph-id bridge anchors them with.
     /// The whole table, not one root: a hit's path is relative to the root that owns it, and
     /// which root that is differs per hit.
-    Ready { hits: Vec<SearchHit>, roots: Option<bsl_search::WorkspaceRoots> },
+    Ready {
+        hits: Vec<SearchHit>,
+        roots: Option<bsl_search::WorkspaceRoots>,
+        /// The workspace overlay's `(pending, unread)` counts, read under the same engine lock
+        /// as the hits, when the answer came from the engine at all.
+        overlay: Option<(usize, usize)>,
+    },
     /// The index/overlay is still warming or building — no hits yet, emit `message`.
     Pending(String),
     /// The semantic modality cannot serve this request; `hybrid_code` degrades to lexical.

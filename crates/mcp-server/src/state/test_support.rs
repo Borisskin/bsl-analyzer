@@ -1,6 +1,14 @@
 use std::env;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
+impl super::SharedState {
+    /// Install a graph whose lifecycle is controlled by the test, not the boot worker.
+    pub(crate) fn with_graph_for_test(mut self, graph: crate::graph::GraphState) -> Self {
+        self.graph = graph;
+        self
+    }
+}
+
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 /// Take the process-wide serialization lock used by tests that toggle a global — an

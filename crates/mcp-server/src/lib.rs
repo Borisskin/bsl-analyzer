@@ -20,6 +20,157 @@ mod tools;
 mod walk_probe;
 mod workspace_lease;
 
+/// An allocator that counts what the thread it runs on allocates.
+///
+/// Per-THREAD on purpose: the harness runs tests beside each other, and a global counter would
+/// report every other test's work as this one's. The counters are `Cell`s with a const
+/// initialiser, so reading them allocates nothing and cannot recurse into this allocator.
+///
+/// It exists because the cost of the recovery ledger is part of the contract, and a cost that
+/// is asserted rather than measured is exactly the one that turns out to be wrong: what was
+/// called "the opens a pass makes" was the length of a list nobody opened.
+#[cfg(test)]
+pub(crate) mod measured_alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Whether THIS thread is measuring. Per-thread rather than global for two reasons:
+        /// the harness runs tests beside each other, so a shared switch would be a race
+        /// between two measurements; and a thread that is not measuring pays one thread-local
+        /// read per allocation, which keeps the suite's half-second budgets about the code
+        /// they are written for rather than about this allocator.
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+        static LIVE: Cell<isize> = const { Cell::new(0) };
+        static PEAK: Cell<isize> = const { Cell::new(0) };
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn armed() -> bool {
+        ARMED.try_with(Cell::get).unwrap_or(false)
+    }
+
+    /// What one thread's allocator calls added up to since `arm`: how many blocks were
+    /// allocated, the NET bytes (allocated minus freed), and the high-water mark of that net.
+    ///
+    /// A net flow, not a live set. Every free on an armed thread is subtracted, including a
+    /// block allocated before `arm` or on another thread, so `live` can sit below zero and
+    /// `peak` is not a footprint. Only a difference between two samples of one armed stretch
+    /// means something — what was allocated and not freed between them — and that is the only
+    /// way the measurements in this crate read it.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct Sample {
+        pub(crate) blocks: usize,
+        pub(crate) live: isize,
+        pub(crate) peak: isize,
+    }
+
+    pub(crate) fn sample() -> Sample {
+        Sample {
+            blocks: COUNT.try_with(Cell::get).unwrap_or_default(),
+            live: LIVE.try_with(Cell::get).unwrap_or_default(),
+            peak: PEAK.try_with(Cell::get).unwrap_or_default(),
+        }
+    }
+
+    /// Begin measuring what THIS thread allocates and frees, from zero.
+    pub(crate) fn arm() {
+        let _ = LIVE.try_with(|live| live.set(0));
+        let _ = PEAK.try_with(|peak| peak.set(0));
+        let _ = COUNT.try_with(|count| count.set(0));
+        let _ = ARMED.try_with(|armed| armed.set(true));
+    }
+
+    pub(crate) fn disarm() {
+        let _ = ARMED.try_with(|armed| armed.set(false));
+    }
+
+    /// Start the high-water mark again from the net as it stands now.
+    pub(crate) fn reset_peak() {
+        let live = LIVE.try_with(Cell::get).unwrap_or_default();
+        let _ = PEAK.try_with(|peak| peak.set(live));
+    }
+
+    pub(crate) struct Measuring;
+
+    // SAFETY: every call forwards to the system allocator with the same pointer and layout it
+    // was given; the counters are thread-local `Cell`s that allocate nothing.
+    unsafe impl GlobalAlloc for Measuring {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let pointer = unsafe { System.alloc(layout) };
+            if !pointer.is_null() && armed() {
+                note(layout.size() as isize);
+            }
+            pointer
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let pointer = unsafe { System.alloc_zeroed(layout) };
+            if !pointer.is_null() && armed() {
+                note(layout.size() as isize);
+            }
+            pointer
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            if armed() {
+                let _ = LIVE.try_with(|live| live.set(live.get() - layout.size() as isize));
+            }
+            unsafe { System.dealloc(pointer, layout) }
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let moved = unsafe { System.realloc(pointer, layout, new_size) };
+            if !moved.is_null() && armed() {
+                note(new_size as isize - layout.size() as isize);
+            }
+            moved
+        }
+    }
+
+    /// The counters are a net flow, and a difference between two samples is exact.
+    #[test]
+    fn the_counters_are_a_net_flow_only_differences_can_read() {
+        let allocated_before_arming: Vec<u8> = Vec::with_capacity(4096);
+        arm();
+        let start = sample();
+        drop(allocated_before_arming);
+        let freed = sample();
+        let inside: Vec<u8> = Vec::with_capacity(1024);
+        let allocated = sample();
+        drop(inside);
+        disarm();
+        assert_eq!(
+            freed.live - start.live,
+            -4096,
+            "a block allocated before arming is subtracted when it is freed",
+        );
+        assert!(freed.live < 0, "so the net can sit below zero, and is not a live set");
+        assert_eq!(
+            allocated.live - freed.live,
+            1024,
+            "a difference between two samples is exactly what was allocated between them",
+        );
+    }
+
+    fn note(bytes: isize) {
+        let _ = COUNT.try_with(|count| count.set(count.get().saturating_add(1)));
+        let _ = LIVE.try_with(|live| {
+            let now = live.get() + bytes;
+            live.set(now);
+            let _ = PEAK.try_with(|peak| {
+                if now > peak.get() {
+                    peak.set(now);
+                }
+            });
+        });
+    }
+}
+
+#[cfg(test)]
+#[global_allocator]
+static MEASURED_ALLOC: measured_alloc::Measuring = measured_alloc::Measuring;
+
 pub use baseline::{
     resolve_project_baseline_diagnostics, BaselineConfigDiagnostics, BaselineResolutionSummary,
 };
@@ -1017,7 +1168,7 @@ impl McpServer {
             diag.ensure_loading();
             return Ok(tools::resident::status(
                 &diag.status_report(),
-                self.state.owns_caches_cached(),
+                self.state.owns_caches_for_status(),
                 self.state.standalone_notice().as_deref(),
             )
             .into());
@@ -1201,7 +1352,11 @@ impl McpServer {
                     .map(|guard| guard.clone())
                     .unwrap_or(crate::state::OverlayWarmupState::Pending);
                 let baseline = self.state.baseline_view();
-                tokio::task::spawn_blocking(move || {
+                let drift_watch = self.state.search_watch().drift_watch;
+                let poll_cycle = self.state.poll_cycle();
+                let backlog = self.state.overlay_backlog_state();
+                let slow_holds = self.state.overlay_backlog_slow_holds();
+                let status = tokio::task::spawn_blocking(move || {
                     tools::search::search_status(
                         McpProfile::Workspace,
                         &engine,
@@ -1215,7 +1370,16 @@ impl McpServer {
                     )
                 })
                 .await
-                .map_err(|e| McpError::internal_error(format!("Task error: {e}"), None))?
+                .map_err(|e| McpError::internal_error(format!("Task error: {e}"), None))?;
+                status.map(|status| {
+                    tools::search::append_workspace_changes(
+                        status,
+                        drift_watch,
+                        poll_cycle,
+                        &backlog,
+                        slow_holds,
+                    )
+                })
             }
             // `search_code` is the unified lexical+semantic code search (smart-fused: exact-symbol
             // tier then semantic tail).
@@ -1248,6 +1412,7 @@ impl McpServer {
                 let index_progress = self.state.index_progress().clone();
                 self.state.request_overlay_refresh();
                 let retry_progress = index_progress.clone();
+                let watch = self.state.search_watch();
                 let outcome = tools::search::search_call(ct, move |cancel| {
                     tools::search::hybrid_code_cancellable(
                         &engine,
@@ -1260,6 +1425,7 @@ impl McpServer {
                         &query,
                         limit,
                         max_output_tokens,
+                        watch,
                     )
                 })
                 .await;
@@ -1689,13 +1855,13 @@ impl McpServer {
         // `status` reports the graph lifecycle (and kicks the lazy build) so an agent can start
         // it and poll progress instead of reading a flat `loading` envelope from a data action.
         if p.action == "status" {
-            graph.ensure_loading();
+            graph.ensure_first_build();
             let report = graph.status_report();
             return Ok(tools::graph::status(&report));
         }
 
         // Lazily trigger the background load on first use.
-        graph.ensure_loading();
+        graph.ensure_first_build();
         let superseded = graph.superseded_latched();
 
         // `resolve` is a name lookup, not a graph traversal: the platform answers it
@@ -1798,6 +1964,10 @@ impl McpServer {
             };
             // Request reads report the publication already paired with this descriptor;
             // background owners detect drift and schedule reloads.
+            // A request may ask the graph to look again sooner — nothing more. It reads no
+            // disk itself: all it does is move the watcher's probe forward, so a workspace in
+            // use notices a healed subtree at the cadence a request path used to walk at.
+            graph.note_request();
             let freshness = graph.cached_freshness(&snapshot);
             // Modules the artefact could not read are missing nodes and edges: that is
             // incompleteness of the answer, not merely drift.
@@ -1883,7 +2053,7 @@ impl McpServer {
         // best-effort snapshot: `None` when it is not `Ready`, in which case the core card is
         // still served (with `usages_unavailable`).
         let graph = self.state.graph().clone();
-        graph.ensure_loading();
+        graph.ensure_first_build();
 
         let retry_diag = diag.clone();
         tasks::resident_response(
@@ -2209,7 +2379,7 @@ impl McpServer {
                 diag.ensure_loading();
                 Ok(tools::resident::status(
                     &diag.status_report(),
-                    self.state.owns_caches_cached(),
+                    self.state.owns_caches_for_status(),
                     self.state.standalone_notice().as_deref(),
                 )
                 .into())
@@ -2259,12 +2429,18 @@ impl McpServer {
         };
 
         let retry_diag = diag.clone();
+        let heal_diag = diag.clone();
         tasks::resident_response(
             self,
             caller,
             "diagnostics file",
             ct,
             move |session| {
+                // A file the resident holds out of service as unreadable answers with an
+                // error body and no findings. The client asked for THIS file, so it pays for
+                // this file: one re-read, rather than being told about a repair it already
+                // made for as long as the sweep's window lasts.
+                heal_diag.retry_unread_request_path(root_id.as_deref(), &path);
                 // `generation` is supplied by `read` under the lock (so `result_id` describes
                 // the exact resident state queried), and the freshness verdict is computed
                 // under that same lock and returned alongside — the envelope is atomic.
@@ -2480,7 +2656,7 @@ impl McpServer {
     /// comparable within one response, meaningless across searches or backends.
     #[tool(
         name = "search",
-        output_schema = tools::search::search_output_schema(),
+        output_schema = tools::search::reference_search_output_schema(),
         annotations(read_only_hint = true)
     )]
     async fn reference_search(
@@ -2884,23 +3060,42 @@ mod surface_guards {
     fn profile_search_outputs_publish_every_discriminated_branch() {
         let workspace = tool_output_schema(McpProfile::Workspace, "search");
         let reference = tool_output_schema(McpProfile::Reference, "search");
-        assert_eq!(workspace, reference);
-        let encoded = workspace.to_string();
-        for value in [
-            "search_code",
-            "find_docs",
-            "search_docs",
-            "list_platform",
-            "status",
-            "not_ready",
-            "ready",
-            "loading",
-            "busy",
-            "failed",
-        ] {
-            assert!(encoded.contains(&format!("\"{value}\"")), "missing {value}: {encoded}");
+        assert_ne!(workspace, reference, "search_code's own version is the workspace's alone");
+        for (profile, schema) in [("workspace", &workspace), ("reference", &reference)] {
+            let encoded = schema.to_string();
+            for value in [
+                "search_code",
+                "find_docs",
+                "search_docs",
+                "list_platform",
+                "status",
+                "not_ready",
+                "ready",
+                "loading",
+                "busy",
+                "failed",
+            ] {
+                let quoted = format!("\"{value}\"");
+                assert!(encoded.contains(&quoted), "{profile} misses {value}: {encoded}");
+            }
+            assert!(encoded.contains("\"schema_version\""));
         }
-        assert!(encoded.contains("\"schema_version\""));
+        let version_of_hits = |schema: &serde_json::Value, action: &str| {
+            let action = format!("#/$defs/{action}");
+            let definitions = schema["$defs"].as_object().expect("definitions");
+            let hits = definitions.values().find(|definition| {
+                let properties = &definition["properties"];
+                properties["action"]["$ref"] == action.as_str() && properties.get("hits").is_some()
+            });
+            hits.expect("a hits branch per action")["properties"]["schema_version"]["$ref"].clone()
+        };
+        let code = "SearchCodeAction";
+        let docs = "FindDocsAction";
+        assert_eq!(version_of_hits(&workspace, code), "#/$defs/SearchCodeSchemaVersion");
+        assert_eq!(version_of_hits(&workspace, docs), "#/$defs/SearchSchemaVersion");
+        assert_eq!(version_of_hits(&reference, code), "#/$defs/SearchSchemaVersion");
+        assert_eq!(workspace["$defs"]["SearchCodeSchemaVersion"]["enum"], serde_json::json!(["5"]));
+        assert_eq!(reference["$defs"]["SearchSchemaVersion"]["enum"], serde_json::json!(["4"]));
     }
 
     #[test]
@@ -3181,71 +3376,698 @@ mod graph_supersession_contract {
         state.diagnostics().ensure_loading();
         crate::diagnostics_state::test_support::wait_ready(state.diagnostics());
         let graph = state.graph().clone();
-        graph.ensure_loading();
+        graph.ensure_first_build();
         crate::graph::test_support::wait_ready(&graph);
         let held: Vec<_> = (0..crate::graph::SNAPSHOT_POOL_CAP)
             .map(|_| graph.snapshot().expect("the published pool has four handles"))
             .collect();
-        let lock = crate::workspace_lease::WorkspaceLease::hold_cache_lock_for(
-            &cache,
-            Duration::from_secs(3),
-        );
-        let server = McpServer::new(McpProfile::Workspace, state);
-        let token = || tokio_util::sync::CancellationToken::new();
+        // Held until this stand lets go, so what follows can say WHEN the answer came back
+        // rather than how long it took.
+        let (lock, release_the_lock) =
+            crate::workspace_lease::WorkspaceLease::hold_cache_lock_until_released(&cache);
+        let server = McpServer::new(McpProfile::Workspace, state.clone());
 
-        let answer = match handler {
-            BusyGraphHandler::Graph => tokio::time::timeout(
-                Duration::from_millis(500),
-                server.graph(params("overview", None), token()),
-            )
-            .await
-            .expect("graph handler must not wait for the lease lock")
-            .expect("an exhausted pool is a temporary loading answer"),
-            BusyGraphHandler::ResolveNames => tokio::time::timeout(
-                Duration::from_millis(500),
-                server.graph(resolve_params("Считать"), token()),
-            )
-            .await
-            .expect("resolve_names must not wait for the lease lock")
-            .expect("resolve still answers from its other providers"),
-            BusyGraphHandler::SymbolInfo => {
-                let response = tokio::time::timeout(
-                    Duration::from_millis(500),
-                    server.symbol_info(
-                        symbol_params("Сервер.Считать"),
-                        token(),
-                        tasks::TaskCapable(false),
-                    ),
-                )
-                .await
-                .expect("symbol_info must not wait for the lease lock")
-                .expect("the resident card survives unavailable graph enrichment");
-                match response {
+        // The handler runs as a task of its own, and the bound is awaited on its join handle:
+        // a timeout wrapped around the future itself is only ever reached at an await the
+        // handler may never make, so a first poll that blocks synchronously — which is exactly
+        // what a lease read under a held lock does — used to be slept through and called fast.
+        let lease_before = state.lease_disk_check_threads().len();
+        let call = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                let token = || tokio_util::sync::CancellationToken::new();
+                let inline = |response| match response {
                     rmcp::model::CallToolResponse::Complete(result) => result,
                     _ => panic!("a caller that declared no task extension is answered inline"),
-                }
-            }
-            BusyGraphHandler::References => {
-                let response = tokio::time::timeout(
-                    Duration::from_millis(500),
-                    server.references(
-                        references_params("Сервер.Считать"),
-                        token(),
-                        tasks::TaskCapable(false),
+                };
+                match handler {
+                    BusyGraphHandler::Graph => server
+                        .graph(params("overview", None), token())
+                        .await
+                        .expect("an exhausted pool is a temporary loading answer"),
+                    BusyGraphHandler::ResolveNames => server
+                        .graph(resolve_params("Считать"), token())
+                        .await
+                        .expect("resolve still answers from its other providers"),
+                    BusyGraphHandler::SymbolInfo => inline(
+                        server
+                            .symbol_info(
+                                symbol_params("Сервер.Считать"),
+                                token(),
+                                tasks::TaskCapable(false),
+                            )
+                            .await
+                            .expect("the resident card survives unavailable graph enrichment"),
                     ),
+                    BusyGraphHandler::References => inline(
+                        server
+                            .references(
+                                references_params("Сервер.Считать"),
+                                token(),
+                                tasks::TaskCapable(false),
+                            )
+                            .await
+                            .expect("resident references survive unavailable graph enrichment"),
+                    ),
+                }
+            })
+        };
+        // The answer has to come back while this stand still holds the lock. That ORDER does not,
+        // by itself, show the handler kept away from the lock: every lease wait is bounded by
+        // `LOCK_WAIT`, so a handler that waited would give up after it and still answer before
+        // the release — slower, not stuck. The bound below is only a hang guard, not the
+        // discriminator: a budget in the hundreds of milliseconds measured the runtime's
+        // scheduling as much as the handler, and a loaded suite fails it for neither reason.
+        let answer = tokio::time::timeout(Duration::from_secs(30), call)
+            .await
+            .expect("the handler never answered while the lease lock was held")
+            .expect("the handler did not panic");
+        assert!(answer.structured_content.is_some());
+        // The discriminator, which no clock can make untrue: the handler took neither of the two
+        // lease paths that note the thread asking — an ownership check or a publication fence.
+        // `release` reaches the lock file too and is not noted; it runs on shutdown, not while
+        // a request is served. Read by THREAD, because the background owners go on using the
+        // lease while this runs — that is their work, and it is not this handler's.
+        let strangers = lease_reads_off_the_owners(&state, lease_before);
+        assert!(
+            strangers.is_empty(),
+            "the handler went to the lease's disk while it was held: {strangers:?}",
+        );
+
+        drop(held);
+        release_the_lock.send(()).expect("the lock holder is still there to be released");
+        lock.join().unwrap();
+        server.shutdown();
+    }
+
+    fn status_params() -> Parameters<MetadataParams> {
+        Parameters(MetadataParams {
+            action: "status".to_owned(),
+            filter: None,
+            meta_type: None,
+            name_mask: None,
+            max_items: None,
+            object_type: None,
+            object_name: None,
+            form_name: None,
+            max_output_tokens: None,
+            connection: None,
+            mode: Some("auto".to_owned()),
+        })
+    }
+
+    /// Every thread this workspace's background owners run on. A lease read from one of these
+    /// is the design — it is how the verdict this daemon serves stays current; a read from
+    /// anywhere else is a request path reading the lease.
+    const BACKGROUND_OWNERS: &[&str] = &[
+        "bsl-cache-lease",
+        "bsl-graph-watch",
+        "bsl-graph-init",
+        "bsl-graph-reload",
+        "bsl-graph-first-build",
+        "bsl-search-init",
+        "bsl-search-overlay-watch",
+        "bsl-overlay-backlog",
+        "bsl-embed-retry",
+        "bsl-change-hub",
+        "bsl-change-poll",
+    ];
+
+    /// The lease reads made since `from` that no background owner made.
+    ///
+    /// A COUNT cannot say this: the owners read the lease while a request is being served, and
+    /// a total that moved says nothing about who moved it.
+    fn lease_reads_off_the_owners(state: &SharedState, from: usize) -> Vec<String> {
+        state
+            .lease_disk_check_threads()
+            .split_off(from)
+            .into_iter()
+            .filter(|thread| !BACKGROUND_OWNERS.contains(&thread.as_str()))
+            .collect()
+    }
+
+    /// A request answers without asking the lease anything.
+    ///
+    /// Not "it answered quickly": a lease read that beats a bound on an idle machine is the
+    /// same read on a loaded one, and the bound is what moves. The lease records the THREAD
+    /// each of its disk answers was asked on, and none of them may be the one serving a
+    /// request — so this fails on the read itself rather than on how long it took, and a
+    /// background owner reading the lease beside the request is not mistaken for one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_paths_ask_the_lease_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        crate::graph::test_support::sample_workspace(root);
+        std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        let state = SharedState::workspace_with_cache(root.to_path_buf(), cache.clone()).unwrap();
+        state.diagnostics().ensure_loading();
+        crate::diagnostics_state::test_support::wait_ready(state.diagnostics());
+        let graph = state.graph().clone();
+        graph.ensure_first_build();
+        crate::graph::test_support::wait_ready(&graph);
+        let server = McpServer::new(McpProfile::Workspace, state.clone());
+        let token = || tokio_util::sync::CancellationToken::new();
+
+        for (what, strangers) in [
+            ("graph resolve", {
+                let before = state.lease_disk_check_threads().len();
+                assert!(server
+                    .graph(resolve_params("Считать"), token())
+                    .await
+                    .expect("resolve answers")
+                    .structured_content
+                    .is_some());
+                lease_reads_off_the_owners(&state, before)
+            }),
+            ("graph overview", {
+                let before = state.lease_disk_check_threads().len();
+                assert!(server
+                    .graph(params("overview", None), token())
+                    .await
+                    .expect("overview answers")
+                    .structured_content
+                    .is_some());
+                lease_reads_off_the_owners(&state, before)
+            }),
+            ("metadata status", {
+                let before = state.lease_disk_check_threads().len();
+                assert!(matches!(
+                    server
+                        .metadata(status_params(), token(), tasks::TaskCapable(false))
+                        .await
+                        .expect("status answers"),
+                    rmcp::model::CallToolResponse::Complete(_)
+                ));
+                lease_reads_off_the_owners(&state, before)
+            }),
+        ] {
+            assert!(
+                strangers.is_empty(),
+                "{what} went to the lease on the thread serving it: {strangers:?}",
+            );
+        }
+        server.shutdown();
+    }
+
+    /// A request answers without asking the lease anything — on a graph with nothing published
+    /// yet, and on one whose last build failed with a retry that is due.
+    ///
+    /// The previous statement of this warmed the graph to Ready first, where no build can be
+    /// claimed whatever the lease says. Those are the two states where one CAN: an idle graph
+    /// owes its first build, and a failed one owes a retry whose moment has come — and reaching
+    /// that decision from the request thread is what put a lease read, and its lock wait, on
+    /// every such call.
+    ///
+    /// Attributed by THREAD, not by a count: the background owners read the lease, and must —
+    /// that is how the verdict this daemon serves stays current. What may not happen is a read
+    /// on the thread serving the request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_on_an_unbuilt_or_failed_graph_asks_the_lease_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        crate::graph::test_support::sample_workspace(root);
+        std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        // The graph's first build is held by the stand, so the request below meets a graph that
+        // has nothing published and has not started building either.
+        let (state, held) = crate::graph::test_support::holding_the_first_build(|| {
+            SharedState::workspace_with_cache(root.to_path_buf(), cache.clone()).unwrap()
+        });
+        let graph = state.graph().clone();
+        // The boot's own init is the other claimant. It is refused while the hold stands, and
+        // it does not come back — so the hold is given up only once that thread has gone, and
+        // the graph then stays idle for as long as this test needs it to.
+        assert!(
+            crate::change_hub::test_support::eventually(Duration::from_secs(60), || !state
+                .search_init_running()),
+            "the boot's workspace-search init never finished",
+        );
+        drop(held);
+        crate::graph::test_support::wait_until(&graph, "the graph to fall back to idle", || {
+            matches!(graph.status(), crate::graph::GraphStatus::Idle)
+        });
+        state.diagnostics().ensure_loading();
+        crate::diagnostics_state::test_support::wait_ready(state.diagnostics());
+        let server = McpServer::new(McpProfile::Workspace, state.clone());
+
+        for (what, status) in [
+            ("an idle graph", crate::graph::GraphStatus::Idle),
+            // And the other state a build can be claimed in: failed, with a retry that is due
+            // right now. `ensure_loading` reaches the schedule for this one too.
+            (
+                "a failed graph whose retry is due",
+                crate::graph::GraphStatus::Failed("t".to_owned()),
+            ),
+        ] {
+            if matches!(status, crate::graph::GraphStatus::Failed(_)) {
+                // The ask above is answered by a real build, so this leg waits for it to end
+                // before putting the graph where a retry — not a first build — is what is owed.
+                crate::graph::test_support::wait_until(
+                    &graph,
+                    "the asked-for build to end",
+                    || {
+                        !matches!(graph.status(), crate::graph::GraphStatus::Loading)
+                            && !graph.build_in_flight()
+                    },
+                );
+                graph.fail_with_retry_held_until(std::time::Instant::now());
+            }
+            assert!(
+                matches!(
+                    graph.status(),
+                    crate::graph::GraphStatus::Idle | crate::graph::GraphStatus::Failed(_)
+                ),
+                "{what}: the stand needs a graph a build could still be claimed on: {:?}",
+                graph.status(),
+            );
+            let before = state.lease_disk_check_threads().len();
+            for action in ["status", "overview", "resolve"] {
+                // Each call is a task of its own with a bound on its join handle: a first poll
+                // that blocks synchronously — which is what a lease read under a held lock does
+                // — is caught rather than slept through.
+                let calling = {
+                    let server = server.clone();
+                    tokio::spawn(async move {
+                        let asked = if action == "resolve" {
+                            resolve_params("Считать")
+                        } else {
+                            params(action, None)
+                        };
+                        server.graph(asked, tokio_util::sync::CancellationToken::new()).await
+                    })
+                };
+                let answered = tokio::time::timeout(Duration::from_secs(5), calling)
+                    .await
+                    .unwrap_or_else(|_| panic!("{what}: graph {action} never came back"))
+                    .expect("the request task did not panic");
+                // A failed graph answers some actions with an error, and that IS the answer:
+                // what this test is about is the thread it came back on, not its shape.
+                let _ = answered;
+            }
+            let strangers = lease_reads_off_the_owners(&state, before);
+            assert!(
+                strangers.is_empty(),
+                "{what}: the lease was read on the thread serving the request: {strangers:?}",
+            );
+        }
+        server.shutdown();
+    }
+
+    /// A verdict nobody has established is not published as one.
+    ///
+    /// The startup claim can fail — a peer holds the lock, or the record could not be written —
+    /// and the cached verdict then still carries its initial value. Publishing that value as
+    /// `owns_caches` tells a client this daemon does NOT own the workspace's caches, in the one
+    /// state where nobody has asked the question yet; it is indistinguishable from a checked
+    /// answer, and a status tool's whole point is to be believed. The field is simply not there
+    /// until a background check has established it — the same shape every other
+    /// present-when-known field in this envelope already has.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unestablished_ownership_verdict_is_not_published_as_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        crate::graph::test_support::sample_workspace(root);
+        std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        // Held until this stand ends it: the boot's claim cannot go through, and neither can
+        // the background check that would answer the question afterwards. A hold measured in
+        // seconds ends on its own where the stand runs slowly, and everything it was standing
+        // for then quietly becomes false.
+        let (lock, release_the_lock) =
+            crate::workspace_lease::WorkspaceLease::hold_cache_lock_until_released(&cache);
+        let state = SharedState::workspace_with_cache(root.to_path_buf(), cache.clone()).unwrap();
+        assert!(
+            !state.ownership_verdict_established(),
+            "the stand needs a daemon whose claim did not go through",
+        );
+        let server = McpServer::new(McpProfile::Workspace, state.clone());
+
+        let answered = |response| match response {
+            rmcp::model::CallToolResponse::Complete(result) => result,
+            _ => panic!("a caller that declared no task extension is answered inline"),
+        };
+        // Run as a task of its own with the bound on the join handle, and with the lease's own
+        // thread attribution around it: this stand states what the answer SAYS, and it states
+        // it about an answer that neither waited on the held lock nor went to disk for it.
+        let before = state.lease_disk_check_threads().len();
+        let asked = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .metadata(
+                        status_params(),
+                        tokio_util::sync::CancellationToken::new(),
+                        tasks::TaskCapable(false),
+                    )
+                    .await
+                    .expect("status answers whatever the claim is doing")
+            })
+        };
+        let body = answered(
+            tokio::time::timeout(Duration::from_millis(500), asked)
+                .await
+                .expect("the status request waited on the claim this test holds the lock against")
+                .expect("the status task did not panic"),
+        )
+        .structured_content
+        .expect("a structured body");
+        let strangers = lease_reads_off_the_owners(&state, before);
+        assert!(strangers.is_empty(), "the status request went to the lease: {strangers:?}");
+        assert!(
+            body.get("owns_caches").is_none(),
+            "an unestablished verdict was published as a checked one: {body}",
+        );
+
+        // And the control: once the lock is free and a background check has run, the field is
+        // there — the absence above is the unknown window, not the field going away.
+        release_the_lock.send(()).expect("the lock holder is still there to be released");
+        lock.join().unwrap();
+        assert!(
+            crate::change_hub::test_support::eventually(Duration::from_secs(30), || state
+                .ownership_verdict_established()),
+            "no background check ever established the verdict",
+        );
+        let body = answered(
+            server
+                .metadata(
+                    status_params(),
+                    tokio_util::sync::CancellationToken::new(),
+                    tasks::TaskCapable(false),
                 )
                 .await
-                .expect("references must not wait for the lease lock")
-                .expect("resident references survive unavailable graph enrichment");
-                match response {
-                    rmcp::model::CallToolResponse::Complete(result) => result,
+                .expect("status answers"),
+        )
+        .structured_content
+        .expect("a structured body");
+        assert_eq!(
+            body.get("owns_caches"),
+            Some(&serde_json::json!(true)),
+            "an established verdict is not published: {body}",
+        );
+        server.shutdown();
+    }
+
+    /// A status answer does not WAIT on the lease either.
+    ///
+    /// Making no I/O of its own is not the statement: the verdict a request renders is kept
+    /// under the same lifecycle lock a background check holds across its file lock and its
+    /// record read, so a request that merely reads it queues behind that I/O — seconds of it,
+    /// on the thread serving the call, with nothing in the thread attribution to show for it.
+    /// What a request may read is a published snapshot, and reading one takes no lock at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_status_answer_does_not_queue_behind_a_background_ownership_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        crate::graph::test_support::sample_workspace(root);
+        std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        // A peer holds the lock file until this stand ends it, so every claim attempt spends
+        // its whole wait inside the lifecycle lock — the real shape of a check that is under
+        // way, and one a slow stand cannot outlive.
+        let (lock, release_the_lock) =
+            crate::workspace_lease::WorkspaceLease::hold_cache_lock_until_released(&cache);
+        let state = SharedState::workspace_with_cache(root.to_path_buf(), cache.clone()).unwrap();
+        let server = McpServer::new(McpProfile::Workspace, state.clone());
+
+        // A background owner doing exactly what the heartbeat does, on a thread named like one.
+        let checking = {
+            let state = state.clone();
+            std::thread::Builder::new()
+                .name("bsl-cache-lease".to_owned())
+                .spawn(move || state.owns_caches())
+                .expect("the background check starts")
+        };
+        assert!(
+            crate::change_hub::test_support::eventually(Duration::from_secs(5), || state
+                .lease_lifecycle_is_busy()),
+            "the background check never reached the lock this test is about",
+        );
+
+        let before = state.lease_disk_check_threads().len();
+        let asked = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .metadata(
+                        status_params(),
+                        tokio_util::sync::CancellationToken::new(),
+                        tasks::TaskCapable(false),
+                    )
+                    .await
+                    .expect("status answers whatever the background is doing")
+            })
+        };
+        let answer = tokio::time::timeout(Duration::from_millis(500), asked)
+            .await
+            .expect("the status request queued behind the background ownership check")
+            .expect("the status task did not panic");
+        assert!(matches!(answer, rmcp::model::CallToolResponse::Complete(_)));
+        let strangers = lease_reads_off_the_owners(&state, before);
+        assert!(strangers.is_empty(), "the status request went to the lease: {strangers:?}");
+
+        release_the_lock.send(()).expect("the lock holder is still there to be released");
+        lock.join().unwrap();
+        let _ = checking.join();
+        server.shutdown();
+    }
+
+    /// An attempt that produced no answer establishes nothing.
+    ///
+    /// Pacing and verdict are different facts. A refresh that could not take the lock has still
+    /// been attempted — that is what throttles the next one — but it answered nothing, and
+    /// recording the attempt as the answer republishes the initial `false` as a checked verdict:
+    /// the very thing the unknown window exists to avoid, restored by the first refresh.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refresh_that_answered_nothing_leaves_the_verdict_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        crate::graph::test_support::sample_workspace(root);
+        std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        // Held until this stand ends it: what follows is about refreshes that cannot take the
+        // lock, and a hold that ends on a clock takes that premise with it.
+        let (lock, release_the_lock) =
+            crate::workspace_lease::WorkspaceLease::hold_cache_lock_until_released(&cache);
+        let state = SharedState::workspace_with_cache(root.to_path_buf(), cache.clone()).unwrap();
+        let server = McpServer::new(McpProfile::Workspace, state.clone());
+        let published = |server: &McpServer| {
+            let server = server.clone();
+            async move {
+                let answer = server
+                    .metadata(
+                        status_params(),
+                        tokio_util::sync::CancellationToken::new(),
+                        tasks::TaskCapable(false),
+                    )
+                    .await
+                    .expect("status answers");
+                match answer {
+                    rmcp::model::CallToolResponse::Complete(result) => {
+                        result.structured_content.expect("a structured body")
+                    }
                     _ => panic!("a caller that declared no task extension is answered inline"),
                 }
             }
         };
-        assert!(answer.structured_content.is_some());
+        // The premise is read off DISK, not off the answer this stand is about: a defect that
+        // publishes attempts as verdicts must reach the assertion after the refresh instead of
+        // failing the setup before it.
+        assert!(!cache.lease_path().exists(), "the boot's claim wrote a record after all");
 
-        drop(held);
+        // Refreshes that cannot take the lock, on the thread a background owner uses.
+        let before = state.lease_disk_check_threads().len();
+        for _ in 0..2 {
+            let state = state.clone();
+            std::thread::Builder::new()
+                .name("bsl-cache-lease".to_owned())
+                .spawn(move || state.owns_caches())
+                .expect("the background check starts")
+                .join()
+                .expect("the background check returns");
+        }
+        let attempted: Vec<String> = state
+            .lease_disk_check_threads()
+            .split_off(before)
+            .into_iter()
+            .filter(|thread| thread == "bsl-cache-lease")
+            .collect();
+        assert!(
+            !attempted.is_empty(),
+            "no refresh reached the claim it retries, so nothing was attempted to answer",
+        );
+        assert!(!cache.lease_path().exists(), "a refresh wrote a record after all");
+        assert!(
+            !state.ownership_verdict_established(),
+            "an attempt that answered nothing was recorded as the answer",
+        );
+        let body = published(&server).await;
+        assert!(
+            body.get("owns_caches").is_none(),
+            "a failed refresh republished the initial value as a checked verdict: {body}",
+        );
+
+        // And the transition out of unknown, once a check can actually answer.
+        release_the_lock.send(()).expect("the lock holder is still there to be released");
+        lock.join().unwrap();
+        assert!(
+            crate::change_hub::test_support::eventually(Duration::from_secs(30), || state
+                .ownership_verdict_established()),
+            "no background check ever established the verdict",
+        );
+        assert_eq!(
+            published(&server).await.get("owns_caches"),
+            Some(&serde_json::json!(true)),
+            "an established verdict is not published",
+        );
+        server.shutdown();
+    }
+
+    /// A failed refresh does not unpublish the verdict a check established.
+    ///
+    /// The claimed half of the same line, where the damage runs the other way: this daemon
+    /// claimed the workspace and a client has been told so. The record then goes missing — a
+    /// deleted `.build`, a peer's cleanup — and the refresh that would re-claim it cannot take
+    /// the lock. Recording that attempt as the answer makes `status` say this daemon does not
+    /// own caches it is still maintaining, on the strength of a check that answered nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_refresh_keeps_publishing_the_verdict_a_check_established() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        crate::graph::test_support::sample_workspace(root);
+        std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        let state = SharedState::workspace_with_cache(root.to_path_buf(), cache.clone()).unwrap();
+        let server = McpServer::new(McpProfile::Workspace, state.clone());
+        let published = |server: &McpServer| {
+            let server = server.clone();
+            async move {
+                let answer = server
+                    .metadata(
+                        status_params(),
+                        tokio_util::sync::CancellationToken::new(),
+                        tasks::TaskCapable(false),
+                    )
+                    .await
+                    .expect("status answers");
+                match answer {
+                    rmcp::model::CallToolResponse::Complete(result) => {
+                        result.structured_content.expect("a structured body")
+                    }
+                    _ => panic!("a caller that declared no task extension is answered inline"),
+                }
+            }
+        };
+        // Premise off disk: the boot's claim really went through, so what follows is a refresh
+        // of an established verdict and not the unknown window of the stand above.
+        assert!(cache.lease_path().exists(), "the boot's claim wrote no record");
+        assert_eq!(
+            published(&server).await.get("owns_caches"),
+            Some(&serde_json::json!(true)),
+            "the stand needs a daemon that has been published as the owner",
+        );
+
+        // The lock a re-claim needs is held by a peer, and only THEN does the record go missing:
+        // the refresh completes, and it answers nothing. The order is the premise. This daemon's
+        // own owners keep asking whether it still owns the workspace — the heartbeat about every
+        // second once the verdict is older than `VERDICT_TTL` — and one that finds no record
+        // re-claims it under this very lock, writing a record with this daemon's token. Removed
+        // before the lock is held, the record can be put back in between, and the refresh then
+        // reads its own record and answers without attempting any claim.
+        // Held until this stand ends it, for the same reason as above.
+        let (lock, release_the_lock) =
+            crate::workspace_lease::WorkspaceLease::hold_cache_lock_until_released(&cache);
+        std::fs::remove_file(cache.lease_path()).expect("the record is this daemon's to remove");
+        let before = state.lease_disk_check_threads().len();
+        // Read where it can no longer change: with the lock held, nothing can write it back.
+        assert!(
+            !cache.lease_path().exists(),
+            "premise: the record came back although the lock a re-claim needs is held",
+        );
+        let refreshed = {
+            let state = state.clone();
+            std::thread::Builder::new()
+                .name("bsl-graph-reload".to_owned())
+                .spawn(move || state.refresh_ownership_now())
+                .expect("the background check starts")
+                .join()
+                .expect("the background check returns")
+        };
+        assert!(
+            !refreshed,
+            "the refresh took the lock after all, so it answered instead of failing",
+        );
+        let attempted: Vec<String> = state
+            .lease_disk_check_threads()
+            .split_off(before)
+            .into_iter()
+            .filter(|thread| thread == "bsl-graph-reload")
+            .collect();
+        assert!(
+            attempted.len() >= 2,
+            "the refresh made {} attempts: it never reached the re-claim whose failure this \
+             stand is about",
+            attempted.len(),
+        );
+
+        let body = published(&server).await;
+        assert_eq!(
+            body.get("owns_caches"),
+            Some(&serde_json::json!(true)),
+            "a refresh that answered nothing replaced the verdict a check established: {body}",
+        );
+        release_the_lock.send(()).expect("the lock holder is still there to be released");
+        lock.join().unwrap();
+        server.shutdown();
+    }
+
+    /// The same statement where the answer is not free: the lease lock is held, so a request
+    /// that reads the lease at all waits on a file lock this test owns.
+    ///
+    /// The handler runs as a task of its own and the bound is awaited on its join handle, so a
+    /// first poll that blocks synchronously is caught rather than slept through — a timeout
+    /// wrapped around the future itself only fires at an await the handler may never reach.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_does_not_wait_on_a_held_lease_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        crate::graph::test_support::sample_workspace(root);
+        std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        // Claimed by nobody: the lock is taken first and held until this stand ends it, so this
+        // backend's own startup claim does not go through and its ownership verdict is genuinely
+        // unknown — the window the status path used to close with a synchronous read of its own.
+        let (lock, release_the_lock) =
+            crate::workspace_lease::WorkspaceLease::hold_cache_lock_until_released(&cache);
+        let state = SharedState::workspace_with_cache(root.to_path_buf(), cache.clone()).unwrap();
+        let server = McpServer::new(McpProfile::Workspace, state.clone());
+
+        let before = state.lease_disk_check_threads().len();
+        let asked = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .metadata(
+                        status_params(),
+                        tokio_util::sync::CancellationToken::new(),
+                        tasks::TaskCapable(false),
+                    )
+                    .await
+                    .expect("status answers whatever the lease is doing")
+            })
+        };
+        let answer = tokio::time::timeout(Duration::from_millis(500), asked)
+            .await
+            .expect("the status request waited on the held lease lock")
+            .expect("the status task did not panic");
+        assert!(matches!(answer, rmcp::model::CallToolResponse::Complete(_)));
+        let strangers = lease_reads_off_the_owners(&state, before);
+        assert!(
+            strangers.is_empty(),
+            "the status request answered an ownership question from disk: {strangers:?}",
+        );
+
+        release_the_lock.send(()).expect("the lock holder is still there to be released");
         lock.join().unwrap();
         server.shutdown();
     }
@@ -3279,7 +4101,7 @@ mod graph_supersession_contract {
         let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
         let state = SharedState::workspace_with_cache(root.to_path_buf(), cache.clone()).unwrap();
         let graph = state.graph().clone();
-        graph.ensure_loading();
+        graph.ensure_first_build();
         crate::graph::test_support::wait_ready(&graph);
         let held = graph.snapshot().expect("the old daemon owns one open descriptor");
         let server = McpServer::new(McpProfile::Workspace, state);
@@ -3739,12 +4561,21 @@ mod tool_descriptions {
 /// empty list with no hint that a source was never asked, which is exactly the emptiness that
 /// cannot be told from a proven zero.
 ///
-/// The graph's verdict is an INPUT here rather than something to wait for. A newer lease takes
-/// the workspace's caches BEFORE the server exists, so nothing this server starts can ever own
-/// the graph's build: it is never claimed, the graph never publishes, and the verdict holds for
-/// the whole test. Claiming the build from the stand instead would have raced the boot thread
-/// that claims it too — a narrow window, but the same kind of wager this change exists to
-/// remove.
+/// The graph's verdict is an INPUT here rather than something to wait for, and the stand makes
+/// it one: it takes the graph's first build itself — production's own single flight, claimed
+/// inside the boot before any thread that boot starts can claim it — and holds it across the
+/// whole call. The source is unconsulted because nothing may build it, and the hold is read on
+/// both sides of the handler rather than assumed.
+///
+/// A lease claimed before the constructor does NOT establish this: the constructor claims one of
+/// its own, which is newer, so the graph is free to build from the moment it exists. That left
+/// the verdict a race between the boot's publish and this call — about 15ms wide on an idle
+/// machine — which is exactly the wager a lifecycle precondition has to replace.
+///
+/// The same answer is asked for a second way: an independent graph, claimed as an external
+/// build before it is installed in the state, which no boot worker ever receives. One stand
+/// holds production's own first build, the other hands the state a graph nobody can publish;
+/// both must read as partial.
 #[cfg(test)]
 mod resolve_envelope {
     use super::*;
@@ -3768,30 +4599,28 @@ mod resolve_envelope {
         })
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_unconsulted_source_makes_the_resolve_envelope_partial() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        crate::graph::test_support::sample_workspace(root);
-        std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
-        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
-        let newer = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
-        let state = SharedState::workspace_with_cache(root.to_path_buf(), cache)
-            .expect("valid workspace project");
-        state.diagnostics().ensure_loading();
-        crate::diagnostics_state::test_support::wait_ready(state.diagnostics());
-        let server = McpServer::new(McpProfile::Workspace, state);
+    /// A backend shut down however the test leaves. An assertion that fires mid-answer would
+    /// otherwise leave a boot working on a temporary directory the test is about to remove.
+    struct ServerUnderTest(McpServer);
 
-        let body = server
-            .graph(
-                resolve_params("ЗаведомоНесуществующееИмяСимвола"),
-                tokio_util::sync::CancellationToken::new(),
-            )
-            .await
-            .expect("resolve answers whatever the graph is doing")
-            .structured_content
-            .expect("a structured body");
+    impl std::ops::Deref for ServerUnderTest {
+        type Target = McpServer;
 
+        fn deref(&self) -> &McpServer {
+            &self.0
+        }
+    }
+
+    impl Drop for ServerUnderTest {
+        fn drop(&mut self) {
+            self.0.shutdown();
+        }
+    }
+
+    /// What a `resolve` for a name no source holds must say while the graph is unconsulted: an
+    /// empty list, the graph named as not ready, and a completeness that is partial for that
+    /// reason.
+    fn assert_partial_while_the_graph_is_unconsulted(body: &serde_json::Value) {
         let candidates = body["result"]["candidates"]
             .as_array()
             .unwrap_or_else(|| panic!("the answer carries a candidate list: {body}"));
@@ -3807,6 +4636,7 @@ mod resolve_envelope {
             .unwrap_or_else(|| panic!("`graph` carries a state: {body}"))
             .to_owned();
         assert_eq!(graph_state, "not_ready", "{body}");
+        assert_eq!(body["freshness"]["completeness"]["status"], "partial", "{body}");
 
         let codes: Vec<&str> = body["freshness"]["completeness"]["reasons"]
             .as_array()
@@ -3818,9 +4648,70 @@ mod resolve_envelope {
             codes.contains(&"index_building"),
             "an empty list while a source is unconsulted must not read as complete: {body}",
         );
+    }
 
-        server.shutdown();
-        newer.release();
+    async fn resolve_nothing(server: &McpServer) -> serde_json::Value {
+        server
+            .graph(
+                resolve_params("ЗаведомоНесуществующееИмяСимвола"),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("resolve answers whatever the graph is doing")
+            .structured_content
+            .expect("a structured body")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unconsulted_source_makes_the_resolve_envelope_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        crate::graph::test_support::sample_workspace(root);
+        std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        let (state, held) = crate::graph::test_support::holding_the_first_build(|| {
+            SharedState::workspace_with_cache(root.to_path_buf(), cache)
+                .expect("valid workspace project")
+        });
+        assert!(
+            held.holds_unconsulted(),
+            "the stand does not hold the graph's first build: {:?}",
+            state.graph().status(),
+        );
+        state.diagnostics().ensure_loading();
+        crate::diagnostics_state::test_support::wait_ready(state.diagnostics());
+        let server = ServerUnderTest(McpServer::new(McpProfile::Workspace, state));
+
+        let body = resolve_nothing(&server).await;
+
+        // The whole answer was assembled with the build still held, so what it says about the
+        // graph is what the graph was, not what it became.
+        assert!(held.holds_unconsulted(), "the graph was built out from under the answer: {body}",);
+        assert_partial_while_the_graph_is_unconsulted(&body);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_externally_claimed_graph_makes_the_resolve_envelope_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        crate::graph::test_support::sample_workspace(root);
+        std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        let graph =
+            crate::graph::GraphState::for_workspace_with_cache(root.to_path_buf(), cache.clone());
+        assert!(graph.try_begin_external_build(), "the stand owns the graph's build");
+        let state = SharedState::workspace_with_cache(root.to_path_buf(), cache)
+            .expect("valid workspace project")
+            .with_graph_for_test(graph.clone());
+        state.diagnostics().ensure_loading();
+        crate::diagnostics_state::test_support::wait_ready(state.diagnostics());
+        let server = ServerUnderTest(McpServer::new(McpProfile::Workspace, state));
+        assert_eq!(graph.status(), crate::graph::GraphStatus::Loading);
+
+        let body = resolve_nothing(&server).await;
+
+        assert_eq!(graph.status(), crate::graph::GraphStatus::Loading);
+        assert_partial_while_the_graph_is_unconsulted(&body);
     }
 }
 

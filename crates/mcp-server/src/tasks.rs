@@ -214,11 +214,19 @@ where
         outcome = &mut call => outcome,
         reason = stop_reason(&task_ctx, stop) => {
             stopped = Some(reason);
+            #[cfg(test)]
+            grace_probe::note(grace_probe::Grace::Entered);
             // The grace first: an answer already assembled is worth more than the moment
             // saved by discarding it, and a caller holding a handle can still read it.
-            match tokio::time::timeout(FINISHING_GRACE, &mut call).await {
-                Ok(outcome) => outcome,
-                Err(_) => {
+            match within_grace(FINISHING_GRACE, &mut call).await {
+                Some(outcome) => {
+                    #[cfg(test)]
+                    grace_probe::note(grace_probe::Grace::AnsweredInside);
+                    outcome
+                }
+                None => {
+                    #[cfg(test)]
+                    grace_probe::note(grace_probe::Grace::Expired);
                     ct.cancel();
                     call.await
                 }
@@ -239,6 +247,127 @@ where
         CallOutcome::Panicked => {
             Err(TaskExit::Error(McpError::internal_error("internal handler panic", None)))
         }
+    }
+}
+
+/// Wait for `call` for at most `limit`: its output, or `None` once the limit has passed.
+///
+/// Exactly `tokio::time::timeout`, polled the same way — the work first, the limit second. A
+/// test that installed a clock of its own on the thread driving the task runs the SAME limit
+/// on that clock instead, so the boundary is reached when the test says so and not when a
+/// loaded host happens to wake a thread; everything that follows from the answer is unchanged.
+async fn within_grace<F>(limit: Duration, call: F) -> Option<F::Output>
+where
+    F: std::future::Future + Unpin,
+{
+    #[cfg(test)]
+    if let Some(clock) = grace_probe::clock() {
+        return clock.within(limit, call).await;
+    }
+    tokio::time::timeout(limit, call).await.ok()
+}
+
+/// Which way the stop arm of [`run`] went, for a test on the thread that drives it.
+///
+/// A test cannot read this off the outcome: `Cancelled` is what both a grace that ran out and a
+/// build that cancels on the spot produce, and the difference is the whole question. Recorded
+/// only on a thread that asked to watch, so a test on another runtime sees nothing of it.
+#[cfg(test)]
+pub(crate) mod grace_probe {
+    use std::cell::RefCell;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Grace {
+        /// A stop was decided while the work was still running: the grace began.
+        Entered,
+        /// The work answered before the grace ran out.
+        AnsweredInside,
+        /// The grace ran out first, and the work was cancelled.
+        Expired,
+    }
+
+    thread_local! {
+        static SEEN: RefCell<Option<Vec<Grace>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn watch() {
+        SEEN.with(|seen| *seen.borrow_mut() = Some(Vec::new()));
+    }
+
+    pub(super) fn note(event: Grace) {
+        SEEN.with(|seen| {
+            if let Some(events) = seen.borrow_mut().as_mut() {
+                events.push(event);
+            }
+        });
+    }
+
+    pub(crate) fn seen() -> Vec<Grace> {
+        SEEN.with(|seen| seen.borrow().clone().unwrap_or_default())
+    }
+
+    /// The time a grace runs on, moved only by the test that owns it. Nothing advances it on
+    /// its own — no idle runtime and no real thread finishing its work — so a boundary checked
+    /// against it is checked exactly.
+    #[derive(Default)]
+    pub(crate) struct GraceClock {
+        elapsed_nanos: std::sync::atomic::AtomicU64,
+        moved: tokio::sync::Notify,
+    }
+
+    impl GraceClock {
+        pub(crate) fn advance(&self, by: std::time::Duration) {
+            self.elapsed_nanos.fetch_add(
+                u64::try_from(by.as_nanos()).unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            self.moved.notify_waiters();
+        }
+
+        fn elapsed(&self) -> std::time::Duration {
+            std::time::Duration::from_nanos(
+                self.elapsed_nanos.load(std::sync::atomic::Ordering::SeqCst),
+            )
+        }
+
+        pub(super) async fn within<F>(
+            &self,
+            limit: std::time::Duration,
+            mut call: F,
+        ) -> Option<F::Output>
+        where
+            F: std::future::Future + Unpin,
+        {
+            let started = self.elapsed();
+            loop {
+                // Registered before the limit is read, so an advance in between is not lost.
+                let moved = self.moved.notified();
+                tokio::pin!(moved);
+                moved.as_mut().enable();
+                let passed = self.elapsed().saturating_sub(started) >= limit;
+                tokio::select! {
+                    biased;
+                    output = &mut call => return Some(output),
+                    () = std::future::ready(()), if passed => return None,
+                    () = &mut moved => {}
+                }
+            }
+        }
+    }
+
+    thread_local! {
+        static CLOCK: RefCell<Option<std::sync::Arc<GraceClock>>> = const { RefCell::new(None) };
+    }
+
+    /// Run every grace started on this thread on a clock the caller owns.
+    pub(crate) fn own_the_clock() -> std::sync::Arc<GraceClock> {
+        let clock = std::sync::Arc::new(GraceClock::default());
+        CLOCK.with(|slot| *slot.borrow_mut() = Some(std::sync::Arc::clone(&clock)));
+        clock
+    }
+
+    pub(super) fn clock() -> Option<std::sync::Arc<GraceClock>> {
+        CLOCK.with(|slot| slot.borrow().clone())
     }
 }
 
@@ -428,6 +557,46 @@ mod tests {
         assert!(published.contains(reason), "published for the synchronous branch: {reason}");
     }
 
+    /// Yield until `done` holds, driving the runtime the task lives on. Under a paused clock this
+    /// is also what keeps Tokio from auto-advancing time while the OS schedules a blocking body:
+    /// a runtime that always has this task to run is never idle. Bounded in REAL time, as a hang
+    /// guard only: nothing is decided by how long this takes.
+    async fn yield_until(what: &str, mut done: impl FnMut() -> bool) {
+        let give_up = std::time::Instant::now() + Duration::from_secs(20);
+        while !done() {
+            assert!(std::time::Instant::now() < give_up, "never happened: {what}");
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A task whose body reports that it has started and then answers only when the stand says
+    /// so: past its last checkpoint, with an answer released by the stand and not by a clock.
+    fn held_answer(
+        manager: &TaskManager,
+    ) -> (rmcp::model::Task, std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        // `Failed` is not a state the wait sleeps on, so the body runs at once.
+        let diag = DiagnosticsState::for_workspace(std::env::temp_dir());
+        diag.fail_for_test("not the subject");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (answer_tx, answer_rx) = std::sync::mpsc::channel::<()>();
+        let task = manager.spawn(TaskOptions::new(), move |task_ctx| {
+            Box::pin(run(
+                diag,
+                task_ctx,
+                "probe",
+                UNREACHABLE_DEADLINE,
+                move |_session| {
+                    let _ = entered_tx.send(());
+                    // Bounded in real time, so a stand that fails cannot strand the thread.
+                    let _ = answer_rx.recv_timeout(Duration::from_secs(20));
+                    Ok(CallToolResult::success(vec![]))
+                },
+                || CallToolResult::success(vec![]),
+            ))
+        });
+        (task, entered_rx, answer_tx)
+    }
+
     /// An answer that lands while the task is being stopped is published, not thrown away.
     ///
     /// The read that reaches its result past the last cancellation checkpoint cannot be
@@ -435,34 +604,75 @@ mod tests {
     /// request nobody does, and that is deliberate. For a task the caller still holds a
     /// handle, and this gate fails on a build that cancels the join the moment a stop is
     /// decided: there the same work settles as `cancelled` with no result at all.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    ///
+    /// This one runs the grace on the REAL timer, under Tokio's paused clock, and checks that
+    /// what the caller reads back is the body's own answer. The pair below runs the same limit
+    /// on a clock the stand owns, to put each side of the boundary exactly.
+    #[tokio::test(start_paused = true)]
     async fn an_answer_that_arrives_while_stopping_is_still_published() {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
         // `Failed` is not a state the wait sleeps on, so the body runs at once and this gate
         // is about the stop alone.
         let diag = DiagnosticsState::for_workspace(std::env::temp_dir());
         diag.fail_for_test("not the subject");
 
+        let entered = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let (release, held) = std::sync::mpsc::channel();
+        let answer = CallToolResult::structured(serde_json::json!({ "answer": "finished" }));
+        let expected = serde_json::to_value(&answer).unwrap();
         let manager = TaskManager::new();
+        let body_entered = entered.clone();
+        let stop_observed = stopped.clone();
         let task = manager.spawn(TaskOptions::new(), move |task_ctx| {
-            Box::pin(run(
-                diag,
-                task_ctx,
-                "probe",
-                UNREACHABLE_DEADLINE,
-                // Shorter than the grace and longer than the stop takes to arrive: work
-                // whose tail outlives the decision to stop it.
-                |_session| {
-                    std::thread::sleep(Duration::from_millis(20));
-                    Ok(CallToolResult::success(vec![]))
-                },
-                || CallToolResult::success(vec![]),
-            ))
+            Box::pin(async move {
+                let observed = task_ctx.clone();
+                let call = run(
+                    diag,
+                    task_ctx,
+                    "probe",
+                    UNREACHABLE_DEADLINE,
+                    move |_session| {
+                        body_entered.store(true, Ordering::SeqCst);
+                        held.recv_timeout(Duration::from_secs(5))
+                            .expect("the driver releases the finishing body");
+                        Ok(answer)
+                    },
+                    || CallToolResult::success(vec![]),
+                );
+                tokio::pin!(call);
+                std::future::poll_fn(|cx| {
+                    let cancelling = observed.is_cancel_requested();
+                    let outcome = call.as_mut().poll(cx);
+                    if cancelling {
+                        // The body is still held, so this poll must enter the stop arm,
+                        // not select an answer that finished before cancellation.
+                        stop_observed.store(true, Ordering::SeqCst);
+                    }
+                    outcome
+                })
+                .await
+            })
         });
 
+        yield_until("the body started", || entered.load(Ordering::SeqCst)).await;
+        let frozen = tokio::time::Instant::now();
         manager.cancel_task(&task.task_id).expect("the running task is addressable");
-        tokio::time::timeout(Duration::from_secs(5), wait_for_terminal(&manager, &task.task_id))
-            .await
-            .expect("the task must settle");
+        yield_until("the stop arm was entered", || stopped.load(Ordering::SeqCst)).await;
+        assert_eq!(
+            manager.get_task(&task.task_id).unwrap().task.status,
+            TaskStatus::Working,
+            "stopping must give the in-flight answer its finishing grace"
+        );
+        release.send(()).expect("the body is still waiting to finish");
+        yield_until("the task settled", || {
+            manager.get_task(&task.task_id).unwrap().task.status != TaskStatus::Working
+        })
+        .await;
+        assert_eq!(tokio::time::Instant::now(), frozen, "the grace has not elapsed");
 
         let detailed = manager.get_task(&task.task_id).expect("the task is addressable");
         assert_eq!(
@@ -470,6 +680,112 @@ mod tests {
             TaskStatus::Completed,
             "the work finished inside the grace, so its answer belongs to the caller rather \
              than to the bin"
+        );
+        match detailed.payload {
+            rmcp::model::TaskPayload::Completed { result } => {
+                assert_eq!(serde_json::Value::Object(result), expected);
+            }
+            other => panic!("the completed task must retain the answer: {other:?}"),
+        }
+    }
+
+    /// The same contract at its boundary: an answer released a millisecond before
+    /// `FINISHING_GRACE` runs out is published.
+    ///
+    /// Every step is an event, none a duration. The body has started before the stop; the
+    /// stop is decided while it still runs, which is the grace beginning; the grace runs on a
+    /// clock this test owns, moved to a millisecond short of `FINISHING_GRACE`; and only then
+    /// is the answer released. How long a real thread takes to wake, or a nominal sleep
+    /// takes to end, decides nothing here — which is what made the earlier form of this gate
+    /// fail on a loaded host with the product behaving exactly as designed.
+    #[tokio::test]
+    async fn an_answer_released_just_inside_the_grace_is_published() {
+        grace_probe::watch();
+        let clock = grace_probe::own_the_clock();
+        let manager = TaskManager::new();
+        let (task, entered, answer) = held_answer(&manager);
+
+        yield_until("the body started", || entered.try_recv().is_ok()).await;
+        manager.cancel_task(&task.task_id).expect("the running task is addressable");
+        yield_until("the stop was decided while the work still ran", || {
+            grace_probe::seen().contains(&grace_probe::Grace::Entered)
+        })
+        .await;
+
+        // The grace's own boundary, a millisecond short of it: still open.
+        clock.advance(FINISHING_GRACE - Duration::from_millis(1));
+        // Let the grace look at the moved clock before reading what it decided.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !grace_probe::seen().contains(&grace_probe::Grace::Expired),
+            "the grace ran out before FINISHING_GRACE had passed: the work was cancelled early",
+        );
+
+        answer.send(()).expect("the body is waiting for its answer");
+        yield_until("the task settled", || {
+            manager.get_task(&task.task_id).expect("the task is addressable").task.status
+                != TaskStatus::Working
+        })
+        .await;
+
+        assert_eq!(
+            grace_probe::seen(),
+            vec![grace_probe::Grace::Entered, grace_probe::Grace::AnsweredInside],
+            "the answer released inside the grace did not end it",
+        );
+        let detailed = manager.get_task(&task.task_id).expect("the task is addressable");
+        assert_eq!(
+            detailed.task.status,
+            TaskStatus::Completed,
+            "the work finished inside the grace, so its answer belongs to the caller rather \
+             than to the bin"
+        );
+    }
+
+    /// The other side of the same boundary: once `FINISHING_GRACE` has passed with the work
+    /// still running, the task is cancelled, and an answer that comes afterwards is not
+    /// published. Without this the gate above would be green for a stand whose clock governed
+    /// nothing. It is also the earlier form's failure, reached on purpose: a stopped task
+    /// whose answer came after the grace ends `Cancelled`, and that is the design.
+    #[tokio::test]
+    async fn an_answer_that_misses_the_grace_is_not_published() {
+        grace_probe::watch();
+        let clock = grace_probe::own_the_clock();
+        let manager = TaskManager::new();
+        let (task, entered, answer) = held_answer(&manager);
+
+        yield_until("the body started", || entered.try_recv().is_ok()).await;
+        manager.cancel_task(&task.task_id).expect("the running task is addressable");
+        yield_until("the stop was decided while the work still ran", || {
+            grace_probe::seen().contains(&grace_probe::Grace::Entered)
+        })
+        .await;
+
+        clock.advance(FINISHING_GRACE);
+        yield_until("the grace ran out", || {
+            grace_probe::seen().contains(&grace_probe::Grace::Expired)
+        })
+        .await;
+        yield_until("the task settled", || {
+            manager.get_task(&task.task_id).expect("the task is addressable").task.status
+                != TaskStatus::Working
+        })
+        .await;
+        // Real, bounded cleanup: the blocking thread is let go rather than left to its timeout.
+        let _ = answer.send(());
+
+        assert_eq!(
+            grace_probe::seen(),
+            vec![grace_probe::Grace::Entered, grace_probe::Grace::Expired],
+            "the grace did not run out at FINISHING_GRACE",
+        );
+        let detailed = manager.get_task(&task.task_id).expect("the task is addressable");
+        assert_eq!(
+            detailed.task.status,
+            TaskStatus::Cancelled,
+            "an answer that missed the grace was published anyway",
         );
     }
 

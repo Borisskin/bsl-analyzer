@@ -61,12 +61,60 @@ pub(crate) fn search_not_ready(
     }
     structured(json!({
         "action": action,
-        "schema_version": super::types::SEARCH_SCHEMA_VERSION,
+        "schema_version": super::types::search_schema_version(action),
         "status": "not_ready",
         "detail": detail,
         "retry_after_ms": SEARCH_NOT_READY_RETRY_MS,
         "progress": prog,
     }))
+}
+
+/// Who follows the workspace for the index, and who reads its overlay backlog back — the
+/// section a workspace `search status` ends with. The structured status is unchanged: these
+/// facts reach a machine through `search_code`'s `freshness` instead.
+pub(crate) fn append_workspace_changes(
+    mut result: CallToolResult,
+    drift_watch: Option<crate::tools::location::DriftWatch>,
+    poll_cycle: Option<std::time::Duration>,
+    backlog: &crate::state::overlay_backlog::BacklogState,
+    slow_holds: u64,
+) -> CallToolResult {
+    use crate::state::overlay_backlog::BacklogState;
+    let mut section = String::from("\nWorkspace changes:\n");
+    if let Some(watch) = drift_watch {
+        let _ = writeln!(section, "  Watch:    {}", watch.as_str());
+    }
+    if let Some(cycle) = poll_cycle {
+        let _ = writeln!(
+            section,
+            "  Polling:  an edit that keeps its size and mtime is found within {}s, while the \
+             polled files stay readable (plus the walk's own I/O)",
+            cycle.as_secs()
+        );
+    }
+    let backlog = match backlog {
+        BacklogState::Running => "running".to_owned(),
+        BacklogState::Backoff { until } => format!(
+            "backing off ({}s left)",
+            until.saturating_duration_since(std::time::Instant::now()).as_secs()
+        ),
+        BacklogState::Exhausted { since } => format!(
+            "exhausted {}s ago; the changed files wait for a fresh change",
+            since.elapsed().as_secs()
+        ),
+        BacklogState::Stopped { reason } => format!("stopped ({reason})"),
+    };
+    let _ = writeln!(section, "  Backlog:  {backlog}");
+    if slow_holds > 0 {
+        let _ = writeln!(
+            section,
+            "  Holds:    {slow_holds} batch publication(s) held the engine past their bound"
+        );
+    }
+    if let Some(rmcp::model::ContentBlock::Text(text)) = result.content.first_mut() {
+        text.text.push_str(&section);
+    }
+    result
 }
 
 /// The text the reference profile has always answered with while its index builds, kept
@@ -84,7 +132,7 @@ pub(crate) fn docs_not_ready(action: &str) -> CallToolResult {
         DOCS_INDEX_BUILDING_TEXT.to_owned(),
         json!({
             "action": action,
-            "schema_version": super::types::SEARCH_SCHEMA_VERSION,
+            "schema_version": super::types::search_schema_version(action),
             "status": "not_ready",
             "detail": DOCS_INDEX_BUILDING_TEXT,
             "retry_after_ms": SEARCH_NOT_READY_RETRY_MS,
@@ -106,7 +154,7 @@ pub(crate) fn baseline_warming_not_ready(progress: &IndexProgress) -> CallToolRe
 #[allow(clippy::too_many_arguments, reason = "distinct status inputs, mirrored by _with_cap")]
 pub fn search_status(
     profile: crate::McpProfile,
-    engine: &Arc<Mutex<Option<SearchEngine>>>,
+    engine: &crate::state::SharedSearchEngine,
     progress: &Arc<IndexProgress>,
     semantic_runtime: &Arc<Mutex<SemanticRuntimeStatus>>,
     workspace_search_mode: WorkspaceSearchMode,
@@ -142,7 +190,7 @@ pub fn search_status(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn search_status_with_cap(
     profile: crate::McpProfile,
-    engine: &Arc<Mutex<Option<SearchEngine>>>,
+    engine: &crate::state::SharedSearchEngine,
     progress: &Arc<IndexProgress>,
     semantic_runtime: &Arc<Mutex<SemanticRuntimeStatus>>,
     workspace_search_mode: WorkspaceSearchMode,
@@ -324,6 +372,9 @@ pub(super) fn search_status_with_cap(
             SemanticRuntimeStatus::Indexing => {
                 "ready (lexical) — semantic index building in background"
             }
+            SemanticRuntimeStatus::Stopped => {
+                "ready (lexical) — semantic indexing stopped with the daemon"
+            }
             _ => "ready",
         };
         let _ = writeln!(out, "Search index: {search_state}");
@@ -368,6 +419,7 @@ pub(super) fn search_status_with_cap(
                 }
             },
             SemanticRuntimeStatus::Failed(_) => "failed (inspect status)".to_owned(),
+            SemanticRuntimeStatus::Stopped => "stopped with the daemon".to_owned(),
         };
         let _ = writeln!(out, "  Semantic: {semantic_status}");
         let _ = writeln!(out, "  FTS:      {}", if chunks > 0 { "available" } else { "empty" });
@@ -441,6 +493,9 @@ pub(super) fn search_status_with_cap(
                             }
                         }
                         (SemanticRuntimeStatus::Failed(_), _) => "failed".to_owned(),
+                        (SemanticRuntimeStatus::Stopped, _) => {
+                            "local sqlite semantic indexing stopped with the daemon".to_owned()
+                        }
                     };
                     let _ = writeln!(out, "  Code semantic source: {code_semantic_source}");
                 }
@@ -759,6 +814,10 @@ fn write_summary_block(
                 "baseline available; semantic runtime reported a failure (see below).".to_owned()
             }
         }
+        (SemanticRuntimeStatus::Stopped, _) => {
+            "semantic indexing stopped with the daemon; nothing further will be embedded."
+                .to_owned()
+        }
         (SemanticRuntimeStatus::OverlaySyncing, _) => {
             if baseline_probe_unreachable(baseline_probe) {
                 "local overlay still syncing; the shared baseline is not currently reachable (see the External baseline section).".to_owned()
@@ -832,6 +891,71 @@ fn shorten_fingerprint(fingerprint: &str) -> &str {
 }
 
 #[cfg(test)]
+mod workspace_changes_tests {
+    use super::append_workspace_changes;
+    use crate::state::overlay_backlog::BacklogState;
+    use crate::tools::location::DriftWatch;
+    use rmcp::model::{CallToolResult, ContentBlock};
+    use std::time::{Duration, Instant};
+
+    fn status() -> CallToolResult {
+        let mut result = CallToolResult::success(vec![ContentBlock::text("Search status: ready")]);
+        result.structured_content = Some(serde_json::json!({"action": "status"}));
+        result
+    }
+
+    fn text(result: &CallToolResult) -> String {
+        result.content[0].as_text().expect("text").text.clone()
+    }
+
+    /// Every state the overlay's backlog owner can be in reads differently in `search status`,
+    /// next to who watches the workspace and how long a poll can miss an edit; the structured
+    /// status is not touched.
+    #[test]
+    fn each_backlog_state_reads_differently_in_the_status() {
+        let states = [
+            BacklogState::Running,
+            BacklogState::Backoff { until: Instant::now() + Duration::from_secs(90) },
+            BacklogState::Exhausted { since: Instant::now() },
+            BacklogState::Stopped { reason: "the lease went terminal" },
+        ];
+        let lines: Vec<String> = states
+            .iter()
+            .map(|state| {
+                let result = append_workspace_changes(status(), None, None, state, 0);
+                assert_eq!(result.structured_content, status().structured_content);
+                let text = text(&result);
+                text.lines()
+                    .find(|line| line.contains("Backlog:"))
+                    .expect("a backlog line")
+                    .to_owned()
+            })
+            .collect();
+        for (i, line) in lines.iter().enumerate() {
+            for other in &lines[i + 1..] {
+                assert_ne!(line, other);
+            }
+        }
+        assert!(lines[1].contains("backing off") && lines[2].contains("exhausted"));
+        assert!(lines[3].contains("the lease went terminal"));
+
+        let polled = append_workspace_changes(
+            status(),
+            Some(DriftWatch::Polling),
+            Some(Duration::from_secs(60)),
+            &BacklogState::Running,
+            2,
+        );
+        let polled = text(&polled);
+        assert!(polled.starts_with("Search status: ready\n"), "{polled}");
+        assert!(polled.contains("Watch:    polling") && polled.contains("within 60s"), "{polled}");
+        assert!(polled.contains("Holds:    2 batch"), "{polled}");
+        assert!(!text(&append_workspace_changes(status(), None, None, &BacklogState::Running, 0))
+            .contains("Holds:"));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::super::test_support::unreachable_workspace_service;
     use super::{
@@ -877,7 +1001,7 @@ mod tests {
 
         let result = search_status(
             crate::McpProfile::Workspace,
-            &Arc::new(Mutex::<Option<SearchEngine>>::new(None)),
+            &crate::state::shared_engine(None),
             &Arc::new(IndexProgress::default()),
             &runtime,
             WorkspaceSearchMode::SqliteLocal,
@@ -902,7 +1026,7 @@ mod tests {
         engine.initialize_workspace_overlay_clean().unwrap();
         assert!(engine.mark_workspace_path_dirty(&file).unwrap());
         assert_eq!(engine.workspace_overlay_retry_signals().unwrap().pending_dirty_paths, 1);
-        let shared = Arc::new(Mutex::new(Some(engine)));
+        let shared = crate::state::shared_engine(Some(engine));
 
         search_status(
             crate::McpProfile::Workspace,
@@ -969,7 +1093,7 @@ mod tests {
 
         let result = search_status(
             crate::McpProfile::Workspace,
-            &Arc::new(Mutex::new(Some(engine))),
+            &crate::state::shared_engine(Some(engine)),
             &Arc::new(IndexProgress::default()),
             &Arc::new(Mutex::new(SemanticRuntimeStatus::Disabled)),
             WorkspaceSearchMode::SqliteLocal,
@@ -995,7 +1119,7 @@ mod tests {
     /// construction, so for it the honest report is silence rather than a permanent fault.
     #[test]
     fn status_tells_an_unread_root_table_from_a_missing_one() {
-        let engine: Arc<Mutex<Option<SearchEngine>>> = Arc::new(Mutex::new(None));
+        let engine: crate::state::SharedSearchEngine = crate::state::shared_engine(None);
         let building = search_status(
             crate::McpProfile::Workspace,
             &engine,
@@ -1032,7 +1156,7 @@ mod tests {
         // Hold the engine past the cap so the read genuinely times out, exactly as an overlay
         // prime would. The roots are unchanged all the while — saying "none" here would be a
         // statement about the workspace, when the only true statement is about the read.
-        let held: Arc<Mutex<Option<SearchEngine>>> = Arc::new(Mutex::new(None));
+        let held: crate::state::SharedSearchEngine = crate::state::shared_engine(None);
         // A barrier, not a sleep: the branch under test is the ONLY one that tells "the index
         // is held" from "there is no index", so it must not depend on the holder winning a
         // scheduling race against a fixed window.
@@ -1105,7 +1229,7 @@ mod tests {
 
         let result = search_status(
             crate::McpProfile::Workspace,
-            &Arc::new(Mutex::new(Some(engine))),
+            &crate::state::shared_engine(Some(engine)),
             &Arc::new(IndexProgress::default()),
             &Arc::new(Mutex::new(SemanticRuntimeStatus::Disabled)),
             WorkspaceSearchMode::SqliteLocal,
@@ -1145,7 +1269,7 @@ mod tests {
 
         let result = search_status(
             crate::McpProfile::Workspace,
-            &Arc::new(Mutex::new(None)),
+            &crate::state::shared_engine(None),
             &Arc::new(IndexProgress::default()),
             &Arc::new(Mutex::new(SemanticRuntimeStatus::Disabled)),
             WorkspaceSearchMode::PostgresRemoteOverlay,
@@ -1179,7 +1303,7 @@ mod tests {
         let started = Instant::now();
         let result = search_status(
             crate::McpProfile::Workspace,
-            &Arc::new(Mutex::new(None)),
+            &crate::state::shared_engine(None),
             &Arc::new(IndexProgress::default()),
             &Arc::new(Mutex::new(SemanticRuntimeStatus::Ready)),
             WorkspaceSearchMode::PostgresRemoteOverlay,
@@ -1205,7 +1329,7 @@ mod tests {
     fn search_status_reports_warming_while_baseline_connect_is_pending() {
         let result = search_status(
             crate::McpProfile::Workspace,
-            &Arc::new(Mutex::new(None)),
+            &crate::state::shared_engine(None),
             &Arc::new(IndexProgress::default()),
             &Arc::new(Mutex::new(SemanticRuntimeStatus::Disabled)),
             WorkspaceSearchMode::PostgresRemoteOverlay,
@@ -1241,7 +1365,7 @@ mod tests {
             .unwrap();
         let result = search_status(
             crate::McpProfile::Workspace,
-            &Arc::new(Mutex::new(Some(engine))),
+            &crate::state::shared_engine(Some(engine)),
             &Arc::new(IndexProgress::default()),
             &Arc::new(Mutex::new(SemanticRuntimeStatus::Disabled)),
             WorkspaceSearchMode::SqliteLocal,
@@ -1279,7 +1403,7 @@ mod tests {
         progress.done_batches.store(5, Ordering::Relaxed);
         let result = search_status(
             crate::McpProfile::Workspace,
-            &Arc::new(Mutex::new(Some(engine))),
+            &crate::state::shared_engine(Some(engine)),
             &progress,
             &Arc::new(Mutex::new(SemanticRuntimeStatus::OverlaySyncing)),
             WorkspaceSearchMode::PostgresRemoteOverlay,
@@ -1314,7 +1438,7 @@ mod tests {
         let run = |warmup: OverlayWarmupState| {
             search_status(
                 crate::McpProfile::Workspace,
-                &Arc::new(Mutex::new(None)),
+                &crate::state::shared_engine(None),
                 &Arc::new(IndexProgress::default()),
                 &Arc::new(Mutex::new(SemanticRuntimeStatus::Ready)),
                 WorkspaceSearchMode::PostgresRemoteOverlay,
@@ -1372,7 +1496,7 @@ mod tests {
 
     #[test]
     fn search_status_emits_progress_signal_while_building() {
-        let engine: Arc<Mutex<Option<SearchEngine>>> = Arc::new(Mutex::new(None));
+        let engine: crate::state::SharedSearchEngine = crate::state::shared_engine(None);
         let progress = Arc::new(IndexProgress::default());
         let result = search_status(
             crate::McpProfile::Workspace,
@@ -1396,7 +1520,7 @@ mod tests {
     fn search_status_returns_promptly_with_busy_note_when_engine_lock_is_held() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("bsl-search.db");
-        let engine = Arc::new(Mutex::new(Some(SearchEngine::fts_only(&db_path).unwrap())));
+        let engine = crate::state::shared_engine(Some(SearchEngine::fts_only(&db_path).unwrap()));
         let gate = Arc::new(Barrier::new(2));
         let holder = {
             let engine = Arc::clone(&engine);

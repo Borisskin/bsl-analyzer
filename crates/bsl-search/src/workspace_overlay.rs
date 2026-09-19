@@ -220,26 +220,18 @@ struct ManifestBaseline<'a> {
     store: &'a Store,
 }
 
-/// The baseline a snapshot-fed dirty reindex resolves through the store before it touches the dirty
-/// set. Owning the loaded value (rather than dispatching inline) lets the fallible store reads run
-/// FIRST, so a store error propagates with every dirty flag still intact.
-enum DirtyBaseline {
-    Manifest(HashMap<FileKey, String>),
-    Raw(HashMap<FileKey, Vec<u8>>),
-}
-
 /// One key's point-path result: what the pass PROVED (or failed to prove) about the file,
 /// paired with an orthogonal store flag — a failed row retraction does not erase the file
 /// outcome, it only changes how the mark is retained. [`WorkspaceOverlayCache::settle_point`]
 /// is the single place these are applied to the carriers, so no branch can forget one.
-struct PointSettlement {
-    action: PointAction,
+pub(crate) struct PointSettlement {
+    pub(crate) action: PointAction,
     /// The key's fingerprint-row obligation did not land (retraction denied); the mark must
     /// survive WITHOUT charging the file budget, whatever the action was.
     store_fault: bool,
 }
 
-enum PointAction {
+pub(crate) enum PointAction {
     /// Read and different from the baseline: a fresh overlay entry.
     Reindexed { entry: OverlayFileEntry, has_baseline: bool },
     /// Read and equal to the baseline: the local entry (and any hiding) is lifted.
@@ -372,8 +364,8 @@ impl WorkspaceOverlayCache {
     /// fronts was just reconciled with disk, so nothing differs from the baseline and a full disk
     /// scan (a prime) would build zero entries anyway. This is the zero-scan, zero-RAM equivalent
     /// of that prime. Until the overlay is initialized the incremental reindex is inert
-    /// ([`Self::reindex_dirty_from_snapshots`] no-ops on `!initialized`), so this is what unblocks
-    /// the resident-fed path; from here the watcher marks and the reindex serve fresh edits.
+    /// ([`Self::capture_point_keys`] captures nothing), so this is what unblocks the resident-fed
+    /// path; from here the watcher marks and point refreshes serve fresh edits.
     pub fn mark_initialized_clean(&mut self) {
         self.entries.clear();
         self.hidden_paths.clear();
@@ -645,88 +637,124 @@ impl WorkspaceOverlayCache {
         self.dirty_paths.insert(key, self.dirty_seq);
     }
 
-    /// The paths currently marked dirty (awaiting reindex), for a caller that prefetches
-    /// resident snapshots off-lock before feeding them back via
-    /// [`Self::reindex_dirty_from_snapshots`].
-    pub fn dirty_paths_list(&self) -> Vec<FileKey> {
-        self.dirty_paths.keys().cloned().collect()
+    /// Up to `limit` dirty keys for a point refresh, the oldest marks first, each with the
+    /// sequence of its mark and its failure streak. Nothing before the overlay is initialized:
+    /// a key marked then is left for the first full refresh, as every other point path does.
+    pub(crate) fn capture_point_keys(
+        &self,
+        limit: usize,
+    ) -> Vec<crate::point_refresh::CapturedKey> {
+        if !self.initialized {
+            return Vec::new();
+        }
+        let mut marks: Vec<(&FileKey, u64)> =
+            self.dirty_paths.iter().map(|(key, seq)| (key, *seq)).collect();
+        marks.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(right.0)));
+        marks
+            .into_iter()
+            .take(limit)
+            .map(|(key, seq)| crate::point_refresh::CapturedKey {
+                key: key.clone(),
+                seq,
+                prior_failures: self.dirty_failures.get(key).copied().unwrap_or(0),
+            })
+            .collect()
     }
 
-    /// Reindex the currently-dirty paths, chunking a resident-provided parse where the
-    /// snapshot's text matches disk and reading+parsing from disk otherwise. Runs with no
-    /// embedder (the interactive `ReuseOnly` discipline: lexical immediately, vectors from the
-    /// background pass) and never cold-scans. A no-op until the overlay has been initialized,
-    /// so a path marked before the first full refresh is left for that refresh to pick up.
-    pub fn reindex_dirty_from_snapshots(
-        &mut self,
-        roots: &WorkspaceRoots,
-        store: &Store,
-        serves_external_baseline: bool,
-        batch_size: usize,
-        hash_mode: BaselineHashMode,
-        snapshots: &HashMap<FileKey, ModuleSnapshot>,
-    ) -> Result<(), SearchError> {
-        if !self.initialized || self.dirty_paths.is_empty() {
-            return Ok(());
-        }
-        // Process ONLY the prefetched snapshot paths that are still dirty; every other dirty path
-        // stays in the set, served by the query's own lazy disk refresh and by later prefetches.
-        // The prefetch already capped how many snapshots it fetched, so this bounds the
-        // under-lock apply to that same per-query budget (no unbounded reindex here).
-        let keys: Vec<FileKey> =
-            snapshots.keys().filter(|key| self.dirty_paths.contains_key(*key)).cloned().collect();
-        if keys.is_empty() {
-            return Ok(());
-        }
-        // Load the baseline through the fallible store reads BEFORE clearing any dirty flag. A
-        // store-wide error here (a schema/manifest read that fails) is NOT a per-path fault: it must
-        // leave every prefetched path dirty — with its consecutive-failure budget untouched — so a
-        // later prefetch retries it, rather than silently dropping stale overlay entries that no
-        // query would ever revisit. Removing the keys first (then hitting `?`) would strand them:
-        // neither reindexed nor dirty. The budget is reserved for genuine per-path stat/read
-        // failures inside the refresh body (see `retain_dirty_after_failure`); charging a transient
-        // store error to it would let a few store hiccups exhaust MAX_DIRTY_REFRESH_FAILURES and
-        // drop many healthy paths at once. So the keys leave the dirty set only once the baseline is
-        // in hand and each path's per-path refresh owns its outcome.
-        // The manifest leg is MODE-gated, not presence-gated: the persisted manifest is a
-        // warm-cache that survives a mode switch, and a local engine dispatching on its
-        // presence would read its edits against another mode's baseline.
-        let manifest_fingerprints = if serves_external_baseline {
-            store.load_baseline_manifest_fingerprints("code")?
+    /// Marks a point refresh may answer: all of them once initialized, none before.
+    pub(crate) fn point_backlog(&self) -> usize {
+        if self.initialized {
+            self.dirty_paths.len()
         } else {
-            None
-        };
-        let baseline = match manifest_fingerprints {
-            Some(manifest_fingerprints) => DirtyBaseline::Manifest(manifest_fingerprints),
-            None => {
-                DirtyBaseline::Raw(store.all_files_in_collection("code")?.into_iter().collect())
+            0
+        }
+    }
+
+    /// The fence a point batch captures (the mark sequence) and the wholesale invalidation it
+    /// must not outlive.
+    pub(crate) fn point_fences(&self) -> (u64, u64) {
+        (self.dirty_seq, self.wholesale_seq)
+    }
+
+    pub(crate) fn graph_context_provider_handle(&self) -> Option<Arc<dyn GraphContextProvider>> {
+        self.graph_context_provider.clone()
+    }
+
+    /// Whether a batch prepared against this cache may still publish at all: nothing replaced
+    /// the whole state it was prepared against.
+    pub(crate) fn point_batch_stands(
+        &self,
+        batch: &crate::point_refresh::PreparedPointBatch,
+    ) -> bool {
+        self.initialized && self.wholesale_seq == batch.wholesale_seq
+    }
+
+    /// Per prepared key, whether it may settle: its mark is still the one captured, and no
+    /// other point settlement answered it since.
+    pub(crate) fn applicable_point_keys(
+        &self,
+        batch: &crate::point_refresh::PreparedPointBatch,
+    ) -> Vec<bool> {
+        batch
+            .keys
+            .iter()
+            .map(|prepared| {
+                let key = &prepared.captured.key;
+                self.dirty_paths.get(key) == Some(&prepared.captured.seq)
+                    && self.settled_seq.get(key).is_none_or(|settled| *settled <= batch.fence)
+            })
+            .collect()
+    }
+
+    /// Settle the applicable keys of `batch`, taking its prepared entries over. A key left out
+    /// keeps its mark for the next batch. Returns how many settled, and how many of those lost
+    /// their marks for good rather than being marked again by a fault.
+    pub(crate) fn settle_point_batch(
+        &mut self,
+        batch: &mut crate::point_refresh::PreparedPointBatch,
+        applicable: &[bool],
+    ) -> (usize, usize) {
+        let mut settled = 0;
+        let mut cleared = 0;
+        for (prepared, applies) in std::mem::take(&mut batch.keys).into_iter().zip(applicable) {
+            if !applies {
+                continue;
             }
-        };
-
-        for key in &keys {
-            self.dirty_paths.remove(key);
+            let key = prepared.captured.key;
+            self.dirty_paths.remove(&key);
+            self.dirty_failures.remove(&key);
+            let action = match prepared.action {
+                PointAction::Reindexed { mut entry, has_baseline } => {
+                    // Vectors the live cache already holds for these exact inputs; the rest
+                    // wait for the embedding pass, as every interactive point path leaves them.
+                    entry.vector_documents = build_overlay_vectors(
+                        None,
+                        1,
+                        &entry.lexical_documents,
+                        &entry.embedding_inputs,
+                        &mut self.embedding_cache,
+                    )
+                    .unwrap_or_default();
+                    PointAction::Reindexed { entry, has_baseline }
+                }
+                other => other,
+            };
+            if prepared.resident_fed {
+                self.resident_fed_count += 1;
+            }
+            let settlement = PointSettlement { action, store_fault: false };
+            self.settle_point(key.clone(), settlement, prepared.captured.prior_failures);
+            settled += 1;
+            if !self.dirty_paths.contains_key(&key) {
+                cleared += 1;
+            }
         }
+        (settled, cleared)
+    }
 
-        match baseline {
-            DirtyBaseline::Manifest(manifest_fingerprints) => self
-                .refresh_dirty_paths_from_manifest(
-                    keys,
-                    ManifestBaseline { fingerprints: &manifest_fingerprints, store },
-                    roots,
-                    None,
-                    batch_size,
-                    snapshots,
-                )?,
-            DirtyBaseline::Raw(baseline_files) => self.refresh_dirty_paths(
-                keys,
-                RawBaseline { files: &baseline_files, hash_mode },
-                roots,
-                None,
-                batch_size,
-                snapshots,
-            )?,
-        }
-        Ok(())
+    /// The paths currently marked dirty, awaiting a point refresh.
+    pub fn dirty_paths_list(&self) -> Vec<FileKey> {
+        self.dirty_paths.keys().cloned().collect()
     }
 
     /// `allow_cold_scan` gates the only expensive operation here: a cold full-tree scan + read +
@@ -1264,111 +1292,24 @@ impl WorkspaceOverlayCache {
             // Removing the count here clears it on success (the common path) and hands the
             // prior value to the settlement, keeping the failure streak consecutive.
             let prior_failures = self.dirty_failures.remove(&key).unwrap_or(0);
-            let baseline_hash = baseline_files.get(&key);
-            let has_baseline = baseline_hash.is_some();
-            // A key whose root is no longer registered resolves to nothing; that is a change of
-            // composition, not a filesystem error, and it settles like a deletion.
-            let Some(abs_path) = roots.resolve(&key) else {
-                let settlement = PointSettlement {
-                    action: PointAction::ProvenGone { has_baseline },
-                    store_fault: false,
-                };
-                self.settle_point(key, settlement, prior_failures);
-                continue;
-            };
-
-            let metadata = match std::fs::metadata(&abs_path) {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    let action = if point_target_is_absent(&error, &abs_path)
-                        && root_is_reachable(roots, &key)
-                    {
-                        PointAction::ProvenGone { has_baseline }
-                    } else {
-                        PointAction::FileFault { reason: "stat failed" }
-                    };
-                    self.settle_point(
-                        key,
-                        PointSettlement { action, store_fault: false },
-                        prior_failures,
-                    );
-                    continue;
-                }
-            };
-            let fingerprint = FileFingerprint {
-                len: metadata.len(),
-                modified: metadata.modified().ok(),
-                canonical: crate::workspace_roots::canonical_spelling(&abs_path),
-            };
-            // A live target that is not a source file is positive evidence the SOURCE file is
-            // gone: the walk never yields a file whose two spellings disagree on role, so a
-            // clean full scan would remove this entry — the point path settles it the same way.
-            // The same goes for a non-regular target spelled `.bsl` (a directory, a FIFO): the
-            // walk yields regular files only, and reading a FIFO would even block.
-            if !metadata.is_file()
-                || project_model::file_role(&fingerprint.canonical)
-                    != project_model::FileRole::Source
-            {
-                let settlement = PointSettlement {
-                    action: PointAction::ProvenGone { has_baseline },
-                    store_fault: false,
-                };
-                self.settle_point(key, settlement, prior_failures);
-                continue;
-            }
-
-            // No equal-fingerprint fast path here: every key in this loop carries a dirty
-            // mark, and the mark is positive evidence the fingerprint must not be trusted —
-            // an edit at unchanged (len, mtime, canonical) would otherwise be consumed
-            // silently. The price is one read per honest no-op watcher ping.
-            let content = match std::fs::read_to_string(&abs_path) {
-                Ok(content) => content,
-                Err(_) => {
-                    let settlement = PointSettlement {
-                        action: PointAction::FileFault { reason: "read failed" },
-                        store_fault: false,
-                    };
-                    self.settle_point(key, settlement, prior_failures);
-                    continue;
-                }
-            };
-            let file_hash = compute_file_hash(&content, hash_mode);
-            if baseline_hash.is_some_and(|stored_hash| stored_hash == &file_hash) {
-                self.settle_point(
-                    key,
-                    PointSettlement { action: PointAction::BaselineEqual, store_fault: false },
-                    prior_failures,
-                );
-                continue;
-            }
-
+            let baseline =
+                PointBaseline::Raw { hash: baseline_files.get(&key).cloned(), mode: hash_mode };
             let provider = self.graph_context_provider.clone();
-            let parse_root = resident_parse_root(snapshots, &key, &content);
-            if parse_root.is_some() {
-                self.resident_fed_count += 1;
-            }
-            let action = match build_overlay_entry(
+            let read = classify_point(
                 &key,
-                &content,
-                fingerprint,
-                file_hash,
+                &baseline,
+                roots,
+                snapshots,
+                provider.as_deref(),
                 embedder,
                 batch_size,
                 &mut self.embedding_cache,
-                provider.as_deref(),
-                parse_root,
-            ) {
-                Ok(entry) => PointAction::Reindexed { entry, has_baseline },
-                Err(error) => {
-                    tracing::warn!(
-                        root = %key.root_id,
-                        path = %key.path,
-                        "failed to build an overlay entry; keeping the mark for a retry: {error}"
-                    );
-                    PointAction::BuildFault
-                }
-            };
-            self.settle_point(key, PointSettlement { action, store_fault: false }, prior_failures);
+            );
+            if read.resident_fed {
+                self.resident_fed_count += 1;
+            }
+            let settlement = PointSettlement { action: read.action, store_fault: false };
+            self.settle_point(key, settlement, prior_failures);
         }
         Ok(())
     }
@@ -2080,125 +2021,41 @@ impl WorkspaceOverlayCache {
         // Each drained key CLASSIFIES into a [`PointSettlement`] and settles at once through
         // [`Self::settle_point`]. The key's fingerprint-row obligation (the row claims
         // "verified"; the mark dies with the process, the row would survive the restart) is
-        // executed BEFORE the settlement, and its failure becomes the settlement's store
-        // flag — the mark then survives without the file budget being charged, whatever the
-        // file outcome was. No per-key fault aborts the loop: the caller has already drained
-        // the dirty set, and an abort would strand every unprocessed mark.
+        // executed with the settlement, and its failure becomes the settlement's store flag —
+        // the mark then survives without the file budget being charged, whatever the file
+        // outcome was. No per-key fault aborts the loop: the caller has already drained the
+        // dirty set, and an abort would strand every unprocessed mark.
         for key in dirty_keys {
             // Removing the count here clears it on success (the common path) and hands the
             // prior value to the settlement, keeping the failure streak consecutive.
             let prior_failures = self.dirty_failures.remove(&key).unwrap_or(0);
-            let baseline_fingerprint = manifest_fingerprints.get(&key);
-            let has_baseline = baseline_fingerprint.is_some();
-            // A key whose root is no longer registered resolves to nothing; that is a change of
-            // composition, not a filesystem error, and it settles like a deletion.
-            let Some(abs_path) = roots.resolve(&key) else {
-                let store_fault = !Self::retract_fingerprint_row(store, &key);
-                let settlement = PointSettlement {
-                    action: PointAction::ProvenGone { has_baseline },
-                    store_fault,
-                };
-                self.settle_point(key, settlement, prior_failures);
-                continue;
-            };
-
-            let metadata = match std::fs::metadata(&abs_path) {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    // Whichever way this settles, the row's "verified" claim did not survive
-                    // the failed stat.
-                    let store_fault = !Self::retract_fingerprint_row(store, &key);
-                    let action = if point_target_is_absent(&error, &abs_path)
-                        && root_is_reachable(roots, &key)
-                    {
-                        PointAction::ProvenGone { has_baseline }
-                    } else {
-                        PointAction::FileFault { reason: "stat failed" }
-                    };
-                    self.settle_point(key, PointSettlement { action, store_fault }, prior_failures);
-                    continue;
-                }
-            };
-            let fingerprint = FileFingerprint {
-                len: metadata.len(),
-                modified: metadata.modified().ok(),
-                canonical: crate::workspace_roots::canonical_spelling(&abs_path),
-            };
-            // A live target that is not a source file is positive evidence the SOURCE file is
-            // gone (see the raw twin above) — as is a non-regular target spelled `.bsl`; the
-            // row's "verified" claim goes with the entry.
-            if !metadata.is_file()
-                || project_model::file_role(&fingerprint.canonical)
-                    != project_model::FileRole::Source
-            {
-                let store_fault = !Self::retract_fingerprint_row(store, &key);
-                let settlement = PointSettlement {
-                    action: PointAction::ProvenGone { has_baseline },
-                    store_fault,
-                };
-                self.settle_point(key, settlement, prior_failures);
-                continue;
-            }
-
-            // No equal-fingerprint fast path here: every key in this loop carries a dirty
-            // mark, and the mark is positive evidence the fingerprint must not be trusted —
-            // an edit at unchanged (len, mtime, canonical) would otherwise be consumed
-            // silently. The read path below also settles the persisted row either way.
-            let content = match std::fs::read_to_string(&abs_path) {
-                Ok(content) => content,
-                Err(_) => {
-                    let store_fault = !Self::retract_fingerprint_row(store, &key);
-                    let settlement = PointSettlement {
-                        action: PointAction::FileFault { reason: "read failed" },
-                        store_fault,
-                    };
-                    self.settle_point(key, settlement, prior_failures);
-                    continue;
-                }
-            };
-            // The successful read produced FRESHER knowledge than the persisted row, so its
-            // "verified" claim no longer stands whatever the branches below decide: at an
-            // unchanged (len, mtime, canonical) the old row would suppress this very result
-            // after a restart. A failed retraction keeps the mark for a retried one.
-            let store_fault = !Self::retract_fingerprint_row(store, &key);
-            let file_hash = normalized_file_hash_for_content(&content);
-            let local_fp = fingerprint_content(&content, &key.path);
-            if baseline_fingerprint.is_some_and(|stored| stored == &local_fp) {
-                self.settle_point(
-                    key,
-                    PointSettlement { action: PointAction::BaselineEqual, store_fault },
-                    prior_failures,
-                );
-                continue;
-            }
-
+            let baseline =
+                PointBaseline::Manifest { fingerprint: manifest_fingerprints.get(&key).cloned() };
             let provider = self.graph_context_provider.clone();
-            let parse_root = resident_parse_root(snapshots, &key, &content);
-            if parse_root.is_some() {
-                self.resident_fed_count += 1;
-            }
-            let action = match build_overlay_entry(
+            let read = classify_point(
                 &key,
-                &content,
-                fingerprint,
-                file_hash,
+                &baseline,
+                roots,
+                snapshots,
+                provider.as_deref(),
                 embedder,
                 batch_size,
                 &mut self.embedding_cache,
-                provider.as_deref(),
-                parse_root,
-            ) {
-                Ok(entry) => PointAction::Reindexed { entry, has_baseline },
-                Err(error) => {
-                    tracing::warn!(
-                        root = %key.root_id,
-                        path = %key.path,
-                        "failed to build an overlay entry; keeping the mark for a retry: {error}"
-                    );
-                    PointAction::BuildFault
-                }
-            };
-            self.settle_point(key, PointSettlement { action, store_fault }, prior_failures);
+            );
+            if read.resident_fed {
+                self.resident_fed_count += 1;
+            }
+            // Whatever the classification decided, the row's "verified" claim did not
+            // survive: a failed stat or read proved nothing, a proven absence ended the
+            // file, and a successful read is FRESHER knowledge than the row — at an unchanged
+            // (len, mtime, canonical) the old row would suppress this very result after a
+            // restart. A failed retraction keeps the mark for a retried one.
+            let store_fault = !Self::retract_fingerprint_row(store, &key);
+            self.settle_point(
+                key,
+                PointSettlement { action: read.action, store_fault },
+                prior_failures,
+            );
         }
 
         Ok(())
@@ -2318,7 +2175,7 @@ fn mtime_to_secs_nanos(mtime: Option<SystemTime>) -> Option<(i64, u32)> {
 }
 
 #[derive(Debug, Clone)]
-struct OverlayFileEntry {
+pub(crate) struct OverlayFileEntry {
     fingerprint: FileFingerprint,
     file_hash: Vec<u8>,
     lexical_documents: Vec<IndexedDocument>,
@@ -2444,6 +2301,130 @@ fn scanned_files_from(roots: &WorkspaceRoots, set: &project_model::SourceSet) ->
         dangling: set.dangling,
         canonical_fallbacks: set.canonical_fallbacks,
     }
+}
+
+/// A dirty key's baseline, as a point classification reads it: the stored raw hash with the
+/// recipe that recomputes it, or the manifest's fingerprint.
+pub(crate) enum PointBaseline {
+    Raw { hash: Option<Vec<u8>>, mode: BaselineHashMode },
+    Manifest { fingerprint: Option<String> },
+}
+
+impl PointBaseline {
+    fn is_present(&self) -> bool {
+        match self {
+            Self::Raw { hash, .. } => hash.is_some(),
+            Self::Manifest { fingerprint } => fingerprint.is_some(),
+        }
+    }
+}
+
+/// What classifying one dirty key read and decided.
+pub(crate) struct PointRead {
+    pub(crate) action: PointAction,
+    /// The entry was chunked from the resident's shared parse instead of a parse of its own.
+    pub(crate) resident_fed: bool,
+    /// Bytes read from disk for the decision.
+    pub(crate) bytes: u64,
+}
+
+/// Classify one dirty key against its baseline: the ONE decision every point path makes,
+/// under a lock or off every lock alike. Reads the file and builds its entry; touches no
+/// carrier and no store — the caller settles the result and owns the row obligations.
+///
+/// No equal-fingerprint fast path: every key classified here carries a dirty mark, and the
+/// mark is positive evidence the fingerprint must not be trusted — an edit at unchanged
+/// (len, mtime, canonical) would otherwise be consumed silently. The price is one read per
+/// honest no-op watcher ping.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn classify_point(
+    key: &FileKey,
+    baseline: &PointBaseline,
+    roots: &WorkspaceRoots,
+    snapshots: &HashMap<FileKey, ModuleSnapshot>,
+    provider: Option<&dyn GraphContextProvider>,
+    embedder: Option<&Embedder>,
+    batch_size: usize,
+    embedding_cache: &mut HashMap<String, Vec<f32>>,
+) -> PointRead {
+    crate::point_refresh::forbidden_under_a_bounded_publication("reading and parsing a file");
+    let has_baseline = baseline.is_present();
+    let settled = |action| PointRead { action, resident_fed: false, bytes: 0 };
+    // A key whose root is no longer registered resolves to nothing; that is a change of
+    // composition, not a filesystem error, and it settles like a deletion.
+    let Some(abs_path) = roots.resolve(key) else {
+        return settled(PointAction::ProvenGone { has_baseline });
+    };
+    let metadata = match std::fs::metadata(&abs_path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return settled(
+                if point_target_is_absent(&error, &abs_path) && root_is_reachable(roots, key) {
+                    PointAction::ProvenGone { has_baseline }
+                } else {
+                    PointAction::FileFault { reason: "stat failed" }
+                },
+            );
+        }
+    };
+    let fingerprint = FileFingerprint {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        canonical: crate::workspace_roots::canonical_spelling(&abs_path),
+    };
+    // A live target that is not a source file is positive evidence the SOURCE file is gone:
+    // the walk never yields a file whose two spellings disagree on role, so a clean full scan
+    // would remove this entry — the point path settles it the same way. The same goes for a
+    // non-regular target spelled `.bsl` (a directory, a FIFO): the walk yields regular files
+    // only, and reading a FIFO would even block.
+    if !metadata.is_file()
+        || project_model::file_role(&fingerprint.canonical) != project_model::FileRole::Source
+    {
+        return settled(PointAction::ProvenGone { has_baseline });
+    }
+    let Ok(content) = std::fs::read_to_string(&abs_path) else {
+        return settled(PointAction::FileFault { reason: "read failed" });
+    };
+    let bytes = content.len() as u64;
+    let (file_hash, equal) = match baseline {
+        PointBaseline::Raw { hash, mode } => {
+            let file_hash = compute_file_hash(&content, *mode);
+            let equal = hash.as_ref().is_some_and(|stored| stored == &file_hash);
+            (file_hash, equal)
+        }
+        PointBaseline::Manifest { fingerprint } => {
+            let local = fingerprint_content(&content, &key.path);
+            let equal = fingerprint.as_ref().is_some_and(|stored| stored == &local);
+            (normalized_file_hash_for_content(&content), equal)
+        }
+    };
+    if equal {
+        return PointRead { action: PointAction::BaselineEqual, resident_fed: false, bytes };
+    }
+    let parse_root = resident_parse_root(snapshots, key, &content);
+    let resident_fed = parse_root.is_some();
+    let action = match build_overlay_entry(
+        key,
+        &content,
+        fingerprint,
+        file_hash,
+        embedder,
+        batch_size,
+        embedding_cache,
+        provider,
+        parse_root,
+    ) {
+        Ok(entry) => PointAction::Reindexed { entry, has_baseline },
+        Err(error) => {
+            tracing::warn!(
+                root = %key.root_id,
+                path = %key.path,
+                "failed to build an overlay entry; keeping the mark for a retry: {error}"
+            );
+            PointAction::BuildFault
+        }
+    };
+    PointRead { action, resident_fed, bytes }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2961,90 +2942,6 @@ mod tests {
                 "a fresh mark reset the consecutive-failure count"
             );
         }
-    }
-
-    /// A store-wide error while resolving the baseline for a snapshot-fed reindex must leave every
-    /// prefetched-but-unprocessed path dirty, with its per-path failure budget untouched — so a
-    /// later prefetch retries it instead of stranding stale overlay entries no query would revisit.
-    /// The pre-fix code cleared the dirty flags BEFORE the fallible store read, so on error the
-    /// paths were neither reindexed nor dirty; restoring that ordering makes the retained-count
-    /// assertion fail. Because the store error is not a per-path fault, it must NOT be charged to
-    /// `MAX_DIRTY_REFRESH_FAILURES` (else a few store hiccups would drop many healthy paths at once).
-    #[test]
-    fn store_error_during_reindex_keeps_paths_dirty_without_charging_failure_budget() {
-        let dir = tempdir().unwrap();
-        let workspace = dir.path();
-        let store = Store::open(&workspace.join("search.db")).unwrap();
-
-        let mut cache = WorkspaceOverlayCache::default();
-        cache.enable_watcher_mode();
-        let manifest: HashMap<FileKey, String> = HashMap::new();
-        cache
-            .refresh_with_manifest(&manifest, &single_root(workspace), None, 32, &store, true)
-            .unwrap();
-
-        // Invalid UTF-8 in a regular `.bsl`: `metadata` succeeds, `read_to_string` always fails, so
-        // one healthy reindex records a genuine per-path failure (budget = 1). That seeded count is
-        // what the store-error reindex below must leave untouched.
-        fs::write(workspace.join("Broken.bsl"), [0xff, 0xfe]).unwrap();
-        cache.mark_dirty_path(key("Broken.bsl"));
-
-        let content = "Процедура П()\nКонецПроцедуры\n";
-        let root = parser::parse(content).syntax_node();
-        let mut snapshots = HashMap::new();
-        snapshots.insert(
-            key("Broken.bsl"),
-            crate::ports::ModuleSnapshot { text: std::sync::Arc::from(content), root },
-        );
-
-        cache
-            .reindex_dirty_from_snapshots(
-                &single_root(workspace),
-                &store,
-                true,
-                32,
-                BaselineHashMode::NormalizedChunks,
-                &snapshots,
-            )
-            .unwrap();
-        assert_eq!(cache.stats().pending_dirty_paths, 1, "the read-failed path stays dirty");
-        assert_eq!(
-            cache.dirty_failure_count(&key("Broken.bsl")),
-            1,
-            "one genuine per-path failure"
-        );
-
-        // Drop the manifest tables through a second connection so the next reindex fails at the
-        // baseline read (`load_baseline_manifest_fingerprints`) before it processes any path.
-        {
-            let raw = rusqlite::Connection::open(store.db_path()).unwrap();
-            raw.execute_batch(
-                "PRAGMA foreign_keys = OFF;
-                 DROP TABLE IF EXISTS baseline_manifest_files;
-                 DROP TABLE IF EXISTS baseline_manifest;",
-            )
-            .unwrap();
-        }
-
-        let result = cache.reindex_dirty_from_snapshots(
-            &single_root(workspace),
-            &store,
-            true,
-            32,
-            BaselineHashMode::NormalizedChunks,
-            &snapshots,
-        );
-        assert!(result.is_err(), "the dropped baseline table must surface as a store error");
-        assert_eq!(
-            cache.stats().pending_dirty_paths,
-            1,
-            "a store-wide error must not strand the prefetched path (still dirty)"
-        );
-        assert_eq!(
-            cache.dirty_failure_count(&key("Broken.bsl")),
-            1,
-            "a store-wide error must not consume the per-path retry budget"
-        );
     }
 
     #[test]

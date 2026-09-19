@@ -1,11 +1,11 @@
 use super::lexical::lexical_code_hits;
-use super::render::{format_code_hits, hits_response, no_hits_response, Envelope};
+use super::render::{format_code_hits, hits_response, no_hits_response, Envelope, WorkspaceFacts};
 use super::semantic::semantic_code_hits;
 use super::status::search_not_ready;
 use super::types::{CodeHits, SearchFailure, HYBRID_FETCH_MULTIPLIER};
 use crate::baseline::{ConfiguredBaselineStatus, ExternalBaselineService};
 use crate::state::{SemanticRuntimeStatus, WorkspaceSearchMode};
-use bsl_search::{fuse_smart, FusedHit, IndexProgress, SearchEngine};
+use bsl_search::{fuse_smart, FusedHit, IndexProgress};
 use rmcp::model::CallToolResult;
 use rmcp::ErrorData as McpError;
 use std::fmt::Write;
@@ -22,9 +22,10 @@ const MODALITY_LEGEND: &str = "Modality tag per hit: [L] lexical-only · [S] sem
 /// note grows with its own length, so it is charged here, where that length is known.) Sizing
 /// the hits against the full budget and only then wrapping them in all this is how a response
 /// ends up over its ceiling while reporting `budget_exhausted: false`.
-fn hits_budget(max_output_tokens: usize, note: Option<&str>) -> usize {
-    let reserved =
-        MODALITY_LEGEND.len() + note.map_or(0, |note| note.len() * 3 + "-- {} --\n".len());
+fn hits_budget(max_output_tokens: usize, note: Option<&str>, facts: &WorkspaceFacts) -> usize {
+    let reserved = MODALITY_LEGEND.len()
+        + note.map_or(0, |note| note.len() * 3 + "-- {} --\n".len())
+        + facts.envelope_bytes();
     max_output_tokens.saturating_sub(reserved.div_ceil(4))
 }
 
@@ -37,7 +38,7 @@ fn hits_budget(max_output_tokens: usize, note: Option<&str>) -> usize {
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)] // unmanaged, uncancellable compatibility wrapper for tests
 pub fn hybrid_code(
-    engine: &Arc<Mutex<Option<SearchEngine>>>,
+    engine: &crate::state::SharedSearchEngine,
     semantic_runtime: &Arc<Mutex<SemanticRuntimeStatus>>,
     workspace_search_mode: WorkspaceSearchMode,
     configured_baseline: Option<&ConfiguredBaselineStatus>,
@@ -58,6 +59,7 @@ pub fn hybrid_code(
         query,
         limit,
         max_output_tokens,
+        WorkspaceFacts::default(),
     )
     .map_err(|failure| match failure {
         SearchFailure::Error(error) => error,
@@ -67,7 +69,7 @@ pub fn hybrid_code(
 
 #[allow(clippy::too_many_arguments)]
 pub fn hybrid_code_cancellable(
-    engine: &Arc<Mutex<Option<SearchEngine>>>,
+    engine: &crate::state::SharedSearchEngine,
     cancel: &CancellationToken,
     semantic_runtime: &Arc<Mutex<SemanticRuntimeStatus>>,
     workspace_search_mode: WorkspaceSearchMode,
@@ -77,6 +79,7 @@ pub fn hybrid_code_cancellable(
     query: &str,
     limit: usize,
     max_output_tokens: usize,
+    watch: WorkspaceFacts,
 ) -> Result<CallToolResult, SearchFailure> {
     // Over-fetch each modality so a hit ranked just outside `limit` in one but boosted by the
     // other can still surface after fusion.
@@ -91,8 +94,8 @@ pub fn hybrid_code_cancellable(
         query,
         fetch,
     )?;
-    let (lex_hits, roots) = match lexical {
-        CodeHits::Ready { hits, roots } => (hits, roots),
+    let (lex_hits, roots, overlay) = match lexical {
+        CodeHits::Ready { hits, roots, overlay } => (hits, roots, overlay),
         // Lexical is the floor: if it cannot serve yet, the whole search cannot — return a
         // structured not-ready envelope (machine status + live counters + retry hint),
         // matching the graph tool, rather than a bare sentence a poller must parse.
@@ -140,15 +143,19 @@ pub fn hybrid_code_cancellable(
         }
     };
     hits.truncate(limit);
+    let (pending, unread) = overlay.unwrap_or_default();
+    // Unknown is not zero: an answer served past the overlay cannot vouch for what it owes.
+    let overlay_unknown = overlay.is_none() && watch.drift_watch.is_some();
+    let facts = WorkspaceFacts { pending, unread, overlay_unknown, ..watch };
 
     if hits.is_empty() {
         // The text stays the bare sentence it has always been; the degradation reaches a
         // machine consumer through the envelope, where an empty list plus `degraded` reads as
         // "half the search was down" rather than "there is nothing".
-        return Ok(no_hits_response(note.as_deref(), Envelope::Yes, "search_code"));
+        return Ok(no_hits_response(note.as_deref(), Envelope::Yes, "search_code", Some(&facts)));
     }
 
-    Ok(assemble_code_response(&hits, roots.as_ref(), note.as_deref(), max_output_tokens))
+    Ok(assemble_code_response(&hits, roots.as_ref(), note.as_deref(), max_output_tokens, &facts))
 }
 
 /// The served response: the legend, the hits sized against what the wrapping will spend, the
@@ -164,18 +171,19 @@ fn assemble_code_response(
     roots: Option<&bsl_search::WorkspaceRoots>,
     note: Option<&str>,
     max_output_tokens: usize,
+    facts: &WorkspaceFacts,
 ) -> CallToolResult {
     // Explain the per-hit modality tag once, up front — a leading line does not shift the
     // per-hit `graph_id:` parsing (which is relative to each `#N` line).
     let mut out = String::from(MODALITY_LEGEND);
-    let rendered = format_code_hits(hits, roots, hits_budget(max_output_tokens, note));
+    let rendered = format_code_hits(hits, roots, hits_budget(max_output_tokens, note, facts));
     out.push_str(&rendered.text);
     if let Some(note) = note {
         // Append AFTER the hit lines — never before — so a client parsing `graph_id:` lines
         // positionally is not shifted.
         let _ = writeln!(out, "-- {note} --");
     }
-    hits_response(out, rendered, note, Envelope::Yes, "search_code")
+    hits_response(out, rendered, note, Envelope::Yes, "search_code", Some(facts))
 }
 
 #[cfg(test)]
@@ -186,7 +194,7 @@ pub(super) mod tests {
     use super::{assemble_code_response, hybrid_code};
     use crate::baseline::ConfiguredBaselineStatus;
     use crate::state::{SemanticRuntimeStatus, WorkspaceSearchMode};
-    use bsl_search::{FileKey, FusedHit, IndexProgress, Modality, ModuleSnapshot, SearchEngine};
+    use bsl_search::{FileKey, FusedHit, IndexProgress, Modality, SearchEngine};
     use project_model::{ResolvedWorkspaceBaselineSupport, SearchBaselineSupportState};
     use rmcp::model::ErrorCode;
     use std::fs;
@@ -212,17 +220,14 @@ pub(super) mod tests {
         let key = FileKey::configuration("CommonModule.bsl");
         fs::write(&file, "Процедура Предыдущая()\nКонецПроцедуры").unwrap();
         assert!(engine.mark_workspace_path_dirty(&file).unwrap());
-        let text = fs::read_to_string(&file).unwrap();
-        engine
-            .reindex_dirty_from_snapshots(&std::collections::HashMap::from([(
-                key.clone(),
-                ModuleSnapshot { root: parser::parse(&text).syntax_node(), text: text.into() },
-            )]))
-            .unwrap();
+        let capture = engine.capture_point_refresh(bsl_search::POINT_BATCH_KEYS).unwrap().unwrap();
+        let reader = bsl_search::Store::open_reader(capture.db_path()).unwrap();
+        let mut batch = capture.prepare(&reader, &|| false).unwrap();
+        engine.publish_point_refresh(&mut batch).unwrap();
         let before_hash = engine.store().file_hash(&key.root_id, &key.path).unwrap();
 
         let lease = crate::workspace_lease::WorkspaceLease::claim(workspace);
-        let shared = Arc::new(Mutex::new(Some(engine)));
+        let shared = crate::state::shared_engine(Some(engine));
         let failed = Arc::new(Mutex::new(SemanticRuntimeStatus::Failed("test".to_owned())));
 
         fs::write(&file, "Процедура Новая()\nКонецПроцедуры").unwrap();
@@ -297,7 +302,7 @@ pub(super) mod tests {
         engine.set_workspace_root(workspace);
 
         let result = hybrid_code(
-            &Arc::new(Mutex::new(Some(engine))),
+            &crate::state::shared_engine(Some(engine)),
             &Arc::new(Mutex::new(SemanticRuntimeStatus::Indexing)),
             WorkspaceSearchMode::SqliteLocal,
             None,
@@ -326,7 +331,7 @@ pub(super) mod tests {
         engine.set_workspace_root(workspace);
 
         let result = hybrid_code(
-            &Arc::new(Mutex::new(Some(engine))),
+            &crate::state::shared_engine(Some(engine)),
             &Arc::new(Mutex::new(SemanticRuntimeStatus::Failed("overlay sync failed".to_owned()))),
             WorkspaceSearchMode::SqliteLocal,
             None,
@@ -353,7 +358,7 @@ pub(super) mod tests {
         let mut engine = SearchEngine::fts_only(&db_path).unwrap();
         engine.index_directory_fts(workspace).unwrap();
         engine.set_workspace_root(workspace);
-        let engine = Arc::new(Mutex::new(Some(engine)));
+        let engine = crate::state::shared_engine(Some(engine));
         let failed = Arc::new(Mutex::new(SemanticRuntimeStatus::Failed("boom".to_owned())));
 
         let hit_result = hybrid_code(
@@ -419,7 +424,13 @@ pub(super) mod tests {
         for note_length in [44usize, 230, 800] {
             let note = "с".repeat(note_length);
             for budget in (50usize..=2000).step_by(25) {
-                let result = assemble_code_response(&hits, None, Some(&note), budget);
+                let result = assemble_code_response(
+                    &hits,
+                    None,
+                    Some(&note),
+                    budget,
+                    &super::WorkspaceFacts::default(),
+                );
                 let text = result.content[0].as_text().expect("text").text.as_str();
                 let body = result.structured_content.as_ref().expect("structured");
                 let size = text.len() + serde_json::to_string(body).unwrap().len();
@@ -455,7 +466,7 @@ pub(super) mod tests {
         let mut engine = SearchEngine::fts_only(&db_path).unwrap();
         engine.index_directory_fts(workspace).unwrap();
         engine.set_workspace_root(workspace);
-        let engine = Arc::new(Mutex::new(Some(engine)));
+        let engine = crate::state::shared_engine(Some(engine));
 
         // A sweep across the boundary where the hits alone fit but the assembled response does
         // not — the case that overshoots when only the hit blocks are sized. It has to reach
@@ -513,7 +524,7 @@ pub(super) mod tests {
         engine.set_workspace_root(workspace);
 
         let result = hybrid_code(
-            &Arc::new(Mutex::new(Some(engine))),
+            &crate::state::shared_engine(Some(engine)),
             &Arc::new(Mutex::new(SemanticRuntimeStatus::Failed("boom".to_owned()))),
             WorkspaceSearchMode::SqliteLocal,
             None,
@@ -529,7 +540,7 @@ pub(super) mod tests {
         assert!(text.starts_with("Modality tag per hit:"), "text listing unchanged: {text}");
 
         let body = result.structured_content.as_ref().expect("structured listing");
-        assert_eq!(body["schema_version"], "4");
+        assert_eq!(body["schema_version"], "5");
         assert_eq!(body["action"], "search_code");
         let hits = body["hits"].as_array().expect("hits array");
         assert_eq!(hits.len(), body["shown"].as_u64().unwrap() as usize);
@@ -549,7 +560,7 @@ pub(super) mod tests {
 
     #[test]
     fn hybrid_code_not_ready_returns_structured_envelope() {
-        let engine: Arc<Mutex<Option<SearchEngine>>> = Arc::new(Mutex::new(None));
+        let engine: crate::state::SharedSearchEngine = crate::state::shared_engine(None);
         let runtime = Arc::new(Mutex::new(SemanticRuntimeStatus::Ready));
         let progress = Arc::new(IndexProgress::default());
         progress.active.store(true, Ordering::Relaxed);
@@ -587,7 +598,7 @@ pub(super) mod tests {
 
     #[test]
     fn hybrid_code_not_ready_omits_counters_when_inactive() {
-        let engine: Arc<Mutex<Option<SearchEngine>>> = Arc::new(Mutex::new(None));
+        let engine: crate::state::SharedSearchEngine = crate::state::shared_engine(None);
         let runtime = Arc::new(Mutex::new(SemanticRuntimeStatus::Ready));
         let progress = Arc::new(IndexProgress::default());
         progress.total_chunks.store(100, Ordering::Relaxed);
@@ -617,7 +628,7 @@ pub(super) mod tests {
     fn code_search_returns_structured_error_when_workspace_branch_is_expired() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("workspace-search.db");
-        let engine = Arc::new(Mutex::new(Some(SearchEngine::fts_only(&db_path).unwrap())));
+        let engine = crate::state::shared_engine(Some(SearchEngine::fts_only(&db_path).unwrap()));
         let configured = ConfiguredBaselineStatus {
             backend: "postgres",
             selection: "workspace branch feature/demo -> branch develop -> branch vendor".to_owned(),
@@ -663,7 +674,7 @@ pub(super) mod tests {
         engine.set_workspace_root(workspace);
 
         let error = hybrid_code(
-            &Arc::new(Mutex::new(Some(engine))),
+            &crate::state::shared_engine(Some(engine)),
             &Arc::new(Mutex::new(SemanticRuntimeStatus::Disabled)),
             WorkspaceSearchMode::PostgresRemoteOverlay,
             Some(&ConfiguredBaselineStatus {
@@ -705,7 +716,7 @@ pub(super) mod tests {
         engine.set_workspace_root(workspace);
 
         let error = hybrid_code(
-            &Arc::new(Mutex::new(Some(engine))),
+            &crate::state::shared_engine(Some(engine)),
             &Arc::new(Mutex::new(SemanticRuntimeStatus::Disabled)),
             WorkspaceSearchMode::PostgresRemoteOverlay,
             Some(&ConfiguredBaselineStatus {
@@ -738,7 +749,7 @@ pub(super) mod tests {
     fn code_search_surfaces_retry_exhausted_errors_for_empty_queries() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("workspace-search.db");
-        let engine = Arc::new(Mutex::new(Some(SearchEngine::fts_only(&db_path).unwrap())));
+        let engine = crate::state::shared_engine(Some(SearchEngine::fts_only(&db_path).unwrap()));
 
         let error = hybrid_code(
             &engine,

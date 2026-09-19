@@ -1,4 +1,4 @@
-use super::types::SEARCH_SCHEMA_VERSION;
+use super::types::search_schema_version;
 use crate::tools::location as loc;
 use crate::tools::response::structured_with_text;
 use bsl_search::{FusedHit, LexicalHit, SearchHit, SemanticHit};
@@ -114,7 +114,7 @@ impl RenderedHits {
     /// location contract — hence no envelope.
     pub(super) fn into_response(mut self, action: &str) -> CallToolResult {
         let text = std::mem::take(&mut self.text);
-        hits_response(text, self, None, Envelope::No, action)
+        hits_response(text, self, None, Envelope::No, action, None)
     }
 }
 
@@ -234,10 +234,11 @@ pub(super) fn hits_response(
     degraded: Option<&str>,
     envelope: Envelope,
     action: &str,
+    facts: Option<&WorkspaceFacts>,
 ) -> CallToolResult {
     let mut body = json!({
         "action": action,
-        "schema_version": SEARCH_SCHEMA_VERSION,
+        "schema_version": search_schema_version(action),
         "hits": rendered.hits,
         "shown": rendered.shown,
         "total": rendered.total,
@@ -265,10 +266,117 @@ pub(super) fn hits_response(
                 loc::ReasonCode::ModalityDegraded,
                 degraded.unwrap_or_default(),
             );
-        body["freshness"] =
-            loc::Freshness::new(loc::FreshnessSource::SearchIndex, completeness).to_value();
+        let mut freshness = loc::Freshness::new(
+            loc::FreshnessSource::SearchIndex,
+            facts.map_or(completeness.clone(), |facts| facts.completeness(completeness)),
+        );
+        if let Some(watch) = facts.and_then(|facts| facts.drift_watch) {
+            freshness = freshness.with_drift_watch(watch);
+        }
+        body["freshness"] = freshness.to_value();
     }
     structured_with_text(text, body)
+}
+
+/// What the workspace index knows about its own currency when it answers: who watches the
+/// workspace for it, what its overlay still has to read back, and whether anyone is doing so.
+/// Each fact that makes the answer partial becomes a reason from the closed vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct WorkspaceFacts {
+    pub(crate) drift_watch: Option<loc::DriftWatch>,
+    /// Changed files marked and not yet read back.
+    pub(crate) pending: usize,
+    /// Changed files proven present whose bytes could not be read.
+    pub(crate) unread: usize,
+    /// Why nobody is reading the marks back, when nobody is: the backlog owner's state.
+    pub(crate) backlog_stalled: Option<&'static str>,
+    /// The poll standing in for the watch is overdue.
+    pub(crate) poll_overdue: bool,
+    /// The answer was served without the workspace overlay, so what it still owes is not
+    /// known — and not zero.
+    pub(crate) overlay_unknown: bool,
+}
+
+impl WorkspaceFacts {
+    fn reasons(&self) -> Vec<(loc::ReasonCode, String)> {
+        let mut reasons = Vec::new();
+        if self.overlay_unknown {
+            reasons.push((
+                loc::ReasonCode::IndexBuilding,
+                "answered without the workspace overlay: changed files not read back yet are \
+                 not in this answer"
+                    .to_owned(),
+            ));
+        }
+        if self.pending > 0 {
+            reasons.push((
+                loc::ReasonCode::IndexBuilding,
+                format!(
+                    "the workspace overlay is catching up: {} changed file(s) not read back yet",
+                    self.pending
+                ),
+            ));
+        }
+        if self.drift_watch == Some(loc::DriftWatch::Starting) {
+            reasons.push((
+                loc::ReasonCode::ModalityDegraded,
+                "workspace changes do not reach the index yet: its consumer is still starting"
+                    .to_owned(),
+            ));
+        }
+        if self.drift_watch == Some(loc::DriftWatch::Unobserved) {
+            reasons.push((
+                loc::ReasonCode::ModalityDegraded,
+                "workspace changes are no longer tracked: the search consumer has stopped"
+                    .to_owned(),
+            ));
+        }
+        if let (Some(state), true) =
+            (self.backlog_stalled, self.pending > 0 || self.overlay_unknown)
+        {
+            reasons.push((
+                loc::ReasonCode::ModalityDegraded,
+                format!(
+                    "the overlay backlog is not being processed ({state}); the changed files \
+                     wait for a fresh change"
+                ),
+            ));
+        }
+        if self.poll_overdue {
+            reasons.push((
+                loc::ReasonCode::ModalityDegraded,
+                "the poll that stands in for the file watch is overdue".to_owned(),
+            ));
+        }
+        if self.unread > 0 {
+            reasons.push((
+                loc::ReasonCode::UnreadableFiles,
+                format!("{} changed file(s) could not be read", self.unread),
+            ));
+        }
+        reasons
+    }
+
+    fn completeness(&self, base: loc::Completeness) -> loc::Completeness {
+        self.reasons()
+            .into_iter()
+            .fold(base, |completeness, (code, detail)| completeness.when(true, code, detail))
+    }
+
+    /// What these facts add to the envelope, so the hit budget is charged for it.
+    pub(crate) fn envelope_bytes(&self) -> usize {
+        let watch = self
+            .drift_watch
+            .map_or(0, |watch| ",\"drift_watch\":\"\"".len() + watch.as_str().len());
+        let reasons: usize = self
+            .reasons()
+            .iter()
+            .map(|(code, detail)| {
+                ",{\"code\":\"\",\"detail\":\"\"}".len() + code.as_str().len() + detail.len() * 2
+            })
+            .sum();
+        watch + reasons
+    }
 }
 
 /// Whether this response carries the contract envelope. The doc-search actions of the
@@ -286,6 +394,7 @@ pub(super) fn no_hits_response(
     degraded: Option<&str>,
     envelope: Envelope,
     action: &str,
+    facts: Option<&WorkspaceFacts>,
 ) -> CallToolResult {
     hits_response(
         NO_HITS_TEXT.to_owned(),
@@ -299,6 +408,7 @@ pub(super) fn no_hits_response(
         degraded,
         envelope,
         action,
+        facts,
     )
 }
 
@@ -549,8 +659,12 @@ pub(super) fn format_baseline_ref(baseline: &bsl_search::BaselineRef) -> String 
 #[cfg(test)]
 mod tests {
     use super::super::test_support::code_hit;
-    use super::{format_code_hits, format_doc_hits, graph_id_for_hit, no_hits_response, Envelope};
+    use super::{
+        format_code_hits, format_doc_hits, graph_id_for_hit, no_hits_response, Envelope,
+        WorkspaceFacts,
+    };
     use bsl_search::{FusedHit, Modality, SearchHit};
+    use rmcp::model::CallToolResult;
     use serde_json::json;
     use std::path::Path;
 
@@ -780,12 +894,170 @@ mod tests {
         assert_eq!(out.hits[0]["score"], json!(0.062));
     }
 
+    fn reasons_of(result: &CallToolResult) -> Vec<(String, String)> {
+        let body = result.structured_content.as_ref().expect("structured envelope");
+        body["freshness"]["completeness"]["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|reason| {
+                (
+                    reason["code"].as_str().unwrap().to_owned(),
+                    reason["detail"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    /// `search_code` says who watches the workspace for the index and what its overlay still
+    /// owes, each fact as a reason from the closed vocabulary — no new code is needed.
+    #[test]
+    fn search_code_names_the_watch_and_the_overlay_debt() {
+        use crate::tools::location::DriftWatch;
+        let catching_up = WorkspaceFacts {
+            drift_watch: Some(DriftWatch::Watching),
+            pending: 2,
+            unread: 1,
+            ..Default::default()
+        };
+        let result = no_hits_response(None, Envelope::Yes, "search_code", Some(&catching_up));
+        let body = result.structured_content.clone().unwrap();
+        assert_eq!(body["freshness"]["drift_watch"], "watching");
+        assert_eq!(body["freshness"]["completeness"]["status"], "partial");
+        let codes: Vec<String> = reasons_of(&result).into_iter().map(|(code, _)| code).collect();
+        assert_eq!(codes, ["index_building", "unreadable_files"]);
+
+        let unobserved =
+            WorkspaceFacts { drift_watch: Some(DriftWatch::Unobserved), ..Default::default() };
+        let result = no_hits_response(None, Envelope::Yes, "search_code", Some(&unobserved));
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["freshness"]["drift_watch"],
+            "unobserved"
+        );
+        assert_eq!(reasons_of(&result)[0].0, "modality_degraded");
+
+        let quiet =
+            WorkspaceFacts { drift_watch: Some(DriftWatch::Watching), ..Default::default() };
+        let result = no_hits_response(None, Envelope::Yes, "search_code", Some(&quiet));
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["freshness"]["completeness"]["status"],
+            "complete"
+        );
+    }
+
+    /// A backlog that is catching up and one nobody is processing are different answers: the
+    /// first is an index still building, the second a subsystem down — distinguishable by the
+    /// reason, not only by prose.
+    #[test]
+    fn a_stalled_backlog_reads_differently_from_one_catching_up() {
+        use crate::tools::location::DriftWatch;
+        let running = WorkspaceFacts {
+            drift_watch: Some(DriftWatch::Watching),
+            pending: 3,
+            ..Default::default()
+        };
+        let stalled =
+            WorkspaceFacts { backlog_stalled: Some("its retry budget ran out"), ..running };
+        let running =
+            reasons_of(&no_hits_response(None, Envelope::Yes, "search_code", Some(&running)));
+        let stalled =
+            reasons_of(&no_hits_response(None, Envelope::Yes, "search_code", Some(&stalled)));
+        assert_eq!(
+            running.iter().map(|(code, _)| code.as_str()).collect::<Vec<_>>(),
+            ["index_building"]
+        );
+        assert!(stalled
+            .iter()
+            .any(|(code, detail)| code == "modality_degraded"
+                && detail.contains("not being processed")));
+    }
+
+    /// Every answer passes the schema its profile publishes: `search_code` with the watch and
+    /// its reasons under the workspace's, the documentation actions under both — and a
+    /// `search_code` answer is not something the reference profile's schema admits.
+    #[test]
+    fn answers_pass_the_schema_their_profile_publishes() {
+        use crate::tools::location::DriftWatch;
+        let valid = |schema: std::sync::Arc<serde_json::Map<String, serde_json::Value>>,
+                     body: &serde_json::Value| {
+            jsonschema::validator_for(&serde_json::Value::Object((*schema).clone()))
+                .expect("a usable schema")
+                .is_valid(body)
+        };
+        let workspace = crate::tools::search::search_output_schema;
+        let reference = crate::tools::search::reference_search_output_schema;
+        let facts = WorkspaceFacts {
+            drift_watch: Some(DriftWatch::Polling),
+            pending: 3,
+            backlog_stalled: Some("its retry budget ran out"),
+            poll_overdue: true,
+            unread: 1,
+            overlay_unknown: true,
+        };
+        let code = no_hits_response(None, Envelope::Yes, "search_code", Some(&facts));
+        let code = code.structured_content.unwrap();
+        assert!(valid(workspace(), &code), "{code}");
+        assert!(!valid(reference(), &code), "the reference schema admits a v5 answer: {code}");
+        for action in ["find_docs", "search_docs"] {
+            let docs =
+                no_hits_response(None, Envelope::No, action, None).structured_content.unwrap();
+            assert!(valid(workspace(), &docs) && valid(reference(), &docs), "{docs}");
+        }
+    }
+
+    /// An index whose consumer has not started applying workspace changes cannot vouch for
+    /// them: the answer is partial, as the graph's is stale in the same state.
+    #[test]
+    fn an_index_whose_watch_is_starting_is_not_complete() {
+        use crate::tools::location::DriftWatch;
+        let facts =
+            WorkspaceFacts { drift_watch: Some(DriftWatch::Starting), ..Default::default() };
+        let result = no_hits_response(None, Envelope::Yes, "search_code", Some(&facts));
+        let body = result.structured_content.clone().unwrap();
+        assert_eq!(body["freshness"]["drift_watch"], "starting");
+        assert_eq!(body["freshness"]["completeness"]["status"], "partial", "{body}");
+        assert_eq!(reasons_of(&result)[0].0, "modality_degraded");
+    }
+
+    /// An answer served without the workspace overlay does not know what the overlay owes, and
+    /// says so instead of claiming nothing is owed.
+    #[test]
+    fn an_answer_without_the_overlay_is_not_complete() {
+        use crate::tools::location::DriftWatch;
+        let facts = WorkspaceFacts {
+            drift_watch: Some(DriftWatch::Watching),
+            overlay_unknown: true,
+            backlog_stalled: Some("its retry budget ran out"),
+            ..Default::default()
+        };
+        let result = no_hits_response(None, Envelope::Yes, "search_code", Some(&facts));
+        let body = result.structured_content.clone().unwrap();
+        assert_eq!(body["freshness"]["completeness"]["status"], "partial");
+        let codes: Vec<String> = reasons_of(&result).into_iter().map(|(code, _)| code).collect();
+        assert_eq!(codes, ["index_building", "modality_degraded"]);
+    }
+
+    /// Reference answers carry no envelope, and a `search_code` answer without workspace facts
+    /// writes no `drift_watch`: nothing outside the workspace sources changed.
+    #[test]
+    fn answers_without_workspace_facts_are_unchanged() {
+        let docs = no_hits_response(None, Envelope::No, "find_docs", None);
+        let body = docs.structured_content.unwrap();
+        assert!(body.get("freshness").is_none());
+        assert_eq!(body["schema_version"], "4");
+        let code = no_hits_response(None, Envelope::Yes, "search_code", None);
+        let body = code.structured_content.unwrap();
+        assert!(body["freshness"].get("drift_watch").is_none());
+        assert_eq!(body["schema_version"], "5");
+    }
+
     #[test]
     fn empty_listing_still_carries_the_envelope() {
         let result = no_hits_response(
             Some("semantic skipped: runtime initialization failed"),
             Envelope::Yes,
             "search_code",
+            None,
         );
 
         assert_eq!(result.content[0].as_text().expect("text").text, "No results found.");

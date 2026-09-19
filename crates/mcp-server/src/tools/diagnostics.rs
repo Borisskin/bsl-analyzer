@@ -1283,7 +1283,7 @@ fn schema_json() -> Value {
             "elapsed_ms": "u64 — ms since the current build started (present while loading)",
             "error": "string — failure message (present when failed)",
             "standalone_extension": "string — present when the project is analyzed without its main configuration: the workspace root is itself a configuration extension, or the project declares external data processors/reports (EPF/ERF) and no base; calls into that configuration are reported unresolved. Both conditions can hold at once, one line each",
-            "owns_caches": "bool — false when a newer daemon generation owns this workspace's derived caches; this backend still answers from what it holds but produces no new derived state"
+            "owns_caches": "bool — false when a newer daemon generation owns this workspace's derived caches; this backend still answers from what it holds but produces no new derived state. Absent until this daemon's ownership verdict has been established at all, which a background check does on its own"
         },
         "catalog_entry": {
             "code": "string — stable diagnostic code (e.g. CyclomaticComplexity)",

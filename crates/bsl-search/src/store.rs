@@ -115,6 +115,34 @@ pub(crate) const DEFAULT_BUSY_TIMEOUT: std::time::Duration = std::time::Duration
 pub(crate) const FENCED_OPEN_BUSY_TIMEOUT: std::time::Duration =
     std::time::Duration::from_millis(100);
 
+/// How phase C of a point refresh ended in SQLite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PointCommit {
+    Committed,
+    /// The baseline moved since the batch was captured: nothing was written.
+    VersionMoved,
+    /// The writer lock stayed held past the budget: nothing was written.
+    Busy,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Point-refresh SQL issued on this thread: `(transactions, selects, deletes)`.
+    pub(crate) static POINT_SQL: std::cell::Cell<(usize, usize, usize)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+fn sqlite_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if matches!(
+                failure.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
 pub(crate) fn sqlite_bootstrap_retryable(error: &SearchError) -> bool {
     matches!(
         error,
@@ -623,6 +651,11 @@ impl Store {
              DROP TRIGGER IF EXISTS files_gen_del;
              DROP TABLE IF EXISTS chunks_fts; DROP TABLE IF EXISTS overlay_chunks_fts;",
         )?;
+        for table in ["files", "baseline_manifest", "baseline_manifest_files"] {
+            for suffix in ["ins", "upd", "del"] {
+                conn.execute_batch(&format!("DROP TRIGGER IF EXISTS {table}_baseline_{suffix};"))?;
+            }
+        }
         let names: Vec<String> = {
             let mut stmt = conn.prepare(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
@@ -809,8 +842,147 @@ impl Store {
         Self::migrate_overlay_embedding_cache_key(conn)?;
 
         Self::create_embedding_generation_triggers(conn)?;
+        Self::create_baseline_version_triggers(conn)?;
 
         Ok(())
+    }
+
+    /// The `baseline_version` counter a point refresh compares against: moved by triggers on
+    /// every write to `files`, `baseline_manifest` and `baseline_manifest_files`, so a write
+    /// through ANY connection — the embedding pass's own, a manifest replacement in its own
+    /// transaction — moves it. The row is seeded with a random value, so a wipe that drops
+    /// and reseeds it does not come back to a value a prepared refresh still holds.
+    fn create_baseline_version_triggers(conn: &Connection) -> Result<(), SearchError> {
+        conn.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES ('baseline_version', abs(random()))",
+            [],
+        )?;
+        let bump = "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) \
+                    WHERE key = 'baseline_version';";
+        for table in ["files", "baseline_manifest", "baseline_manifest_files"] {
+            for (suffix, event) in [("ins", "INSERT"), ("upd", "UPDATE"), ("del", "DELETE")] {
+                conn.execute_batch(&format!(
+                    "CREATE TRIGGER IF NOT EXISTS {table}_baseline_{suffix} AFTER {event} \
+                     ON {table} BEGIN {bump} END;"
+                ))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A connection for reading alone, for a caller that prepares work off every lock: no
+    /// schema step, no pragma write, nothing that would take the writer.
+    pub fn open_reader(path: &Path) -> Result<Self, SearchError> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
+        Ok(Self { conn, path: path.to_path_buf(), mark_seq: Arc::new(AtomicI64::new(0)) })
+    }
+
+    /// Whether a manifest header is persisted — the same validity rule
+    /// [`Self::load_baseline_manifest_fingerprints`] keys on, asked without loading the rows.
+    pub fn has_baseline_manifest(&self) -> Result<bool, SearchError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM baseline_manifest WHERE id = 1)",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? != 0)
+    }
+
+    /// One key's manifest fingerprint, looked up by its primary key.
+    pub fn manifest_fingerprint(
+        &self,
+        collection: &str,
+        key: &FileKey,
+    ) -> Result<Option<String>, SearchError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT file_fingerprint FROM baseline_manifest_files
+                 WHERE collection = ?1 AND root_id = ?2 AND path = ?3",
+                params![collection, key.root_id, key.path],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Phase C of a point refresh (see [`crate::point_refresh`]): ONE immediate transaction that
+    /// re-checks the baseline version it was prepared against and retracts at most one
+    /// fingerprint row per key. Waits at most `busy` for the writer lock and gives the batch
+    /// back rather than waiting out the operational budget under the caller's locks.
+    pub(crate) fn commit_point_refresh(
+        &self,
+        expected_version: i64,
+        retract: &[FileKey],
+        busy: std::time::Duration,
+    ) -> Result<PointCommit, SearchError> {
+        self.conn.busy_timeout(busy)?;
+        let outcome = self.commit_point_refresh_once(expected_version, retract);
+        self.conn.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
+        outcome
+    }
+
+    fn commit_point_refresh_once(
+        &self,
+        expected_version: i64,
+        retract: &[FileKey],
+    ) -> Result<PointCommit, SearchError> {
+        #[cfg(test)]
+        POINT_SQL.with(|sql| sql.set((sql.get().0 + 1, sql.get().1, sql.get().2)));
+        match self.conn.execute_batch("BEGIN IMMEDIATE") {
+            Ok(()) => {}
+            Err(error) if sqlite_busy(&error) => return Ok(PointCommit::Busy),
+            Err(error) => return Err(error.into()),
+        }
+        let applied = (|| -> Result<PointCommit, SearchError> {
+            #[cfg(test)]
+            POINT_SQL.with(|sql| sql.set((sql.get().0, sql.get().1 + 1, sql.get().2)));
+            let version: i64 = self.conn.query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'baseline_version'",
+                [],
+                |row| row.get(0),
+            )?;
+            if version != expected_version {
+                return Ok(PointCommit::VersionMoved);
+            }
+            for key in retract {
+                #[cfg(test)]
+                POINT_SQL.with(|sql| sql.set((sql.get().0, sql.get().1, sql.get().2 + 1)));
+                self.conn.execute(
+                    "DELETE FROM overlay_fingerprint_cache WHERE root_id = ?1 AND path = ?2",
+                    params![key.root_id, key.path],
+                )?;
+            }
+            Ok(PointCommit::Committed)
+        })();
+        match applied {
+            Ok(PointCommit::Committed) => match self.conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(PointCommit::Committed),
+                Err(error) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    if sqlite_busy(&error) {
+                        Ok(PointCommit::Busy)
+                    } else {
+                        Err(error.into())
+                    }
+                }
+            },
+            other => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                other
+            }
+        }
+    }
+
+    /// The current `baseline_version` (see [`Self::create_baseline_version_triggers`]).
+    pub fn baseline_version(&self) -> Result<i64, SearchError> {
+        Ok(self.conn.query_row(
+            "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'baseline_version'",
+            [],
+            |row| row.get(0),
+        )?)
     }
 
     /// Drop and recreate `overlay_embedding_cache` when it still has the legacy `content_hash`
@@ -2128,6 +2300,7 @@ impl Store {
         &self,
         collection: &str,
     ) -> Result<Vec<(FileKey, Vec<u8>)>, SearchError> {
+        crate::point_refresh::forbidden_under_a_bounded_publication("loading every stored file");
         let mut stmt =
             self.conn.prepare("SELECT root_id, path, hash FROM files WHERE collection = ?1")?;
         let rows = stmt.query_map(params![collection], |row| {
@@ -2586,6 +2759,7 @@ impl Store {
         &self,
         collection: &str,
     ) -> Result<Option<HashMap<FileKey, String>>, SearchError> {
+        crate::point_refresh::forbidden_under_a_bounded_publication("loading the whole manifest");
         let has_manifest = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM baseline_manifest WHERE id = 1)",
             [],
@@ -4095,6 +4269,76 @@ mod tests {
             !store.context_dirty_paths("code").unwrap().contains(&FileKey::configuration("P.bsl")),
             "a build whose start-seq covers the re-mark clears it",
         );
+    }
+
+    /// Every write to the baseline moves `baseline_version`, whichever connection makes it and
+    /// whatever statement shape it takes: the triggers see the rows, not the API. A replace that
+    /// resolves its conflict by deleting still fires the insert trigger.
+    #[test]
+    fn every_baseline_write_moves_the_baseline_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("search.db");
+        let store = Store::open(&path).unwrap();
+        let other = Store::open(&path).unwrap();
+        let mut version = store.baseline_version().unwrap();
+        let mut moved = |label: &str, write: &dyn Fn()| {
+            write();
+            let now = store.baseline_version().unwrap();
+            assert_ne!(now, version, "{label} did not move the baseline version");
+            version = now;
+        };
+        moved("upsert_file", &|| {
+            store.upsert_file("", "A.bsl", b"h1", "code").unwrap();
+        });
+        moved("an update through another connection", &|| {
+            other.conn.execute("UPDATE files SET hash = X'01' WHERE path = 'A.bsl'", []).unwrap();
+        });
+        moved("INSERT OR REPLACE", &|| {
+            store
+                .conn
+                .execute(
+                    "INSERT OR REPLACE INTO files (root_id, path, hash, indexed_at, collection) \
+                     VALUES ('', 'A.bsl', X'02', 0, 'code')",
+                    [],
+                )
+                .unwrap();
+        });
+        moved("remove_file", &|| store.remove_file("", "A.bsl", "code").unwrap());
+        let manifest = crate::WorkspaceBaselineManifest {
+            snapshot_id: "s".to_owned(),
+            snapshot_fingerprint: None,
+            files: vec![crate::BaselineManifestFile {
+                collection: "code".to_owned(),
+                root_id: CONFIGURATION_ROOT_ID.to_owned(),
+                path: "A.bsl".to_owned(),
+                file_fingerprint: "f".to_owned(),
+                document_count: 1,
+                file_object_id: "o".to_owned(),
+            }],
+        };
+        moved("save_baseline_manifest", &|| store.save_baseline_manifest(&manifest).unwrap());
+        moved("a manifest row delete", &|| {
+            other.conn.execute("DELETE FROM baseline_manifest_files", []).unwrap();
+        });
+        moved("clear_baseline_manifest", &|| store.clear_baseline_manifest().unwrap());
+    }
+
+    /// A wipe drops the counter with its tables; the reseed is random, so a refresh prepared
+    /// before the wipe does not find its version again.
+    #[test]
+    fn a_wiped_store_does_not_come_back_to_an_old_baseline_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("search.db");
+        let before = Store::open(&path).unwrap().baseline_version().unwrap();
+        {
+            let store = Store::open(&path).unwrap();
+            store
+                .conn
+                .execute("UPDATE meta SET value = '0' WHERE key = 'schema_version'", [])
+                .unwrap();
+        }
+        let after = Store::open(&path).unwrap().baseline_version().unwrap();
+        assert_ne!(before, after, "the wiped store reused the old baseline version");
     }
 
     /// The mark-seq counter is monotonic and survives a clear: after a marked-then-cleared

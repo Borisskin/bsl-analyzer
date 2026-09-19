@@ -3,7 +3,7 @@ use crate::embedder::{Embedder, EmbedderConfig};
 use crate::error::SearchError;
 use crate::index::VectorIndex;
 use crate::local_baseline::LocalStoreBaselineAdapter;
-use crate::ports::{ModuleSnapshot, ModuleSnapshotSource, SnapshotCatalog, SnapshotContentStore};
+use crate::ports::{ModuleSnapshotSource, SnapshotCatalog, SnapshotContentStore};
 use crate::publish::EmbeddingExecutionPolicy;
 use crate::resolver::{InMemoryResolvedViewResolver, ResolvedView};
 use crate::store::{
@@ -37,6 +37,9 @@ std::thread_local! {
 #[derive(Debug, Default)]
 pub struct IndexProgress {
     pub active: AtomicBool,
+    /// How many passes are running. A pause reads it rather than a snapshot of `active`: by the
+    /// time the pause ends, the pass it paused may already have gone.
+    passes: AtomicUsize,
     pub total_files: AtomicUsize,
     pub total_chunks: AtomicUsize,
     pub total_batches: AtomicUsize,
@@ -73,8 +76,41 @@ impl IndexProgress {
 
     /// Mark a pass running until the returned guard drops.
     pub fn begin_pass(self: &Arc<Self>) -> ActivePass {
+        self.passes.fetch_add(1, Ordering::Relaxed);
         self.active.store(true, Ordering::Relaxed);
         ActivePass(Arc::clone(self))
+    }
+
+    /// Mark a running pass as WAITING until the returned guard drops. For a backoff inside a
+    /// pass: the work has not ended, but nothing is being done, and a process kept alive by
+    /// this flag has no reason to stay up for it.
+    pub fn pause_pass(self: &Arc<Self>) -> PausedPass {
+        self.active.store(false, Ordering::Relaxed);
+        PausedPass(Arc::clone(self))
+    }
+}
+
+/// Lowers [`IndexProgress::active`] for as long as a pass is WAITING rather than working.
+///
+/// A backoff inside a pass can run for half an hour. The claim stays — nobody else may start a
+/// pass — but the flag that keeps a broker backend alive must not, or the pause pins a
+/// multi-gigabyte resident for the whole wait, which is the opposite of what pausing is for.
+/// On drop the flag goes back to what it was, which is how the pass resumes counting as work.
+///
+/// What it must NOT do is store `true`: this guard's only job is to be reversible, and a pause
+/// that outlives the pass it paused would then raise a flag [`ActivePass`] had already lowered
+/// — pinning the multi-gigabyte resident for good, which is the exact failure both guards exist
+/// to prevent. Nothing reaches that ordering today; nothing enforced it either, and it is one
+/// caller away.
+pub struct PausedPass(Arc<IndexProgress>);
+
+impl Drop for PausedPass {
+    fn drop(&mut self) {
+        // Raised again only while a pass is still running. Stored unconditionally — and a
+        // snapshot taken at pause time is unconditional too, just later — this would raise a
+        // flag [`ActivePass`] had already lowered, pinning the multi-gigabyte resident for
+        // good: the exact failure both guards exist to prevent.
+        self.0.active.store(self.0.passes.load(Ordering::Relaxed) > 0, Ordering::Relaxed);
     }
 }
 
@@ -88,6 +124,7 @@ pub struct ActivePass(Arc<IndexProgress>);
 
 impl Drop for ActivePass {
     fn drop(&mut self) {
+        self.0.passes.fetch_sub(1, Ordering::Relaxed);
         self.0.active.store(false, Ordering::Relaxed);
     }
 }
@@ -499,6 +536,19 @@ pub struct SearchEngine {
     module_snapshot_source: Option<Arc<dyn ModuleSnapshotSource>>,
 }
 
+/// What the workspace overlay still owes a reader, as one consistent read. See
+/// [`SearchEngine::workspace_overlay_debt`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkspaceOverlayDebt {
+    /// Whether a full pass has ever built the overlay. Before it has, the overlay answers no
+    /// query and owes every change on disk — a fact the counts below cannot express.
+    pub initialized: bool,
+    /// Dirty marks a point refresh could answer now.
+    pub pending: usize,
+    /// Keys proven present but not read back yet.
+    pub unread: usize,
+}
+
 /// The overlay retry driver's condition signals, read without side effects by
 /// [`SearchEngine::workspace_overlay_retry_signals`]. Any nonzero/true field means the
 /// overlay owes another Embed pass.
@@ -513,12 +563,12 @@ pub struct OverlayRetrySignals {
 
 impl OverlayRetrySignals {
     /// Whether any signal demands a pass: the first pass has not happened, removals were
-    /// withheld or a persist failed, marks await re-embedding, entries lack vectors, or
-    /// proven-present files stayed unread.
+    /// withheld or a persist failed, entries lack vectors, or proven-present files stayed
+    /// unread. Dirty marks alone do not: they are the point refresh's to answer, and the
+    /// entries it settles without vectors are what this pass then catches up.
     pub fn demands_a_pass(&self) -> bool {
         !self.initialized
             || self.needs_full_rescan
-            || self.pending_dirty_paths > 0
             || self.unembedded_entries > 0
             || self.unread_keys > 0
     }
@@ -758,33 +808,28 @@ impl SearchEngine {
 
     /// Erased host adapter for one atomic transaction that must remain fenced but can refresh
     /// the lease heartbeat and observe terminal shutdown at bounded row boundaries.
-    #[allow(
-        dead_code,
-        reason = "foundation consumed by the workspace mutation leaves that follow this change"
-    )]
+    ///
+    /// `operation` is `FnMut`, not `FnOnce`: a checkpoint releases and re-takes the
+    /// interprocess lock, so a refusal can arrive AFTER the callback was admitted. The host
+    /// answers that by rolling the transaction back and running the whole thing again, and an
+    /// adapter that had handed its operation away would meet the retry with nothing to run.
     fn fenced_checkpointed_value<T, F, A>(
         apply: &mut A,
-        operation: F,
+        mut operation: F,
     ) -> Result<FenceOutcome<T>, SearchError>
     where
-        F: FnOnce(&mut dyn FnMut() -> ControlFlow<()>) -> ControlFlow<(), Result<T, SearchError>>,
+        F: FnMut(&mut dyn FnMut() -> ControlFlow<()>) -> ControlFlow<(), Result<T, SearchError>>,
         A: FnMut(
             &mut dyn FnMut(
                 &mut dyn FnMut() -> ControlFlow<()>,
             ) -> ControlFlow<(), Result<(), SearchError>>,
         ) -> FenceOutcome<Result<(), SearchError>>,
     {
-        let mut operation = Some(operation);
         let mut value = None;
         let mut erased = |checkpoint: &mut dyn FnMut() -> ControlFlow<()>| {
-            let operation = match operation.take() {
-                Some(operation) => operation,
-                None => {
-                    return ControlFlow::Continue(Err(SearchError::Index(
-                        "checkpointed fenced apply operation invoked more than once".to_owned(),
-                    )))
-                }
-            };
+            // Each attempt starts from nothing: a value left by a rolled-back attempt would
+            // otherwise be reported as this one's result.
+            value = None;
             match operation(checkpoint) {
                 ControlFlow::Break(()) => ControlFlow::Break(()),
                 ControlFlow::Continue(Err(error)) => ControlFlow::Continue(Err(error)),
@@ -1114,8 +1159,7 @@ impl SearchEngine {
         self.module_snapshot_source.clone()
     }
 
-    /// The overlay paths currently marked dirty, so the caller can prefetch resident snapshots
-    /// for them off-lock and feed them back through [`Self::reindex_dirty_from_snapshots`].
+    /// The overlay paths currently marked dirty, awaiting a point refresh.
     pub fn workspace_overlay_dirty_paths(&self) -> Result<Vec<FileKey>, SearchError> {
         let cache = self
             .workspace_overlay_cache
@@ -1133,31 +1177,6 @@ impl SearchEngine {
             .lock()
             .map_err(|e| SearchError::Index(format!("workspace overlay cache lock error: {e}")))?;
         Ok(cache.resident_fed_count())
-    }
-
-    /// Reindex the dirty overlay paths using prefetched resident snapshots (shared parse) where
-    /// available, disk-reading the rest. The `snapshots` map is prefetched by the caller with no
-    /// engine lock held, so this method — which does take the engine's overlay-cache lock — never
-    /// touches the resident host, keeping the resident and engine locks strictly disjoint.
-    pub fn reindex_dirty_from_snapshots(
-        &self,
-        snapshots: &HashMap<FileKey, ModuleSnapshot>,
-    ) -> Result<(), SearchError> {
-        let Some(roots) = &self.workspace_roots else {
-            return Ok(());
-        };
-        let mut cache = self
-            .workspace_overlay_cache
-            .lock()
-            .map_err(|e| SearchError::Index(format!("workspace overlay cache lock error: {e}")))?;
-        cache.reindex_dirty_from_snapshots(
-            roots,
-            &self.store,
-            self.serves_external_baseline,
-            self.batch_size,
-            self.workspace_baseline_hash_mode,
-            snapshots,
-        )
     }
 
     pub fn index_directory(
@@ -1991,7 +2010,7 @@ impl SearchEngine {
 
     fn apply_prepared_boot_file_checkpointed(
         &mut self,
-        prepared: PreparedBootFile,
+        prepared: &PreparedBootFile,
         checkpoint: &mut dyn FnMut() -> ControlFlow<()>,
     ) -> ControlFlow<(), Result<(), SearchError>> {
         match prepared {
@@ -2003,11 +2022,11 @@ impl SearchEngine {
             }
             PreparedBootFile::Reindex { key, hash, chunks, graph_contexts: Some(contexts) } => {
                 match self.store.reindex_file_with_context_checkpointed(
-                    &key,
-                    &hash,
-                    &chunks,
+                    key,
+                    hash,
+                    chunks,
                     None,
-                    Some(&contexts),
+                    Some(contexts),
                     checkpoint,
                 ) {
                     Ok(ControlFlow::Continue(_)) => ControlFlow::Continue(Ok(())),
@@ -2017,7 +2036,7 @@ impl SearchEngine {
             }
             PreparedBootFile::Reindex { key, hash, chunks, graph_contexts: None } => {
                 match self.store.reindex_file_with_context_checkpointed(
-                    &key, &hash, &chunks, None, None, checkpoint,
+                    key, hash, chunks, None, None, checkpoint,
                 ) {
                     Ok(ControlFlow::Continue(_)) => ControlFlow::Continue(Ok(())),
                     Ok(ControlFlow::Break(())) => ControlFlow::Break(()),
@@ -2052,7 +2071,7 @@ impl SearchEngine {
                 }
                 prepared => {
                     match Self::fenced_checkpointed_value(apply, |checkpoint| {
-                        self.apply_prepared_boot_file_checkpointed(prepared, checkpoint)
+                        self.apply_prepared_boot_file_checkpointed(&prepared, checkpoint)
                     })? {
                         FenceOutcome::Applied(()) => {}
                         FenceOutcome::TransientRefusal => {
@@ -2924,13 +2943,18 @@ impl SearchEngine {
 
     /// Apply one already-materialized drift slice. The host advances its cursors only after this
     /// returns `Continue(Ok(_))`; cancellation rolls back every Store mutation in the slice.
+    ///
+    /// Returns the seq the slice's context-dirty marks were stamped with, `None` when it placed
+    /// none: the host hands it to whoever consumes the marks, together with the fact that
+    /// caused them.
     pub fn apply_prepared_workspace_drift_batch(
         &mut self,
         dirty_keys: &[FileKey],
         removed_keys: &[FileKey],
         context_keys: &[FileKey],
         checkpoint: &mut dyn FnMut() -> ControlFlow<()>,
-    ) -> ControlFlow<(), Result<usize, SearchError>> {
+    ) -> ControlFlow<(), Result<Option<i64>, SearchError>> {
+        let _bounded = crate::point_refresh::BoundedPublication::enter();
         let rows = dirty_keys.len() + removed_keys.len() + context_keys.len();
         if rows > WORKSPACE_APPLY_BATCH_ROWS {
             return ControlFlow::Continue(Err(SearchError::Index(format!(
@@ -2966,11 +2990,12 @@ impl SearchEngine {
         }
         for key in removed_keys {
             cache.mark_dirty_path(key.clone());
-            // Local mode serves no baseline hits, so conservatively hiding a possible remote copy
-            // is correct without loading the workspace-sized manifest inside the publication.
-            cache.remove_known_deleted(key, true);
+            // A shared baseline may hold a copy, and hiding it conservatively needs no manifest
+            // loaded inside the publication. A local store has no copy beyond the rows this
+            // batch just deleted: there is nothing to hide.
+            cache.remove_known_deleted(key, self.serves_external_baseline);
         }
-        ControlFlow::Continue(Ok(removed_keys.len()))
+        ControlFlow::Continue(Ok(context_mark_seq))
     }
 
     /// The store key of a workspace `.bsl` file, or `None` when it is not a
@@ -2984,31 +3009,119 @@ impl SearchEngine {
     /// [`WorkspaceRoots::spellings_of`], so a `.bsl` and a descriptor cannot be
     /// attributed by different rules.
     pub fn workspace_file_key(&self, path: &Path) -> Option<FileKey> {
-        let roots = self.workspace_roots.as_ref()?;
-        if !bsl_conventions::has_extension(path, bsl_conventions::BSL_EXTENSION) {
-            return None;
-        }
-        let (walked, canonical) = roots.spellings_of(path);
-        // A `.bsl`-spelled link may resolve to a non-source target — by role, or by not being
-        // a regular file at all (a directory spelled `.bsl`). A key under such a target's root
-        // would be one that is FORBIDDEN to exist (the walk drops such files), so canonical
-        // attribution is meaningless there; the walked spelling is the only key the file could
-        // ever have been indexed under — the key a removal must reach. A GONE target still
-        // attributes canonically: it was a file if it was anything, and the tombstone path
-        // needs the last known spelling.
-        let target_is_source = project_model::file_role(&canonical)
-            == project_model::FileRole::Source
-            && match std::fs::metadata(&canonical) {
-                Ok(metadata) => metadata.is_file(),
-                Err(_) => true,
-            };
-        if target_is_source {
-            roots.root_of(&walked, &canonical)
-        } else {
-            roots.root_of_declared(&walked)
-        }
+        workspace_file_key_in(self.workspace_roots.as_ref()?, path)
     }
 
+    /// Phase one of a carrier snapshot: the in-memory carriers, read under the caller's
+    /// engine lock. The store's carriers are read by [`CarrierCapture::complete`] through a
+    /// connection of the caller's own, off every lock — reading every stored key under the
+    /// engine mutex is what used to park every request behind a whole-store load.
+    pub fn capture_carriers(&self) -> Result<CarrierCapture, SearchError> {
+        let (overlay_entries, unread) = self
+            .workspace_overlay_cache
+            .lock()
+            .map_err(|e| SearchError::Index(format!("workspace overlay cache lock error: {e}")))?
+            .known_keys();
+        Ok(CarrierCapture {
+            roots: self.workspace_roots.clone(),
+            overlay_entries,
+            unread,
+            serves_external_baseline: self.serves_external_baseline,
+            db_path: self.store.db_path().to_path_buf(),
+        })
+    }
+}
+
+/// The in-memory half of a carrier snapshot (see [`SearchEngine::capture_carriers`]).
+pub struct CarrierCapture {
+    roots: Option<WorkspaceRoots>,
+    overlay_entries: HashSet<FileKey>,
+    unread: HashSet<FileKey>,
+    serves_external_baseline: bool,
+    db_path: PathBuf,
+}
+
+impl CarrierCapture {
+    /// Where the caller opens the reader [`Self::complete`] takes.
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+
+    /// Phase two: the store's carriers, read through `reader` — never the live connection.
+    /// The manifest counts only when this engine serves an external baseline, as in the
+    /// engine's own carrier read.
+    pub fn complete(self, reader: &Store) -> Result<CarrierSnapshot, SearchError> {
+        let carriers = crate::key_carriers::CarrierKeys {
+            store_rows: reader
+                .all_files_in_collection("code")?
+                .into_iter()
+                .map(|(key, _hash)| key)
+                .collect(),
+            overlay_entries: self.overlay_entries,
+            unread: self.unread,
+            fingerprints: reader.overlay_fingerprint_keys()?,
+            manifest: if self.serves_external_baseline {
+                reader
+                    .load_baseline_manifest_fingerprints("code")?
+                    .unwrap_or_default()
+                    .into_keys()
+                    .collect()
+            } else {
+                HashSet::new()
+            },
+        };
+        Ok(CarrierSnapshot { roots: self.roots, carriers })
+    }
+}
+
+/// Every key any carrier knows, with the root table it was read under.
+pub struct CarrierSnapshot {
+    roots: Option<WorkspaceRoots>,
+    carriers: crate::key_carriers::CarrierKeys,
+}
+
+impl CarrierSnapshot {
+    pub fn known_keys(&self) -> HashSet<FileKey> {
+        self.carriers.all_keys()
+    }
+
+    /// The keys under `dirs` whose files are proven gone (see
+    /// [`SearchEngine::vanished_workspace_keys`]).
+    pub fn vanished_keys(&self, dirs: &[PathBuf]) -> Vec<FileKey> {
+        match &self.roots {
+            Some(roots) => vanished_keys_in(roots, &self.carriers, dirs),
+            None => Vec::new(),
+        }
+    }
+}
+
+/// The store key of a workspace `.bsl` file under `roots`, or `None` when it is not a `.bsl`
+/// or lies outside every registered root (see [`SearchEngine::workspace_file_key`]).
+pub fn workspace_file_key_in(roots: &WorkspaceRoots, path: &Path) -> Option<FileKey> {
+    if !bsl_conventions::has_extension(path, bsl_conventions::BSL_EXTENSION) {
+        return None;
+    }
+    let (walked, canonical) = roots.spellings_of(path);
+    // A `.bsl`-spelled link may resolve to a non-source target — by role, or by not being
+    // a regular file at all (a directory spelled `.bsl`). A key under such a target's root
+    // would be one that is FORBIDDEN to exist (the walk drops such files), so canonical
+    // attribution is meaningless there; the walked spelling is the only key the file could
+    // ever have been indexed under — the key a removal must reach. A GONE target still
+    // attributes canonically: it was a file if it was anything, and the tombstone path
+    // needs the last known spelling.
+    let target_is_source = project_model::file_role(&canonical) == project_model::FileRole::Source
+        && match std::fs::metadata(&canonical) {
+            Ok(metadata) => metadata.is_file(),
+            Err(_) => true,
+        };
+    if target_is_source {
+        roots.root_of(&walked, &canonical)
+    } else {
+        roots.root_of_declared(&walked)
+    }
+}
+
+impl SearchEngine {
     /// Mark one workspace `.bsl` file's stored graph context stale, so a later
     /// reindex/embed pass re-renders it. Cheap metadata write (a side-table upsert, no
     /// chunk mutation, so the vector sidecar is not invalidated). Returns whether the
@@ -3124,56 +3237,7 @@ impl SearchEngine {
         let Some(roots) = self.workspace_roots.as_ref() else {
             return Ok(Vec::new());
         };
-        // Attributed by the DECLARED spellings alone: the directory is gone, so there is
-        // nothing left on disk to canonicalise, and its keys were spelled the way the walk
-        // reached it.
-        //
-        // Two kinds of key go with a directory, and attribution alone finds only the first.
-        // It answers "which root owns this file", and a root owns no file at its own path,
-        // so a directory that IS a root — an extension deleted whole, a configuration that
-        // is the workspace — attributes to nothing at all. Its keys are its root's.
-        let mut prefixes: Vec<FileKey> = Vec::new();
-        let mut swallowed_roots: HashSet<String> = HashSet::new();
-        for dir in dirs {
-            let walked = if dir.is_absolute() {
-                dir.clone()
-            } else {
-                roots.configuration().unwrap_or_else(|| roots.workspace()).join(dir)
-            };
-            // Both spellings, for the same reason point removal canonicalises: a root
-            // declared through a link owns the files physically under its target, and the
-            // declared path alone would hand the subtree to the enclosing alias root —
-            // whose keys are not the ones in the store.
-            let canonical = crate::workspace_roots::canonical_spelling(&walked);
-            prefixes.extend(roots.root_of_declared(&walked));
-            prefixes.extend(roots.root_of(&walked, &canonical));
-            swallowed_roots.extend(
-                roots
-                    .entries()
-                    .filter(|(_, declared)| {
-                        declared.starts_with(&walked) || declared.starts_with(&canonical)
-                    })
-                    .map(|(id, _)| id.to_owned()),
-            );
-        }
-        if prefixes.is_empty() && swallowed_roots.is_empty() {
-            return Ok(Vec::new());
-        }
-        let carriers = self.carrier_keys()?;
-        Ok(carriers
-            .all_keys()
-            .into_iter()
-            .filter(|key| {
-                swallowed_roots.contains(&key.root_id)
-                    || prefixes.iter().any(|prefix| key.is_under(prefix))
-            })
-            .filter(|key| {
-                self.workspace_roots
-                    .as_ref()
-                    .and_then(|roots| roots.resolve(key))
-                    .is_some_and(|path| proven_absent(&path))
-            })
-            .collect())
+        Ok(vanished_keys_in(roots, &self.carrier_keys()?, dirs))
     }
 
     /// Apply an already-materialized removal set without further filesystem probes.
@@ -3633,6 +3697,7 @@ impl SearchEngine {
     fn dispatched_manifest_fingerprints(
         &self,
     ) -> Result<Option<HashMap<FileKey, String>>, SearchError> {
+        crate::point_refresh::forbidden_under_a_bounded_publication("dispatching the manifest");
         if !self.serves_external_baseline {
             return Ok(None);
         }
@@ -3722,6 +3787,123 @@ impl SearchEngine {
             .lock()
             .map_err(|e| SearchError::Index(format!("workspace overlay cache lock error: {e}")))?;
         Ok(cache.needs_full_rescan())
+    }
+
+    /// What the workspace overlay still owes a reader, read under ONE lock.
+    ///
+    /// `initialized` is its own fact, never a conclusion drawn from the counts: an overlay that
+    /// has never run a full pass owes marks it cannot even count yet, so both counts read zero
+    /// there — the same zero a fully caught-up overlay shows. A caller that reads only the
+    /// counts calls that answer complete, and in a profile with no embedder it says so for the
+    /// whole life of the daemon.
+    pub fn workspace_overlay_debt(&self) -> Result<WorkspaceOverlayDebt, SearchError> {
+        let cache = self
+            .workspace_overlay_cache
+            .lock()
+            .map_err(|e| SearchError::Index(format!("workspace overlay cache lock error: {e}")))?;
+        Ok(WorkspaceOverlayDebt {
+            initialized: cache.is_initialized(),
+            pending: cache.point_backlog(),
+            unread: cache.unread_keys_count(),
+        })
+    }
+
+    /// How many dirty marks a point refresh could answer now: none before the overlay is
+    /// initialized, whose first full refresh answers them instead. O(1).
+    pub fn workspace_overlay_point_backlog(&self) -> Result<usize, SearchError> {
+        let cache = self
+            .workspace_overlay_cache
+            .lock()
+            .map_err(|e| SearchError::Index(format!("workspace overlay cache lock error: {e}")))?;
+        Ok(cache.point_backlog())
+    }
+
+    /// Phase A of a point refresh (see [`crate::point_refresh`]): up to `limit` dirty keys, the
+    /// oldest marks first, with the fences phase C re-checks and the inputs phase B needs. A
+    /// moment under the caller's engine lock; `None` when the overlay has nothing to answer.
+    pub fn capture_point_refresh(
+        &self,
+        limit: usize,
+    ) -> Result<Option<crate::point_refresh::PointCapture>, SearchError> {
+        let Some(roots) = self.workspace_roots.clone() else {
+            return Ok(None);
+        };
+        let (keys, fence, wholesale_seq, provider) = {
+            let cache = self.workspace_overlay_cache.lock().map_err(|e| {
+                SearchError::Index(format!("workspace overlay cache lock error: {e}"))
+            })?;
+            let keys = cache.capture_point_keys(limit);
+            let (fence, wholesale_seq) = cache.point_fences();
+            (keys, fence, wholesale_seq, cache.graph_context_provider_handle())
+        };
+        if keys.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(crate::point_refresh::PointCapture {
+            keys,
+            fence,
+            wholesale_seq,
+            roots_epoch: self.workspace_roots_epoch,
+            baseline_version: self.store.baseline_version()?,
+            roots,
+            hash_mode: self.workspace_baseline_hash_mode,
+            serves_external_baseline: self.serves_external_baseline,
+            provider,
+            source: self.module_snapshot_source.clone(),
+            batch_size: self.batch_size,
+            db_path: self.store.db_path().to_path_buf(),
+        }))
+    }
+
+    /// Phase C of a point refresh: settle what `batch` prepared, unless the state it was
+    /// prepared against moved. Runs under the caller's engine lock and ownership fence, and
+    /// does only bounded work there — anything that would load a whole baseline or read a
+    /// file panics in a debug build (see [`crate::point_refresh::BoundedPublication`]). On
+    /// [`crate::PointPublish::Busy`] the batch is untouched and may be published again.
+    pub fn publish_point_refresh(
+        &self,
+        batch: &mut crate::point_refresh::PreparedPointBatch,
+    ) -> Result<crate::point_refresh::PointPublish, SearchError> {
+        use crate::point_refresh::PointPublish;
+        let _bounded = crate::point_refresh::BoundedPublication::enter();
+        if self.workspace_roots_epoch != batch.roots_epoch {
+            return Ok(PointPublish::Discarded);
+        }
+        // The baseline mode is a fence of its own: `set_serves_external_baseline` moves neither
+        // `roots_epoch` nor `wholesale_seq` nor `baseline_version`, so without this check a
+        // batch classified in one mode could settle in the other. The roots plan already treats
+        // a mode change as superseding; the point path was reading a classification made under
+        // rules that no longer hold. An in-memory flag, so nothing here reads a file.
+        if self.serves_external_baseline != batch.serves_external_baseline {
+            return Ok(PointPublish::Discarded);
+        }
+        let mut cache = self
+            .workspace_overlay_cache
+            .lock()
+            .map_err(|e| SearchError::Index(format!("workspace overlay cache lock error: {e}")))?;
+        if !cache.point_batch_stands(batch) {
+            return Ok(PointPublish::Discarded);
+        }
+        let applicable = cache.applicable_point_keys(batch);
+        let retract: Vec<FileKey> = batch
+            .keys
+            .iter()
+            .zip(&applicable)
+            .filter(|(prepared, applies)| **applies && prepared.retract)
+            .map(|(prepared, _)| prepared.captured.key.clone())
+            .collect();
+        match self.store.commit_point_refresh(
+            batch.baseline_version,
+            &retract,
+            crate::point_refresh::C_BUSY_TIMEOUT,
+        )? {
+            crate::store::PointCommit::Busy => return Ok(PointPublish::Busy),
+            crate::store::PointCommit::VersionMoved => return Ok(PointPublish::Discarded),
+            crate::store::PointCommit::Committed => {}
+        }
+        let stale = applicable.iter().filter(|applies| !**applies).count();
+        let (settled, cleared) = cache.settle_point_batch(batch, &applicable);
+        Ok(PointPublish::Applied { settled, cleared, stale, remaining: cache.point_backlog() })
     }
 
     /// In-engine overlay prime that may embed inline (holds the engine lock for its duration).
@@ -4775,6 +4957,59 @@ fn proven_absent(path: &Path) -> bool {
     }
 }
 
+/// The keys under `dirs` whose files are proven gone, attributed by the DECLARED spellings
+/// alone and chosen from every carrier (see [`SearchEngine::vanished_workspace_keys`]).
+fn vanished_keys_in(
+    roots: &WorkspaceRoots,
+    carriers: &crate::key_carriers::CarrierKeys,
+    dirs: &[PathBuf],
+) -> Vec<FileKey> {
+    // Attributed by the DECLARED spellings alone: the directory is gone, so there is
+    // nothing left on disk to canonicalise, and its keys were spelled the way the walk
+    // reached it.
+    //
+    // Two kinds of key go with a directory, and attribution alone finds only the first.
+    // It answers "which root owns this file", and a root owns no file at its own path,
+    // so a directory that IS a root — an extension deleted whole, a configuration that
+    // is the workspace — attributes to nothing at all. Its keys are its root's.
+    let mut prefixes: Vec<FileKey> = Vec::new();
+    let mut swallowed_roots: HashSet<String> = HashSet::new();
+    for dir in dirs {
+        let walked = if dir.is_absolute() {
+            dir.clone()
+        } else {
+            roots.configuration().unwrap_or_else(|| roots.workspace()).join(dir)
+        };
+        // Both spellings, for the same reason point removal canonicalises: a root
+        // declared through a link owns the files physically under its target, and the
+        // declared path alone would hand the subtree to the enclosing alias root —
+        // whose keys are not the ones in the store.
+        let canonical = crate::workspace_roots::canonical_spelling(&walked);
+        prefixes.extend(roots.root_of_declared(&walked));
+        prefixes.extend(roots.root_of(&walked, &canonical));
+        swallowed_roots.extend(
+            roots
+                .entries()
+                .filter(|(_, declared)| {
+                    declared.starts_with(&walked) || declared.starts_with(&canonical)
+                })
+                .map(|(id, _)| id.to_owned()),
+        );
+    }
+    if prefixes.is_empty() && swallowed_roots.is_empty() {
+        return Vec::new();
+    }
+    carriers
+        .all_keys()
+        .into_iter()
+        .filter(|key| {
+            swallowed_roots.contains(&key.root_id)
+                || prefixes.iter().any(|prefix| key.is_under(prefix))
+        })
+        .filter(|key| roots.resolve(key).is_some_and(|path| proven_absent(&path)))
+        .collect()
+}
+
 /// What a batch removal did: the count each caller reports, and the first fault, kept so a
 /// batch can finish every independent key and still fail as a whole.
 #[derive(Default)]
@@ -4839,6 +5074,12 @@ mod walk_ownership {
     #[test]
     fn the_engine_does_not_carry_its_own_tree_walk() {
         let source = include_str!("engine.rs");
+        // A CRLF checkout (core.autocrlf on Windows, no .gitattributes pinning LF) gives this
+        // file "\r\n" endings, and a needle anchored on "\n" would then match nothing — the
+        // gate would fail on the line endings rather than on the code, in the very CI step that
+        // runs it by name. Normalised first, so the gate is about the source and not the
+        // checkout.
+        let source = &source.replace("\r\n", "\n");
         // Test code walks legitimately (a stand has to build and probe trees), so the ban
         // covers production only. The cut is asserted below: a marker that stopped matching
         // would shrink the scanned region to nothing and quietly pass everything.
@@ -4858,6 +5099,29 @@ mod walk_ownership {
 }
 
 #[cfg(test)]
+mod retry_signal_ownership {
+    use super::OverlayRetrySignals;
+
+    /// Dirty marks belong to the point path and its own owner. A mark alone is no work for the
+    /// embedding driver, whose pass is a whole plan: counting marks as its work would run one
+    /// per edit and race the point path for the same keys.
+    #[test]
+    fn marks_alone_demand_no_embedding_pass() {
+        let clean = OverlayRetrySignals {
+            initialized: true,
+            needs_full_rescan: false,
+            pending_dirty_paths: 0,
+            unembedded_entries: 0,
+            unread_keys: 0,
+        };
+        let marked = OverlayRetrySignals { pending_dirty_paths: 3, ..clean };
+        assert!(!marked.demands_a_pass(), "a dirty mark started a whole embedding pass");
+        assert!(OverlayRetrySignals { unembedded_entries: 1, ..clean }.demands_a_pass());
+        assert!(OverlayRetrySignals { initialized: false, ..clean }.demands_a_pass());
+    }
+}
+
+#[cfg(test)]
 mod index_progress_ownership {
     /// `IndexProgress::active` is a process-lifetime signal, not just a status line: the MCP
     /// broker holds a backend alive while it is raised. A pass that raises it by hand leaks
@@ -4870,6 +5134,12 @@ mod index_progress_ownership {
     #[test]
     fn only_the_guard_raises_the_active_flag() {
         let source = include_str!("engine.rs");
+        // A CRLF checkout (core.autocrlf on Windows, no .gitattributes pinning LF) gives this
+        // file "\r\n" endings, and a needle anchored on "\n" would then match nothing — the
+        // gate would fail on the line endings rather than on the code, in the very CI step that
+        // runs it by name. Normalised first, so the gate is about the source and not the
+        // checkout.
+        let source = &source.replace("\r\n", "\n");
         // Test code may drive the flag directly, so the ban covers production only. The cut is
         // asserted by COUNTING the marker, not by checking what the split returned: `split`
         // always yields at least one piece, so a renamed or moved marker would silently hand
@@ -4887,11 +5157,55 @@ mod index_progress_ownership {
             1,
             "raise IndexProgress::active through begin_pass, so every exit lowers it again"
         );
+        // And that one raise is `begin_pass`. A pause resumes by restoring the flag to what a
+        // LIVE pass says it should be, never by storing `true`: a pause outliving its pass
+        // would otherwise raise a flag `ActivePass` had already lowered, and nothing would ever
+        // lower it again.
+        let begin = production.find("fn begin_pass(").expect("begin_pass");
+        let body = &production[begin + "fn begin_pass(".len()..];
+        let next_fn =
+            body.find("\n    fn ").or_else(|| body.find("\n    pub fn ")).unwrap_or(body.len());
+        assert!(
+            body[..next_fn].contains(&raised_by_hand),
+            "the only unconditional raise belongs to begin_pass, and it is not there",
+        );
+        let resume = ["self.0", ".active.store(self.0.passes.load"].concat();
+        assert_eq!(
+            production.matches(&resume).count(),
+            1,
+            "a pause resumes from the live pass count, not from `true` and not from a snapshot",
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// A pause is reversible, and that is all it is. Held past the end of the pass it paused —
+    /// an ordering nothing reaches today and nothing forbade either — a guard that raised the
+    /// flag unconditionally left it raised for good, pinning the resident process the flag
+    /// keeps alive.
+    #[test]
+    fn a_pause_outliving_its_pass_leaves_the_flag_down() {
+        use std::sync::atomic::Ordering;
+        let progress = std::sync::Arc::new(crate::IndexProgress::default());
+        let paused = {
+            let _active = progress.begin_pass();
+            assert!(progress.active.load(Ordering::Relaxed), "the pass is working");
+            let paused = progress.pause_pass();
+            assert!(!progress.active.load(Ordering::Relaxed), "a pause is not work");
+            paused
+        };
+        assert!(
+            !progress.active.load(Ordering::Relaxed),
+            "the pass ended, so the flag is down however the guards were dropped",
+        );
+        drop(paused);
+        assert!(
+            !progress.active.load(Ordering::Relaxed),
+            "a pause that outlived its pass raised the flag nothing will ever lower",
+        );
+    }
     use super::{
         FenceOutcome, IndexProgress, SearchEngine, CONSTRUCTOR_APPLY_ACTIVE,
         FORCE_VECTOR_REMOVE_ERROR, WORKSPACE_APPLY_BATCH_ROWS,
@@ -5000,6 +5314,29 @@ mod tests {
         assert_eq!(engine.store().overlay_fingerprint_keys().unwrap().len(), fingerprints.len());
     }
 
+    /// A local store has no baseline copy beyond its own rows, which the batch deletes: a removed
+    /// file is not hidden, and is not counted among deleted baseline files for ever.
+    #[test]
+    fn a_local_drift_removal_hides_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = SearchEngine::fts_only(&dir.path().join("search.db")).unwrap();
+        engine.set_workspace_root(dir.path().to_path_buf());
+        engine.initialize_workspace_overlay_clean().unwrap();
+        let removed = FileKey::configuration("Removed.bsl");
+        let chunks = code_chunk::Chunker::chunk("Процедура Тест()\nКонецПроцедуры");
+        engine.ingest_fused_file(&removed, b"hash", &chunks, &vec![None; chunks.len()]).unwrap();
+        assert!(!engine.serves_external_baseline);
+        let outcome = engine.apply_prepared_workspace_drift_batch(
+            &[],
+            std::slice::from_ref(&removed),
+            &[],
+            &mut || ControlFlow::Continue(()),
+        );
+        assert!(matches!(outcome, ControlFlow::Continue(Ok(_))));
+        let stats = engine.workspace_overlay_stats_read_only().unwrap().unwrap();
+        assert_eq!(stats.deleted_files, 0, "a local removal was counted as a hidden baseline file");
+    }
+
     #[test]
     fn prepared_drift_batch_rolls_back_owner_rows() {
         let dir = tempfile::tempdir().unwrap();
@@ -5027,6 +5364,39 @@ mod tests {
         assert!(!engine.store().overlay_tombstone_paths("code").unwrap().contains(&removed));
         assert!(!engine.context_dirty_paths("code").unwrap().contains(&context));
         assert!(engine.workspace_overlay_dirty_paths().unwrap().is_empty());
+    }
+
+    /// The seq a slice reports is the one its marks carry, so a consumer bounded by it clears
+    /// exactly those marks; a slice without context rows reports none.
+    #[test]
+    fn a_drift_slice_reports_the_seq_of_the_marks_it_placed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = SearchEngine::fts_only(&dir.path().join("search.db")).unwrap();
+        let context = FileKey::configuration("Context.bsl");
+        let mut checkpoint = || ControlFlow::Continue(());
+        let none = engine.apply_prepared_workspace_drift_batch(&[], &[], &[], &mut checkpoint);
+        assert!(matches!(none, ControlFlow::Continue(Ok(None))));
+        let placed = match engine.apply_prepared_workspace_drift_batch(
+            &[],
+            &[],
+            std::slice::from_ref(&context),
+            &mut checkpoint,
+        ) {
+            ControlFlow::Continue(Ok(Some(seq))) => seq,
+            other => panic!("context rows placed no seq: {other:?}"),
+        };
+        assert_eq!(placed, engine.mark_seq_handle().load(std::sync::atomic::Ordering::SeqCst));
+        assert!(engine.context_dirty_paths("code").unwrap().contains(&context));
+        struct NoContext;
+        impl crate::ports::GraphContextProvider for NoContext {
+            fn graph_context(&self, _: &str, _: &str, _: &str) -> Option<String> {
+                None
+            }
+        }
+        engine.refresh_dirty_contexts(&NoContext, placed - 1).unwrap();
+        assert!(engine.context_dirty_paths("code").unwrap().contains(&context), "cleared early");
+        engine.refresh_dirty_contexts(&NoContext, placed).unwrap();
+        assert!(!engine.context_dirty_paths("code").unwrap().contains(&context));
     }
     use tempfile::tempdir;
 
@@ -5954,6 +6324,48 @@ mod tests {
 
         let hits = engine.text_search("УдаляемаяПроцедура", 10, Some("code")).unwrap();
         assert!(hits.is_empty());
+    }
+
+    /// The debt of an overlay that has never been built is not zero, and the counts cannot say
+    /// so: they answer for marks the overlay could serve, and an uninitialized one serves none.
+    /// A reader that took the counts alone would call such an answer complete — permanently so
+    /// in a profile whose overlay is never built at all.
+    #[test]
+    fn an_uninitialized_overlay_owes_what_its_counts_cannot_say() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let file = workspace.join("CommonModule.bsl");
+        fs::write(&file, "Процедура СтараяПроцедура()\nКонецПроцедуры").unwrap();
+
+        let db_path = workspace.join("bsl-search.db");
+        let mut engine = SearchEngine::fts_only(&db_path).unwrap();
+        engine.index_directory_fts(workspace).unwrap();
+        engine.set_workspace_root(workspace);
+        engine.enable_workspace_watcher_mode();
+
+        fs::write(&file, "Процедура НоваяПроцедура()\nКонецПроцедуры").unwrap();
+        assert!(engine.mark_workspace_path_dirty(&file).unwrap());
+
+        let owed = engine.workspace_overlay_debt().unwrap();
+        assert!(!owed.initialized, "no pass has built this overlay yet");
+        assert_eq!(
+            owed.pending, 0,
+            "the count an uninitialized overlay reports is the same zero a caught-up one \
+             reports — which is why `initialized` has to be a fact of its own"
+        );
+        assert_eq!(owed.unread, 0);
+
+        engine.prime_workspace_overlay().unwrap();
+
+        let owed = engine.workspace_overlay_debt().unwrap();
+        assert!(owed.initialized, "the priming pass built the overlay");
+        assert_eq!(owed.pending, 0, "the pass answered the mark it was given");
+
+        fs::write(&file, "Процедура ТретьяПроцедура()\nКонецПроцедуры").unwrap();
+        assert!(engine.mark_workspace_path_dirty(&file).unwrap());
+        let owed = engine.workspace_overlay_debt().unwrap();
+        assert!(owed.initialized);
+        assert_eq!(owed.pending, 1, "an initialized overlay counts what it still owes");
     }
 
     #[test]
@@ -8620,14 +9032,7 @@ mod tests {
         assert!(engine.store().overlay_tombstone_paths("code").unwrap().is_empty());
 
         fs::write(&extension_file, "Процедура Исцелена()\nКонецПроцедуры").unwrap();
-        let text: Arc<str> = Arc::from(fs::read_to_string(&extension_file).unwrap());
-        let root = parser::parse(&text).syntax_node();
-        engine
-            .reindex_dirty_from_snapshots(&HashMap::from([(
-                key.clone(),
-                crate::ports::ModuleSnapshot { text, root },
-            )]))
-            .unwrap();
+        crate::point_refresh::point_refresh_for_test(&engine).expect("a dirty key to refresh");
         assert_eq!(engine.workspace_overlay_unread_count().unwrap(), 0);
         assert!(!engine.workspace_overlay_dirty_paths().unwrap().contains(&key));
         assert_eq!(engine.text_search("Исцелена", 10, Some("code")).unwrap().len(), 1);
@@ -9237,16 +9642,8 @@ mod tests {
         // touch: it only adds an extension root.
         let settled = configuration.join("Улаженный.bsl");
         fs::write(&settled, "Процедура Улажена()\nКонецПроцедуры\n").unwrap();
-        let settled_key = FileKey::configuration("Улаженный.bsl");
         assert!(engine.mark_workspace_path_dirty(&settled).unwrap());
-        let text: Arc<str> = Arc::from(fs::read_to_string(&settled).unwrap());
-        let root = parser::parse(&text).syntax_node();
-        engine
-            .reindex_dirty_from_snapshots(&HashMap::from([(
-                settled_key.clone(),
-                crate::ports::ModuleSnapshot { text, root },
-            )]))
-            .unwrap();
+        crate::point_refresh::point_refresh_for_test(&engine).expect("a dirty key to refresh");
         assert_eq!(
             engine.text_search("Улажена", 10, Some("code")).unwrap().len(),
             1,

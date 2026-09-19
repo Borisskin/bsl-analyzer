@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
-type SharedEngine = Arc<Mutex<Option<SearchEngine>>>;
+type SharedEngine = crate::state::SharedSearchEngine;
 type SearchCall = Box<
     dyn Fn(&SharedEngine, &CancellationToken) -> Result<CallToolResult, SearchFailure>
         + Send
@@ -36,7 +36,7 @@ const CANCEL_BOUND: Duration = Duration::from_millis(500);
 
 fn fts_engine(dir: &TempDir) -> SharedEngine {
     let engine = SearchEngine::fts_only(&dir.path().join("search.db")).unwrap();
-    Arc::new(Mutex::new(Some(engine)))
+    crate::state::shared_engine(Some(engine))
 }
 
 /// An engine with an embedder pointed at `base_url`, so a semantic query really embeds.
@@ -52,7 +52,7 @@ fn semantic_engine(dir: &TempDir, base_url: String) -> SharedEngine {
         ..SearchConfig::default()
     };
     let engine = SearchEngine::new(&dir.path().join("search.db"), config).unwrap();
-    Arc::new(Mutex::new(Some(engine)))
+    crate::state::shared_engine(Some(engine))
 }
 
 fn ready_runtime() -> Arc<Mutex<SemanticRuntimeStatus>> {
@@ -91,6 +91,7 @@ fn actions() -> Vec<(&'static str, SearchCall)> {
                     "Процедура",
                     10,
                     usize::MAX,
+                    super::WorkspaceFacts::default(),
                 )
             }),
         ),

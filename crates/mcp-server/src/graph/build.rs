@@ -38,7 +38,7 @@ pub(super) enum LoadFailureReason {
     OperationError,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct LoadFailure {
     pub(super) reason: LoadFailureReason,
     pub(super) message: String,
@@ -49,8 +49,12 @@ impl LoadFailure {
         Self { reason, message: message.into() }
     }
 
-    fn operation(error: impl std::fmt::Display) -> Self {
+    pub(super) fn operation(error: impl std::fmt::Display) -> Self {
         Self::new(LoadFailureReason::OperationError, error.to_string())
+    }
+
+    pub(super) fn refused(message: impl Into<String>) -> Self {
+        Self::new(LoadFailureReason::TransientRefusal, message)
     }
 }
 
@@ -119,17 +123,46 @@ thread_local! {
 }
 
 impl GraphState {
+    /// The fused cold build, and the report of its own outcome.
+    ///
+    /// Reported HERE, while the ticket this build was admitted on is still carried. The grant
+    /// leaves the slot the moment the build takes it, so a failure recorded after the carry has
+    /// been dropped finds an empty slot and names the primary lane by default — which turned a
+    /// build only the marks financed into a primary failure with a retry budget nothing bought.
     pub(super) fn run_fused_cold_build(
         &self,
         engine: &mut SearchEngine,
         source_path: &Path,
-        build_start_seq: i64,
+        observed_through: u64,
+    ) -> Result<(), LoadFailure> {
+        let ticket = self.take_claimed_ticket();
+        // Carried from here to every way this build can end, its outcome included.
+        let _carried = self.carry_ticket(ticket);
+        let outcome = self.fused_cold_build(engine, source_path, observed_through, ticket);
+        if let Err(failure) = &outcome {
+            self.record_load_failure(false, failure.clone());
+        }
+        outcome
+    }
+
+    fn fused_cold_build(
+        &self,
+        engine: &mut SearchEngine,
+        source_path: &Path,
+        observed_through: u64,
+        ticket: Option<super::debt::BuildTicket>,
     ) -> Result<(), LoadFailure> {
         let Some(workspace_root) = self.workspace_root.clone() else {
             return Err(LoadFailure::operation("fused build on a non-workspace graph"));
         };
         let generation =
             lock_recover(&self.inner).published.as_ref().map(|p| p.generation).unwrap_or(0) + 1;
+        // The mandate the external claim fixed. Without it this publication discharged
+        // nothing: a forced reload recorded before the boot took the slot stayed open, and the
+        // drive that follows the publication started a second forced build for work this one
+        // had already done.
+        let observed_through = ticket.map_or(observed_through, |ticket| ticket.scan_cutoff);
+        let forced_through = ticket.and_then(|ticket| ticket.forced_through);
 
         let source_path = source_path.to_path_buf();
         let mut sink = FusedChunkWriter::new(engine, source_path, self.lease.clone());
@@ -144,6 +177,7 @@ impl GraphState {
         if built.force_stale {
             tracing::warn!("fused graph build straddled a disk write; snapshot marked stale");
         }
+        let recovery_through = ticket.map(|ticket| ticket.recovery_cutoff);
         install_failure(self.install_prepared_snapshot(
             built.prepared,
             Published {
@@ -153,16 +187,20 @@ impl GraphState {
                 reload: ReloadState::Idle,
                 force_stale: built.force_stale,
                 search_roots: built.search_roots.clone(),
+                observed_through: Some(observed_through),
             },
             GraphStatus::Ready { files: built.files },
-            // The fused build runs at boot, ahead of any forced-reload request.
-            None,
+            // Whatever its ticket was admitted to answer. A fused build that ran forced
+            // discharges the demand that made it forced, exactly like any other.
+            forced_through,
+            recovery_through,
+            built.recovery,
         ))?;
         *lock_recover(&self.scan) = None;
         self.ensure_hub_roots(&built.scan_roots, built.fp_pre.topology);
         // The fused sink just wrote every indexed document's context from THIS
         // build — nothing persisted predates it, so no whole-collection re-render.
-        self.notify_published(build_start_seq, false);
+        self.notify_published(false);
         Ok(())
     }
 
@@ -214,21 +252,40 @@ impl GraphState {
         let generation =
             lock_recover(&self.inner).published.as_ref().map(|p| p.generation).unwrap_or(0) + 1;
 
-        // Capture the mark-seq at build start (before any disk read below): the post-publish
-        // refresh clears only marks at or below it — drifts this build already reflects. A
-        // drift stamped after this point carries a higher seq, is left for a later build, and
-        // is guaranteed one by the pending-nudge machinery (every xml mark also nudges).
-        let build_start_seq = self.current_mark_seq();
-        let project_reload_epoch = self.project_reload_epoch();
-        let force_project_reload = project_reload_epoch
-            > self.completed_project_reload_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        // The barrier a test uses to put a delivery in the window between the accepted claim
+        // and the pre-scan below.
+        #[cfg(test)]
+        if let Some(hook) = self.post_claim_hook.clone() {
+            hook(self);
+        }
+
+        // The mandate, as it was fixed at the admission. NOT re-derived here: a builder that
+        // reads the current debts reconstructs a mandate nobody granted it — the facts on the
+        // table now include everything delivered since the claim, and publishing a proof over
+        // those retires credits this build never answered.
+        //
+        // A build with no ticket is one no admission point granted (a direct call in a test,
+        // or the boot's own synchronous path); it falls back to reading the position now,
+        // which is exactly what it was before tickets existed.
+        // Every build carries one, and there is no path that reads the debts instead. A
+        // caller that reached here without going through an admission point — the boot's own
+        // synchronous entry, a test driving the loader directly — gets one minted here, ONCE,
+        // before any disk is read. What must never exist is a later live re-read: that is the
+        // whole defect the ticket removes.
+        let ticket =
+            self.take_claimed_ticket().unwrap_or_else(|| self.mint_direct_ticket(is_reload));
+        let _carried = self.carry_ticket(Some(ticket));
+        let observed_through = ticket.scan_cutoff;
+        let forced_through = ticket.forced_through;
+        let recovery_through = Some(ticket.recovery_cutoff);
+        let force_project_reload = ticket.forced;
 
         // On the initial load, reuse a cached build from a previous process run if it
         // still matches the workspace — turning a multi-minute rebuild into a stat
         // walk plus an open. A reload is skipped here: it only fires once drift has
         // been detected, so the on-disk file is known stale and must be rebuilt.
         if !force_project_reload && !is_reload {
-            match self.try_publish_cached(&workspace_root, build_start_seq) {
+            match self.try_publish_cached(&workspace_root, observed_through) {
                 PublishAttemptOutcome::Published => return,
                 PublishAttemptOutcome::FallBack => {}
                 PublishAttemptOutcome::Refused(failure) => {
@@ -258,7 +315,7 @@ impl GraphState {
         // those modules instead of the whole config. On any ineligibility or failure
         // it returns false and we fall through to a full rebuild.
         if !force_project_reload && is_reload {
-            match self.try_incremental_reload(&workspace_root, generation, build_start_seq) {
+            match self.try_incremental_reload(&workspace_root, generation, observed_through) {
                 PublishAttemptOutcome::Published => return,
                 PublishAttemptOutcome::FallBack => {}
                 PublishAttemptOutcome::Refused(failure) => {
@@ -282,6 +339,7 @@ impl GraphState {
                     scan_roots,
                     search_roots,
                     prepared,
+                    recovery,
                 } = built;
                 if force_stale {
                     tracing::warn!(
@@ -317,12 +375,15 @@ impl GraphState {
                         reload: ReloadState::Idle,
                         force_stale,
                         search_roots: search_roots.clone(),
+                        observed_through: Some(observed_through),
                     },
                     GraphStatus::Ready { files },
-                    // The only path that runs under a forced reload. The epoch was
-                    // captured before the build, so a request arriving mid-build stays
-                    // outstanding and claims its own follow-up reload.
-                    Some(project_reload_epoch),
+                    // The only path that runs under a forced reload. The fact was captured
+                    // before the build, so a request arriving mid-build names a later one and
+                    // stays outstanding.
+                    forced_through,
+                    recovery_through,
+                    recovery,
                 )) {
                     self.record_load_failure(is_reload, error);
                     return;
@@ -332,7 +393,7 @@ impl GraphState {
                     hook();
                 }
                 self.ensure_hub_roots(&scan_roots, fp_pre.topology);
-                self.notify_published(build_start_seq, topology_changed);
+                self.notify_published(topology_changed);
                 tracing::info!(files, generation, is_reload, "graph database build complete");
             }
             Ok(Err(e)) => {
@@ -356,16 +417,32 @@ impl GraphState {
     /// rebuild. Patches a copy of the published file and atomically renames it in,
     /// then publishes `generation`. Structural ineligibility falls back to a full rebuild;
     /// an ownership refusal retains its classification for the load lifecycle.
+    /// What the point-patch path did and why, for a test that has to know WHICH branch ran.
+    ///
+    /// Observation only: it records the decision the production gates already made, and no
+    /// gate consults it. A test asserting a point rewrite must be able to tell a patch from a
+    /// full rebuild that quietly replaced it, or it is asserting about the wrong path.
+    #[cfg(test)]
+    fn note_incremental(&self, outcome: &'static str) -> PublishAttemptOutcome {
+        lock_recover(&self.incremental_decisions).push(outcome);
+        PublishAttemptOutcome::FallBack
+    }
+
+    #[cfg(not(test))]
+    fn note_incremental(&self, _outcome: &'static str) -> PublishAttemptOutcome {
+        PublishAttemptOutcome::FallBack
+    }
+
     fn try_incremental_reload(
         &self,
         workspace_root: &Path,
         generation: u64,
-        build_start_seq: i64,
+        observed_through: u64,
     ) -> PublishAttemptOutcome {
         let db_path = self.graph_db_path().expect("workspace graph has cache layout");
         let stored_fp = read_stored_fingerprints(&db_path);
         if stored_fp.is_empty() {
-            return PublishAttemptOutcome::FallBack; // older build → full rebuild
+            return self.note_incremental("no stored fingerprints"); // older build → full rebuild
         }
         // ONE project snapshot and ONE scanned universe serve the eligibility diff,
         // the profile recompute, the pre-fingerprint and the patch, so neither a
@@ -378,7 +455,7 @@ impl GraphState {
         match GraphDb::open(&db_path).and_then(|g| g.freshness_token()) {
             Ok((_, stored_token, _))
                 if stored_token.topology == super::scan::topology_u64(&project.configs) => {}
-            _ => return PublishAttemptOutcome::FallBack,
+            _ => return self.note_incremental("topology moved"),
         }
         let pre = crate::graph::universe::ScannedUniverse::scan_excluding(
             &project.scan_roots,
@@ -389,7 +466,7 @@ impl GraphState {
         // stats at all — the diff cannot see incompleteness, only the verdict can.
         if !pre.clean() {
             tracing::info!("incremental reload: incomplete workspace scan; full rebuild");
-            return PublishAttemptOutcome::FallBack;
+            return self.note_incremental("incomplete scan");
         }
         let diff = classify_changes(&stored_fp, &pre.stats);
 
@@ -400,7 +477,7 @@ impl GraphState {
             || !diff.removed.is_empty()
             || diff.touches_metadata()
         {
-            return PublishAttemptOutcome::FallBack;
+            return self.note_incremental("not a body-only shape");
         }
         let modified_paths: Vec<PathBuf> = diff.modified.iter().map(PathBuf::from).collect();
 
@@ -412,7 +489,7 @@ impl GraphState {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!("incremental reload: profile recompute failed: {e}");
-                    return PublishAttemptOutcome::FallBack;
+                    return self.note_incremental("profile recompute failed");
                 }
             };
         let stored_sig = read_stored_sig_hashes(&db_path);
@@ -420,12 +497,14 @@ impl GraphState {
         for p in &modified_paths {
             let key = p.to_string_lossy().into_owned();
             let Some(profile) = profiles.get(&key) else {
-                return PublishAttemptOutcome::FallBack;
+                return self.note_incremental("no recomputed profile");
             };
             match stored_sig.get(&key) {
                 Some(Some(stored)) if *stored == profile.sig_hash => {} // body-only
                 Some(Some(_)) => sig_changed.push((key, profile)),      // signature changed
-                _ => return PublishAttemptOutcome::FallBack,
+                // A module the last full build could not READ has no stored signature, so a
+                // modification to it can never be a body-only patch.
+                _ => return self.note_incremental("no stored signature"),
             }
         }
 
@@ -448,11 +527,11 @@ impl GraphState {
                     tracing::info!(
                         "incremental reload: signature change not caller-delta-safe; full rebuild"
                     );
-                    return PublishAttemptOutcome::FallBack;
+                    return self.note_incremental("caller delta not safe");
                 }
                 Err(e) => {
                     tracing::warn!("incremental reload: caller-delta plan failed: {e}");
-                    return PublishAttemptOutcome::FallBack;
+                    return self.note_incremental("caller delta failed");
                 }
             }
             // If the caller fan-out approaches the whole config, a full rebuild (no
@@ -466,7 +545,7 @@ impl GraphState {
                     modules = module_total,
                     "incremental reload: caller-delta too broad; full rebuild"
                 );
-                return PublishAttemptOutcome::FallBack;
+                return self.note_incremental("caller delta too broad");
             }
         }
 
@@ -475,6 +554,12 @@ impl GraphState {
         // pre-scan marks the snapshot stale.
         let fp_pre = super::scan::fingerprint_of(&pre.stats, &project.configs);
         let tmp_path = graph_build_path(&db_path);
+        // The same guard the full build carries. The explicit removals below cover the two
+        // outcomes this function names, and `catch_unwind` turns an unwind into one of them —
+        // but each of those removals can itself fail, and the name is unique per build, so
+        // nothing later reuses or clears it. A workspace-sized file left in the cache for good
+        // is too cheap to prevent to leave resting on which exits somebody remembered.
+        let _tmp_cleanup = TempBuildFile(tmp_path.clone());
         let built_at = chrono::Utc::now().to_rfc3339();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let summary = crate::graph_db::update_graph_database_bodies(
@@ -516,11 +601,22 @@ impl GraphState {
             let prepared = self
                 .prepare_snapshot_pool(generation, fp_pre, force_stale)
                 .map_err(prepare_failure)?;
-            Ok::<_, LoadFailure>((summary.modules, fp_pre, force_stale, prepared))
+            // A point patch re-projected exactly what it was given. It proves nothing about
+            // absence and nothing about the rest of the tree: it never looked there.
+            let rewritten_keys: Vec<String> =
+                changed_paths.iter().map(|path| path.to_string_lossy().into_owned()).collect();
+            let rewritten: std::collections::HashSet<&str> =
+                rewritten_keys.iter().map(String::as_str).collect();
+            let recovery = self.recovery_proof(
+                generation,
+                prepared.declared_unread(),
+                crate::graph::snapshot::RecoveryCoverage::Patched { rewritten: &rewritten },
+            );
+            Ok::<_, LoadFailure>((summary.modules, fp_pre, force_stale, prepared, recovery))
         }));
 
         match outcome {
-            Ok(Ok((files, fp, force_stale, prepared))) => {
+            Ok(Ok((files, fp, force_stale, prepared, recovery))) => {
                 if force_stale {
                     tracing::warn!(
                         "incremental reload straddled a disk write; marking snapshot stale"
@@ -536,10 +632,14 @@ impl GraphState {
                         reload: ReloadState::Idle,
                         force_stale,
                         search_roots: project.search_roots.clone(),
+                        observed_through: Some(observed_through),
                     },
                     GraphStatus::Ready { files },
-                    // An incremental reload never runs under a forced reload.
+                    // An incremental reload never runs under a forced reload, so it answers
+                    // no recovery cutoff either: what it proves it proves by coverage.
                     None,
+                    None,
+                    recovery,
                 )) {
                     return match error.reason {
                         LoadFailureReason::TransientRefusal
@@ -548,8 +648,10 @@ impl GraphState {
                         LoadFailureReason::OperationError => PublishAttemptOutcome::FallBack,
                     };
                 }
+                #[cfg(test)]
+                lock_recover(&self.incremental_decisions).push("published");
                 // The body-only gate proved the stored topology unchanged.
-                self.notify_published(build_start_seq, false);
+                self.notify_published(false);
                 tracing::info!(
                     files,
                     generation,
@@ -581,7 +683,7 @@ impl GraphState {
     pub(super) fn try_publish_cached(
         &self,
         workspace_root: &Path,
-        build_start_seq: i64,
+        observed_through: u64,
     ) -> PublishAttemptOutcome {
         if self.is_superseded() {
             return PublishAttemptOutcome::Refused(LoadFailure::new(
@@ -616,7 +718,18 @@ impl GraphState {
                 return PublishAttemptOutcome::Refused(error);
             }
         };
+        // The grant this path may give back, read while the graph still reads as loading and no
+        // other claim is legal: still in the slot on the boot's path, and nothing at all on the
+        // lazy one, whose builder took its ticket and carries it.
+        let own_claim = lock_recover(&self.inner).claimed.map(|ticket| ticket.claim);
 
+        // A cache served as it stands proves nothing fresh: it read nothing, walked nothing
+        // for this publication, and may retire no obligation.
+        let recovery = self.recovery_proof(
+            revision,
+            prepared.declared_unread(),
+            crate::graph::snapshot::RecoveryCoverage::None,
+        );
         *lock_recover(&self.scan) = None;
         if let Err(error) = install_failure(self.install_prepared_snapshot(
             prepared,
@@ -627,17 +740,25 @@ impl GraphState {
                 reload: ReloadState::Idle,
                 force_stale: false,
                 search_roots: project.search_roots.clone(),
+                observed_through: Some(observed_through),
             },
             GraphStatus::Ready { files },
             // Serving a cached build discharges no forced reload: it publishes the
             // state already on disk, not a rebuild of the newly declared configuration.
             None,
+            None,
+            recovery,
         )) {
             return PublishAttemptOutcome::Refused(error);
         }
+        // The claim this path was granted has done its work: the cache is published and no
+        // builder will take the ticket. Left in the slot it reads as a build in flight for the
+        // rest of the generation, and every decision — retry, comparison, and the recovery
+        // probe this publication's own unread metadata asks for — returns early on it.
+        self.release_unused_claim(own_claim);
         // Exact fingerprint match (files AND topology): the persisted search
         // contexts were rendered against this same workspace state.
-        self.notify_published(build_start_seq, false);
+        self.notify_published(false);
         tracing::info!(files, revision, "reused cached graph database (workspace unchanged)");
         PublishAttemptOutcome::Published
     }
@@ -647,10 +768,10 @@ impl GraphState {
     /// and pre-claim the reload slot in the SAME lock hold, then let the normal reload
     /// lifecycle catch up (incrementally when eligible, else a full rebuild). The
     /// atomic Ready+Running publish keeps every existing guard honest:
-    /// `freshness()`/`claim_reload_slot` stay single-flight against the pre-claimed
-    /// slot, and `consume_leftover_marks` sees `drift_pending` and defers the leftover
-    /// consume to the catch-up publish — unlike a fingerprint-clean cached publish,
-    /// THIS snapshot does not reflect the leftover marks' causes. A snapshot from a
+    /// `freshness()`/`try_claim_reload` stay single-flight against the pre-claimed
+    /// slot, and the publication carries no observation, so no mark is consumed against
+    /// it — unlike a fingerprint-clean cached publish, THIS snapshot does not reflect the
+    /// leftover marks' causes. A snapshot from a
     /// straddled build (`force_stale`) was never coherent and is not served. No
     /// `notify_published`: the publish hook must only run against a build that
     /// reflects current disk.
@@ -691,7 +812,8 @@ impl GraphState {
                 "cached graph database was built for another extension topology; \
                  rebuilding instead of serving it stale, and re-rendering search contexts"
             );
-            self.pending_topology_refresh.store(true, std::sync::atomic::Ordering::SeqCst);
+            super::state::lock_recover(&self.debt)
+                .record_hook(super::debt::HookDebt { topology: true, roots: false });
             return PublishAttemptOutcome::FallBack;
         }
         let files = graph.files().unwrap_or(0);
@@ -705,6 +827,14 @@ impl GraphState {
             }
         };
 
+        // A stale cache, adopted on purpose while the catch-up is already claimed. It read
+        // nothing and walked nothing for this publication, so it retires no obligation — and
+        // its own unread metadata is still what it declares.
+        let recovery = self.recovery_proof(
+            revision,
+            prepared.declared_unread(),
+            crate::graph::snapshot::RecoveryCoverage::None,
+        );
         if let Err(error) = install_failure(self.install_prepared_snapshot(
             prepared,
             Published {
@@ -715,11 +845,14 @@ impl GraphState {
                 reload: ReloadState::Running,
                 force_stale: false,
                 search_roots: None,
+                observed_through: None,
             },
             GraphStatus::Ready { files },
             // A placeholder publication; the catch-up build it spawns carries whatever
             // obligation is outstanding.
             None,
+            None,
+            recovery,
         )) {
             return PublishAttemptOutcome::Refused(error);
         }
@@ -728,7 +861,15 @@ impl GraphState {
             revision,
             "published stale cached graph database; catch-up reload starting"
         );
+        // The catch-up owns the slot this publication pre-claimed, so it needs a mandate of
+        // its own: without one the loader falls back to reading whatever the debts say when it
+        // gets there, which is the live re-read the ticket exists to remove.
+        self.issue_handover_ticket();
         self.spawn_reload();
+        #[cfg(test)]
+        if let Some(hook) = self.handover_hook.clone() {
+            hook(self);
+        }
         PublishAttemptOutcome::Published
     }
 
@@ -745,31 +886,33 @@ impl GraphState {
     /// A transient refusal keeps its retry budget. An operation error stops that obligation,
     /// but fresh external work may start a new graph epoch; terminal lease outcomes never do.
     pub(super) fn record_load_failure(&self, is_reload: bool, failure: LoadFailure) {
-        match failure.reason {
-            LoadFailureReason::TransientRefusal | LoadFailureReason::OperationError => {
-                let mut retry = lock_recover(&self.graph_retry);
-                let window = retry.get_or_insert_with(|| {
-                    crate::state::retry_window::RetryWindow::new(
-                        crate::state::retry_window::RetryOwner::Graph,
-                    )
-                });
-                if failure.reason == LoadFailureReason::TransientRefusal {
-                    let _ = window.refused(std::time::Instant::now(), std::time::Duration::ZERO);
-                } else {
-                    window.operation_error();
-                }
-            }
+        let kind = match failure.reason {
+            LoadFailureReason::TransientRefusal => super::debt::FailureKind::Transient,
+            LoadFailureReason::OperationError => super::debt::FailureKind::Operation,
             LoadFailureReason::Superseded | LoadFailureReason::Released => {
-                *lock_recover(&self.graph_retry) = None;
+                super::debt::FailureKind::Terminal
             }
-        }
-        let mut inner = lock_recover(&self.inner);
-        if is_reload {
-            if let Some(p) = inner.published.as_mut() {
-                p.reload = ReloadState::Failed(failure.message);
+        };
+        // One debt for every way a build can end badly, and the schedule that paces its
+        // retries belongs to it. The drift that arrived WHILE the build ran needs nothing
+        // special: it is recorded against its own fact and is still owed, because no
+        // publication observed it.
+        let rearmed = self.record_admission_failure(kind, |inner| {
+            if is_reload {
+                if let Some(p) = inner.published.as_mut() {
+                    p.reload = ReloadState::Failed(failure.message);
+                }
+            } else {
+                inner.status = GraphStatus::Failed(failure.message);
             }
-        } else {
-            inner.status = GraphStatus::Failed(failure.message);
+        });
+        self.settle_mark_obligation();
+        // Started here only when a change delivered DURING this build opened a new epoch for
+        // it: nothing else will deliver that change again. An ordinary failure waits for its
+        // own schedule, and the watcher is what runs it — retrying on the failing thread would
+        // spend the whole budget in a tight loop.
+        if rearmed {
+            self.drive();
         }
     }
 }
@@ -803,6 +946,20 @@ fn build_and_publish_graph_file(
 /// The publication over an ALREADY-SCANNED universe — split from
 /// [`build_and_publish_graph_file`] so a test can mutate the tree between the
 /// pre-scan and the build and observe that the build does not see the mutation.
+/// The build's temporary database, removed on every way out of the build.
+///
+/// Each build takes a name nobody else will reuse, so anything that leaves without publishing —
+/// an operation error, or a panic unwinding out of the builder into the loader's `catch_unwind` —
+/// leaves a database the size of the workspace behind for the life of the cache directory. The
+/// published build is renamed out of this path, so removing it afterwards finds nothing.
+struct TempBuildFile(std::path::PathBuf);
+
+impl Drop for TempBuildFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 fn build_and_publish_scanned(
     workspace_root: &Path,
     project: &crate::graph::ProjectSnapshot,
@@ -814,6 +971,7 @@ fn build_and_publish_scanned(
     let fp_pre = super::scan::fingerprint_of(&pre.stats, &project.configs);
     let out_path = graph.graph_db_path().expect("workspace graph has cache layout");
     let tmp_path = graph_build_path(&out_path);
+    let _tmp_cleanup = TempBuildFile(tmp_path.clone());
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent).map_err(LoadFailure::operation)?;
     }
@@ -838,10 +996,7 @@ fn build_and_publish_scanned(
         }
     } {
         Ok(summary) => summary,
-        Err(error) => {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(LoadFailure::operation(error));
-        }
+        Err(error) => return Err(LoadFailure::operation(error)),
     };
     // The post-scan derives a FRESH project snapshot AND a fresh walk: the straddle
     // check must see the world as it is now, or a topology/root change landing
@@ -854,7 +1009,7 @@ fn build_and_publish_scanned(
     );
     let fp_post = super::scan::fingerprint_of(&post.stats, &post_project.configs);
     let force_stale = publish_force_stale(fp_pre, fp_post, pre.clean(), post.clean());
-    {
+    let stamped = (|| -> Result<(), LoadFailure> {
         let conn = rusqlite::Connection::open(&tmp_path).map_err(LoadFailure::operation)?;
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('force_stale', ?1)",
@@ -866,10 +1021,26 @@ fn build_and_publish_scanned(
             rusqlite::params![summary.modules.to_string()],
         )
         .map_err(LoadFailure::operation)?;
-    }
+        Ok(())
+    })();
+    stamped?;
     publish_or_discard(graph, &tmp_path, &out_path)?;
     let prepared =
         graph.prepare_snapshot_pool(generation, fp_pre, force_stale).map_err(prepare_failure)?;
+    // Borrowed from the walk, not cloned out of it: what the coverage needs is membership, and
+    // the universe already holds every address it listed.
+    let enumerated: std::collections::HashSet<&str> =
+        pre.stats.iter().map(|stat| stat.path.as_str()).collect();
+    let recovery = graph.recovery_proof(
+        generation,
+        prepared.declared_unread(),
+        crate::graph::snapshot::RecoveryCoverage::Walked {
+            scope: crate::graph::snapshot::recovery_scope_of(project),
+            enumerated: &enumerated,
+            complete: pre.clean(),
+            straddled: force_stale,
+        },
+    );
     Ok(PublishedBuild {
         files: summary.modules,
         fp_pre,
@@ -877,6 +1048,7 @@ fn build_and_publish_scanned(
         scan_roots: project.scan_roots.clone(),
         search_roots: project.search_roots.clone(),
         prepared,
+        recovery,
     })
 }
 
@@ -967,6 +1139,9 @@ struct PublishedBuild {
     scan_roots: Vec<PathBuf>,
     search_roots: Option<bsl_search::WorkspaceRoots>,
     prepared: PreparedSnapshotPool,
+    /// What this build proved about the recovery obligations outstanding when it was
+    /// prepared — assembled here, where the universe it walked is still in hand.
+    recovery: crate::graph::debt::RecoveryPublicationProof,
 }
 
 /// Translates the graph pass's [`ide::ChunkRow`] stream into the search store for the
@@ -1199,6 +1374,24 @@ mod module_total_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// A panic in the builder unwinds past the temp database into the loader's `catch_unwind`,
+    /// which logs and gives up. Nothing after that knows the name — each build takes a fresh
+    /// one — so the file has to be released on the way out or it stays for good.
+    #[test]
+    fn a_temp_build_file_is_removed_when_the_build_unwinds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bsl-graph.db.building.1.0");
+        std::fs::write(&path, b"a build in progress").unwrap();
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _cleanup = super::TempBuildFile(path.clone());
+            panic!("the builder panicked");
+        }));
+
+        assert!(unwound.is_err(), "the panic must still reach the caller");
+        assert!(!path.exists(), "the temp database outlived the build that owned it");
+    }
     use super::super::input::{enumerate_bsl_files, load_workspace_db, scan_roots};
     use super::super::scan::{scan_file_stats, scan_stats_over_roots, FileStat, WorkspaceDiff};
     use super::super::snapshot::fold_fingerprint_entries;
@@ -1293,6 +1486,207 @@ mod tests {
         assert!(
             !rows.iter().any(|(_, path)| path.ends_with("C.bsl")),
             "a module under no registered root is still not this index's business: {rows:?}",
+        );
+    }
+
+    /// BUD-02. A fused build reports the outcome of the admission it was granted, and the
+    /// ticket is what says which accounts paid for it.
+    ///
+    /// The ticket is TAKEN out of the slot the moment the build starts and carried for as long
+    /// as it runs. A failure recorded after that carry has been dropped finds an empty slot and
+    /// names the primary lane by default — so a build only the marks financed came back as a
+    /// primary failure and minted a retry budget nothing had bought.
+    #[test]
+    fn a_failed_fused_build_answers_for_the_accounts_that_paid() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        cache.ensure().unwrap();
+        let lease = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
+        let graph = GraphState::for_workspace_with_cache(root.to_path_buf(), cache.clone())
+            .with_lease(lease.clone());
+        let mut engine = bsl_search::SearchEngine::fts_only(&cache.search_db_path()).unwrap();
+
+        // Marks nobody consumed, and nothing else at all: the one lane that can pay here.
+        {
+            let mut debt = lock_recover(&graph.debt);
+            debt.place_marks(std::time::Instant::now(), 5, 1);
+            debt.settle_marks(std::time::Instant::now(), false);
+        }
+        assert!(graph.try_begin_external_build(), "the boot takes the claim");
+        assert_eq!(
+            graph.claimed_ticket().expect("the claim granted a mandate").sponsors,
+            super::super::debt::Sponsors { primary: false, marks: true },
+            "the stand needs an admission only the marks paid for",
+        );
+
+        // The install is refused, so the build ends the way a fenced one does.
+        graph.refused_installs.store(1, std::sync::atomic::Ordering::SeqCst);
+        let failure = graph
+            .run_fused_cold_build(&mut engine, root, 0)
+            .expect_err("a refused install ends the fused build");
+        assert!(!matches!(failure.reason, LoadFailureReason::Superseded), "{failure}");
+
+        assert!(
+            matches!(graph.status(), GraphStatus::Failed(_)),
+            "the build holding the mandate reported no outcome of its own: {:?}",
+            graph.status(),
+        );
+        assert!(
+            !lock_recover(&graph.debt).owes_failed(),
+            "the outcome of a marks-sponsored build minted a primary retry budget",
+        );
+        lease.release();
+    }
+
+    /// A claim nobody will build on is given back.
+    ///
+    /// The warm-cache path takes the external claim, publishes the database already on disk
+    /// and returns — nothing takes the ticket afterwards. Left in the slot it reads as a build
+    /// in flight for the rest of the generation: every decision returns early, so no retry, no
+    /// comparison and, above all, no recovery probe ever runs for a publication whose own
+    /// metadata says it could not read everything.
+    #[test]
+    fn a_warm_cache_publication_gives_its_claim_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        cache.ensure().unwrap();
+        let lease = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
+        let graph = GraphState::for_workspace_with_cache(root.to_path_buf(), cache.clone())
+            .with_lease(lease.clone());
+
+        // A real build first, so there is a cache to reuse.
+        graph.ensure_loading();
+        wait_ready(&graph);
+
+        // The boot of the next generation: an idle graph over that cache.
+        let next = GraphState::for_workspace_with_cache(root.to_path_buf(), cache.clone())
+            .with_lease(lease.clone());
+        assert!(next.try_begin_external_build(), "the boot takes the claim");
+        assert!(
+            matches!(next.try_publish_cached(root, 0), super::PublishAttemptOutcome::Published),
+            "the stand needs the cache to be reusable",
+        );
+
+        assert!(
+            next.claimed_ticket().is_none(),
+            "the finished cache path left its grant in the slot",
+        );
+        assert!(lock_recover(&next.inner).building.is_none(), "and nothing is carrying it either",);
+        lease.release();
+    }
+
+    /// A boot whose cached publication is refused gives its claim back with the failure.
+    ///
+    /// The boot takes the claim itself and no builder takes the ticket afterwards. The success
+    /// path gave it back; every refusal returned with it still in the slot, and the slot reads
+    /// as a build in flight — so the retry the refusal scheduled could not be started by the
+    /// request or the boot entry that exist to start it. Both cached branches: the fresh cache
+    /// and the stale one served while a catch-up runs.
+    #[test]
+    fn a_refused_boot_publication_gives_its_claim_back() {
+        refused_boot_publication_gives_its_claim_back(false);
+    }
+
+    /// [`a_refused_boot_publication_gives_its_claim_back`] on the stale cache the boot serves
+    /// while its catch-up runs.
+    #[test]
+    fn a_refused_stale_boot_publication_gives_its_claim_back() {
+        refused_boot_publication_gives_its_claim_back(true);
+    }
+
+    fn refused_boot_publication_gives_its_claim_back(stale: bool) {
+        let which = if stale { "stale cache" } else { "fresh cache" };
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let mut fingerprint = super::super::scan::workspace_fingerprint(root);
+        if stale {
+            fingerprint.files = fingerprint.files.wrapping_add(1);
+        }
+        seed_cache(root, fingerprint);
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        cache.ensure().unwrap();
+        let graph = GraphState::for_workspace(root.to_path_buf());
+        let mut engine = bsl_search::SearchEngine::fts_only(&cache.search_db_path()).unwrap();
+
+        graph.refused_installs.store(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            graph.start_workspace_graph(&mut engine, root),
+            super::super::types::FusedStartup::Standalone
+        ));
+        assert_eq!(
+            graph.refused_installs.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "{which}: the fixture needs the boot's own install to be the refused one",
+        );
+        assert!(
+            matches!(graph.status(), GraphStatus::Failed(_)),
+            "{which}: the refusal is the boot's outcome: {:?}",
+            graph.status(),
+        );
+        assert!(!graph.build_in_flight(), "{which}: the refused boot left its grant in the slot",);
+
+        assert_eq!(
+            graph.debt_standing(std::time::Instant::now()).failed,
+            Some(super::super::debt::Ripeness::Now),
+            "{which}: the fixture needs the refusal's retry due now",
+        );
+        graph.ensure_first_build();
+        wait_until(&graph, "the retry a request asked for to start", || {
+            !matches!(graph.status(), GraphStatus::Failed(_))
+        });
+        wait_ready(&graph);
+    }
+
+    /// The point-patch path records `published` for a patch that was installed, and not for one
+    /// whose install was refused.
+    ///
+    /// Each half on a workspace of its own: a refused patch has already renamed its database
+    /// into place, so the same edit is no longer a body-only change against it.
+    #[cfg(not(windows))]
+    #[test]
+    fn an_incremental_patch_is_recorded_published_only_once_installed() {
+        let body_edited = || {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().to_path_buf();
+            sample_workspace(&root);
+            let graph = GraphState::for_workspace(root.clone());
+            graph.ensure_loading();
+            wait_ready(&graph);
+            write(
+                &root,
+                "CommonModules/Сервер/Ext/Module.bsl",
+                "&НаСервере\nФункция Считать() Экспорт\nЗначение = 1;\nВозврат Значение;\nКонецФункции",
+            );
+            lock_recover(&graph.incremental_decisions).clear();
+            (dir, root, graph)
+        };
+
+        let (_refused_dir, root, graph) = body_edited();
+        graph.refused_installs.store(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            graph.try_incremental_reload(&root, 2, 0),
+            PublishAttemptOutcome::Refused(_)
+        ));
+        let refused = lock_recover(&graph.incremental_decisions).clone();
+        assert!(
+            !refused.contains(&"published"),
+            "a patch whose install was refused was recorded as published: {refused:?}",
+        );
+
+        let (_installed_dir, root, graph) = body_edited();
+        assert!(matches!(
+            graph.try_incremental_reload(&root, 2, 0),
+            PublishAttemptOutcome::Published
+        ));
+        let installed = lock_recover(&graph.incremental_decisions).clone();
+        assert!(
+            installed.contains(&"published"),
+            "an installed patch was not recorded as published: {installed:?}",
         );
     }
 
@@ -1396,6 +1790,40 @@ mod tests {
         assert_eq!(fs::read(&other_temp).unwrap(), b"other-build-in-progress");
     }
 
+    /// A drift that arrives while a build is running is recorded as a pending nudge and never
+    /// delivered again — the hub batch that carried it is already acknowledged. If the build
+    /// then fails, that signal is the only thing standing between the graph and a permanent
+    /// `Failed`, and it must be spent exactly once, not re-armed for ever.
+    #[test]
+    fn fresh_nudge_during_failed_build_rearms_graph_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let graph = GraphState::for_workspace(root.to_path_buf());
+        lock_recover(&graph.inner).status = GraphStatus::Loading;
+        graph.record_change_quietly(graph.observation());
+
+        graph.record_load_failure(false, LoadFailure::operation("forced"));
+
+        assert!(
+            !matches!(graph.status(), GraphStatus::Failed(_)),
+            "the change recorded during the build was dropped",
+        );
+
+        // The same change must not open a second epoch: spent when it was used, a drift that
+        // arrived once would otherwise re-arm the graph after every later failure.
+        lock_recover(&graph.inner).status = GraphStatus::Loading;
+        graph.record_load_failure(false, LoadFailure::operation("forced again"));
+        assert!(
+            matches!(graph.status(), GraphStatus::Failed(_)),
+            "the same signal re-armed the graph a second time",
+        );
+        assert!(
+            graph.owes_change().is_some(),
+            "the change itself is still owed: only a publication that observes it answers it",
+        );
+    }
+
     #[test]
     fn original_transient_arms_withheld_build_until_trigger() {
         let dir = tempfile::tempdir().unwrap();
@@ -1415,7 +1843,7 @@ mod tests {
 
         assert_eq!(error.reason, LoadFailureReason::TransientRefusal);
         graph.record_load_failure(false, error);
-        assert!(lock_recover(&graph.graph_retry).is_some());
+        assert!(graph.owes_failed());
         assert!(matches!(
             lease.publish_short(&mut (), |_| Ok::<_, std::convert::Infallible>(
                 "ownership returned"
@@ -1428,7 +1856,7 @@ mod tests {
         graph.ensure_loading();
         assert!(!matches!(graph.status(), GraphStatus::Failed(_)));
         wait_ready(&graph);
-        assert!(lock_recover(&graph.graph_retry).is_none());
+        assert!(!graph.owes_failed());
     }
 
     #[test]
@@ -1453,7 +1881,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(released_error.reason, LoadFailureReason::Released);
         released_graph.record_load_failure(false, released_error);
-        assert!(lock_recover(&released_graph.graph_retry).is_none());
+        assert!(!released_graph.owes_failed());
 
         let superseded_dir = tempfile::tempdir().unwrap();
         let superseded_cache =
@@ -1476,7 +1904,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(superseded_error.reason, LoadFailureReason::Superseded);
         superseded_graph.record_load_failure(false, superseded_error);
-        assert!(lock_recover(&superseded_graph.graph_retry).is_none());
+        assert!(!superseded_graph.owes_failed());
         newer.release();
     }
 
@@ -1501,10 +1929,18 @@ mod tests {
         graph.record_load_failure(false, error);
         drop(held);
 
-        assert!(lock_recover(&graph.graph_retry).is_some());
-        graph.ensure_loading();
-        assert!(matches!(graph.status(), GraphStatus::Failed(_)));
-        assert_eq!(graph.nudge_rebuild(), crate::graph::NudgeOutcome::LoadStarted);
+        assert!(graph.owes_failed());
+        graph.drive();
+        assert!(
+            matches!(graph.status(), GraphStatus::Failed(_)),
+            "an operation error must wait for fresh work rather than retry itself",
+        );
+
+        graph.nudge_rebuild();
+        assert!(
+            !matches!(graph.status(), GraphStatus::Failed(_)),
+            "fresh work did not open a new epoch for the stopped budget",
+        );
         wait_ready(&graph);
     }
 
@@ -1559,9 +1995,12 @@ mod tests {
                 reload: ReloadState::Idle,
                 force_stale: built.force_stale,
                 search_roots: built.search_roots,
+                observed_through: Some(0),
             },
             GraphStatus::Ready { files: built.files },
             None,
+            None,
+            built.recovery,
         );
         assert!(matches!(
             fresh_install,
@@ -1582,7 +2021,7 @@ mod tests {
             panic!("clean adoption must preserve the final install refusal")
         };
         clean.record_load_failure(false, failure);
-        assert!(lock_recover(&clean.graph_retry).is_some());
+        assert!(clean.owes_failed());
         assert!(clean.snapshot().is_none(), "clean adoption never becomes ready");
 
         let stale_dir = tempfile::tempdir().unwrap();
@@ -1599,7 +2038,7 @@ mod tests {
             panic!("stale adoption must preserve the final install refusal")
         };
         stale.record_load_failure(false, failure);
-        assert!(lock_recover(&stale.graph_retry).is_some());
+        assert!(stale.owes_failed());
         assert!(stale.snapshot().is_none(), "stale adoption never becomes ready");
     }
 
@@ -1646,7 +2085,7 @@ mod tests {
         graph.run_load(false);
 
         assert!(matches!(graph.status(), GraphStatus::Ready { .. }));
-        assert!(lock_recover(&graph.graph_retry).is_none());
+        assert!(!graph.owes_failed());
         assert!(graph.snapshot().is_some(), "the invalid cache fell back to a real build");
     }
 
@@ -1664,11 +2103,112 @@ mod tests {
         graph.run_load(true);
 
         assert_eq!(graph.snapshot().map(|snapshot| snapshot.generation), Some(1));
-        assert!(lock_recover(&graph.graph_retry).is_some());
+        assert!(graph.owes_failed());
         assert!(matches!(
             lock_recover(&graph.inner).published.as_ref().unwrap().reload,
             ReloadState::Failed(_)
         ));
+    }
+
+    /// A reload of a ready graph that failed is still owed: the graph says it is behind, a
+    /// nudge inside the failure's backoff starts nothing, and the watcher's alarm is armed for
+    /// when the backoff runs out.
+    #[test]
+    fn a_failed_reload_is_owed_behind_its_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        // Watched, so the verdict rests on the reload and not on nobody watching.
+        let hub = crate::change_hub::WorkspaceChangeHub::start(vec![root.to_path_buf()]);
+        assert!(hub.wait_until_watching(std::time::Duration::from_secs(5)));
+        let graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
+        graph.set_watch(super::super::watcher::WatchPhase::Running, None);
+        graph.ensure_loading();
+        wait_ready(&graph);
+        assert_eq!(graph.status_report().stale, Some(false));
+        write(
+            root,
+            "CommonModules/Сервер/Ext/Module.bsl",
+            "Функция Считать() Экспорт Возврат 2; КонецФункции",
+        );
+        // The nudge below records the hub position it reads, and a position the publication
+        // has already observed is not a change. Waited for, not assumed: under load the
+        // watcher's delivery is what arrives late, and the assertion would then be about the
+        // machine rather than about the backoff.
+        crate::graph::test_support::wait_for_hub_seq_above(&hub, graph.observation());
+        let refused =
+            || LoadFailure::new(LoadFailureReason::TransientRefusal, "the lease was busy");
+        // The second refusal in a row is the one with a real delay.
+        graph.record_load_failure(true, refused());
+        graph.record_load_failure(true, refused());
+
+        assert_eq!(
+            graph.status_report().stale,
+            Some(true),
+            "a graph whose reload failed read fresh"
+        );
+        graph.nudge_rebuild();
+        assert!(
+            graph.owes_change().is_some(),
+            "the backoff was stepped around instead of keeping the change owed",
+        );
+        assert!(matches!(
+            lock_recover(&graph.inner).published.as_ref().unwrap().reload,
+            ReloadState::Failed(_)
+        ));
+        let now = std::time::Instant::now();
+        let due = graph.wake_at(now).expect("nobody owns the failed reload");
+        assert!(
+            due > now + std::time::Duration::from_secs(10),
+            "the retry is not held off: {:?}",
+            due - now
+        );
+    }
+
+    /// A retry the owner could not start — its lease could not be confirmed just then — keeps
+    /// the failed reload owed: the graph still reads behind and the alarm stays armed.
+    #[test]
+    fn a_failed_reload_whose_retry_is_held_stays_owed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let lease = crate::workspace_lease::WorkspaceLease::claim(root);
+        let graph = GraphState::for_workspace(root.to_path_buf()).with_lease(lease.clone());
+        graph.ensure_loading();
+        wait_ready(&graph);
+        write(
+            root,
+            "CommonModules/Сервер/Ext/Module.bsl",
+            "Функция Считать() Экспорт Возврат 3; КонецФункции",
+        );
+        graph.record_load_failure(true, LoadFailure::refused("the lease was busy"));
+        // The record gone and its lock held elsewhere: the lease cannot be confirmed for now,
+        // which is not a takeover.
+        std::fs::remove_file(crate::cache::WorkspaceCacheLayout::for_workspace(root).lease_path())
+            .unwrap();
+        let held = lease.hold_file_lock_for_test();
+        graph.drive();
+        assert!(!lease.is_superseded(), "the probe took the workspace over");
+        let now = std::time::Instant::now();
+        assert!(graph.wake_at(now).is_some(), "the held retry dropped the debt");
+        drop(held);
+    }
+
+    /// A first build refused by the lease is retried by its owner, like a reload is: the
+    /// failure itself arms the alarm, with no drift needed to have arrived meanwhile.
+    #[test]
+    fn a_refused_first_build_is_owed_a_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let graph = GraphState::for_workspace(root.to_path_buf());
+        graph.record_load_failure(false, LoadFailure::refused("the lease was busy"));
+        assert!(matches!(graph.status(), GraphStatus::Failed(_)));
+        assert_eq!(
+            graph.debt_standing(std::time::Instant::now()).failed,
+            Some(crate::graph::debt::Ripeness::Now),
+            "a refused first build has no owner for its retry",
+        );
     }
 
     /// End-to-end through `GraphState`: a first use builds the SQLite graph off
@@ -2153,7 +2693,7 @@ mod tests {
         };
         assert_eq!(failure.reason, LoadFailureReason::TransientRefusal);
         graph.record_load_failure(true, failure);
-        assert!(lock_recover(&graph.graph_retry).is_some());
+        assert!(graph.owes_failed());
     }
 
     /// A cached build whose fingerprint no longer matches the workspace (it moved
@@ -3730,7 +4270,7 @@ mod tests {
             "a build made under another topology is not served, however stale-tolerant we are",
         );
         assert!(
-            graph.pending_topology_refresh.load(std::sync::atomic::Ordering::SeqCst),
+            graph.hook_debt().topology,
             "and the whole-collection context re-render is still requested",
         );
     }

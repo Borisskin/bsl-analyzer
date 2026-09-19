@@ -23,11 +23,11 @@ static BUDGET_EXHAUSTED_HOOK: Mutex<Option<Box<dyn Fn() + Send>>> = Mutex::new(N
 /// The driver's own tick: how often it re-checks the condition with no kick arriving. A
 /// safety net for a signal that went quiet (a notification lost, a backoff that expired
 /// with no drift), not the primary wake-up — kicks are.
-const TICK: Duration = Duration::from_secs(30);
+pub(super) const TICK: Duration = Duration::from_secs(30);
 
 /// Backoff schedule for consecutive not-clean outcomes: exponential from one tick, capped.
 /// Pure so the schedule is testable apart from the thread.
-pub(super) fn retry_delay(streak: u32) -> Duration {
+pub(crate) fn retry_delay(streak: u32) -> Duration {
     const CAP: Duration = Duration::from_secs(30 * 60);
     if streak == 0 {
         return Duration::ZERO;
@@ -54,6 +54,9 @@ struct RetryState {
     /// Terminal: nothing this process can retry into existence (no embedder/root, terminal
     /// engine init failure, or an observed live foreign workspace owner).
     disarmed: bool,
+    /// Asked to look at the signals again (see [`OverlayRetry::coalesce`]). Read by an idle
+    /// worker before it sleeps: a wake that came while it was deciding is not lost.
+    look_again: bool,
 }
 
 pub(crate) struct OverlayRetry {
@@ -64,14 +67,21 @@ pub(crate) struct OverlayRetry {
     publish_retry_budget: Duration,
     state: Mutex<RetryState>,
     wake: Condvar,
-    stop: AtomicBool,
+    /// The daemon's stop, not one of its own: a driver with a private flag is one more thing
+    /// a shutdown has to remember to raise, and one more order in which it can be wrong.
+    stop: super::OwnerStop,
     /// Whether a pass is running right now. The backend's lifetime is read off this rather
     /// than off the shared status slot: the status has a second writer (the embed pass), and
     /// its `Ready` at its own finish would otherwise erase this pass from view mid-sync.
     /// Raised and lowered by the pass itself, so no exit can leave it set.
     pass_active: AtomicBool,
+    #[cfg(test)]
+    passes_started: std::sync::atomic::AtomicUsize,
     /// Completed pass count — observability and the single-flight proof in tests.
     passes: AtomicUsize,
+    /// Runs once, the next time the worker is about to idle with nothing due, and is spent.
+    #[cfg(test)]
+    before_idle_wait: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// Marks a pass as running for as long as it lives.
@@ -103,9 +113,17 @@ impl Drop for SyncingVerdict {
         let mut status =
             self.0.semantic_runtime.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if matches!(*status, SemanticRuntimeStatus::OverlaySyncing) {
-            *status = SemanticRuntimeStatus::Failed(
-                "workspace overlay sync ended without a verdict".to_owned(),
-            );
+            // A driver that left because the daemon asked it to did not fail, and saying it
+            // did puts a breakage on the status line for an ordinary shutdown. The caller's
+            // reason code is the same either way; what differs is whether the line tells the
+            // truth about why the sync stopped.
+            *status = if self.0.stop.is_stopped() {
+                SemanticRuntimeStatus::Stopped
+            } else {
+                SemanticRuntimeStatus::Failed(
+                    "workspace overlay sync ended without a verdict".to_owned(),
+                )
+            };
         }
     }
 }
@@ -115,13 +133,14 @@ impl OverlayRetry {
     /// runs, so single-flight holds by construction: kicks merely wake it.
     pub(crate) fn spawn(
         engine: SharedSearchEngine,
+        stop: super::OwnerStop,
         overlay_warmup: Arc<Mutex<OverlayWarmupState>>,
         semantic_runtime: Arc<Mutex<SemanticRuntimeStatus>>,
         lease: WorkspaceLease,
         publish_retry_budget: Duration,
     ) -> Arc<Self> {
         let retry =
-            Self::new(engine, overlay_warmup, semantic_runtime, lease, publish_retry_budget);
+            Self::new(engine, stop, overlay_warmup, semantic_runtime, lease, publish_retry_budget);
         retry.start();
         retry
     }
@@ -132,6 +151,7 @@ impl OverlayRetry {
     /// way to observe it starting from an already-final state.
     fn new(
         engine: SharedSearchEngine,
+        stop: super::OwnerStop,
         overlay_warmup: Arc<Mutex<OverlayWarmupState>>,
         semantic_runtime: Arc<Mutex<SemanticRuntimeStatus>>,
         lease: WorkspaceLease,
@@ -150,20 +170,43 @@ impl OverlayRetry {
                 obligation: false,
                 failed: false,
                 disarmed: false,
+                look_again: false,
             }),
             wake: Condvar::new(),
-            stop: AtomicBool::new(false),
+            stop,
             pass_active: AtomicBool::new(false),
+            #[cfg(test)]
+            passes_started: std::sync::atomic::AtomicUsize::new(0),
             passes: AtomicUsize::new(0),
+            #[cfg(test)]
+            before_idle_wait: Mutex::new(None),
         })
     }
 
     /// Start the worker thread. The worker is the ONLY place a pass runs.
     fn start(self: &Arc<Self>) {
+        // The stop releases THIS wait too: the driver parks on its own condvar, and a stop
+        // that only raised a flag would leave it asleep until its next tick.
+        //
+        // The state lock is TAKEN before the notify, and that is the whole point: the worker
+        // reads the stop and enters its wait while holding it, so a notification delivered in
+        // between would find no waiter and be lost — and one of those waits is unbounded, so
+        // losing it is not a late exit but no exit at all.
+        let waiter = Arc::downgrade(self);
+        self.stop.wakes(move || {
+            if let Some(retry) = waiter.upgrade() {
+                let _state = retry.state.lock().unwrap_or_else(|poison| poison.into_inner());
+                retry.wake.notify_all();
+            }
+        });
         let worker = Arc::clone(self);
+        // Counted before the thread starts, and dropped on every way out: a driver about to
+        // run is an owner a shutdown must still see leave.
+        let live = self.stop.enter();
         std::thread::Builder::new()
             .name("bsl-search-overlay-retry".to_owned())
             .spawn(move || {
+                let _live = live;
                 let _verdict = SyncingVerdict(Arc::clone(&worker));
                 worker.run()
             })
@@ -178,12 +221,31 @@ impl OverlayRetry {
             if state.failed {
                 state.failed = false;
                 state.obligation = true;
-                state.streak = 0;
-                state.next_allowed = Instant::now();
-            } else {
-                state.streak = 0;
-                state.next_allowed = Instant::now();
             }
+            state.streak = 0;
+            state.next_allowed = Instant::now();
+        }
+        self.wake.notify_all();
+    }
+
+    /// A signal that something MAY be worth another look, from a caller that has not observed
+    /// any new fact — a request path is the only one.
+    ///
+    /// It wakes the worker and nothing else. Resetting the backoff here would let a stream of
+    /// searches erase the pacing of an obligation that is already failing, and clearing
+    /// `failed` would restart an obligation that expired without any new external work — both
+    /// of which the retry contract forbids.
+    ///
+    /// It cannot be lost: the request to look again is recorded under the state lock, and a
+    /// worker reads it under that lock before it sleeps. The worker never holds the lock while
+    /// it waits for the engine, so taking it here is brief.
+    pub(crate) fn coalesce(&self) {
+        // Deliberately NOT `fresh_epoch`: `settle_outcome_at` reads a moved epoch as "a fresh
+        // fact landed while the pass ran" and clears the backoff for it. Bumping it here would
+        // let a stream of searches erase the pacing of a failing obligation — the very thing
+        // this method exists to avoid. Asking for another look is all a request may do.
+        if let Ok(mut state) = self.state.lock() {
+            state.look_again = true;
         }
         self.wake.notify_all();
     }
@@ -196,11 +258,37 @@ impl OverlayRetry {
         self.wake.notify_all();
     }
 
-    /// Stop the worker. Called by `SharedState::shutdown` BEFORE the lease is released, so
-    /// a scheduled retry cannot publish after the workspace was handed over.
+    /// Settle the stop this driver reads. Production stops every owner through the daemon's
+    /// `OwnerStop` itself, before the lease is released; a test that builds its own driver
+    /// owns the only clone of that stop and reaches it through here.
+    #[cfg(test)]
     pub(crate) fn stop(&self) {
-        self.stop.store(true, Ordering::SeqCst);
+        self.stop.stop();
         self.wake.notify_all();
+    }
+
+    /// A driver with no worker thread, so a test reads the obligation state it leaves.
+    #[cfg(test)]
+    pub(crate) fn unstarted_for_test(engine: SharedSearchEngine) -> Arc<Self> {
+        Self::new(
+            engine,
+            super::OwnerStop::default(),
+            Arc::new(Mutex::new(OverlayWarmupState::Pending)),
+            Arc::new(Mutex::new(SemanticRuntimeStatus::Disabled)),
+            WorkspaceLease::unmanaged(),
+            Duration::from_secs(600),
+        )
+    }
+
+    /// Put the driver where an operation error leaves it: waiting for a fresh signal.
+    #[cfg(test)]
+    pub(crate) fn fail_for_test(&self) {
+        self.state.lock().unwrap().failed = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_failed(&self) -> bool {
+        self.state.lock().unwrap().failed
     }
 
     /// Completed passes so far — the single-flight proof in tests.
@@ -219,14 +307,17 @@ impl OverlayRetry {
             Err(_) => return,
         };
         loop {
-            if self.stop.load(Ordering::SeqCst) {
+            if self.stop.is_stopped() {
                 return;
             }
             if state.disarmed || state.failed {
-                state = match self.wake.wait(state) {
-                    Ok(state) => state,
+                // Bounded even so: the notification above cannot be lost, and a wait that
+                // answers only to a notify is one missed wake-up away from lasting for ever.
+                let (next, _) = match self.wake.wait_timeout(state, TICK) {
+                    Ok(pair) => pair,
                     Err(_) => return,
                 };
+                state = next;
                 continue;
             }
             let now = Instant::now();
@@ -239,10 +330,40 @@ impl OverlayRetry {
                 state = next;
                 continue;
             }
-            if !self.should_run(state.obligation) {
+            // The signals are read with the state lock released: they take the engine, and a
+            // request's `coalesce` must never wait behind that. What changed meanwhile is
+            // re-read below, before any sleep.
+            let seen = (state.fresh_epoch, state.obligation, state.failed, state.disarmed);
+            state.look_again = false;
+            drop(state);
+            let due = self.should_run(seen.1);
+            state = match self.state.lock() {
+                Ok(state) => state,
+                Err(_) => return,
+            };
+            if (state.fresh_epoch, state.obligation, state.failed, state.disarmed) != seen {
+                continue;
+            }
+            if !due {
                 if self.lease.is_superseded() {
                     self.disarm_superseded(&mut state);
                     continue;
+                }
+                #[cfg(test)]
+                if let Some(hook) = self.before_idle_wait.lock().unwrap().take() {
+                    hook();
+                }
+                if std::mem::take(&mut state.look_again) {
+                    continue;
+                }
+                // The stop, read here and not only on the due branch. `should_run` above takes
+                // the engine with this lock RELEASED, and a stop landing in that window has
+                // already run its waker: the notify it sent found no waiter, and without this
+                // read the worker would go on to sleep out the whole tick after being asked to
+                // leave. Read while the lock is held, so a stop arriving from here on cannot
+                // slip between the read and the wait.
+                if self.stop.is_stopped() {
+                    return;
                 }
                 let (next, _) = match self.wake.wait_timeout(state, TICK) {
                     Ok(pair) => pair,
@@ -251,14 +372,22 @@ impl OverlayRetry {
                 state = next;
                 continue;
             }
-            if self.stop.load(Ordering::SeqCst) {
+            if self.stop.is_stopped() {
                 return;
             }
             // Run the pass with the state lock RELEASED: a pass embeds for minutes, and
             // kick/disarm/stop must stay responsive meanwhile.
             let epoch_before = state.fresh_epoch;
             drop(state);
-            let outcome = self.run_pass();
+            let mut outcome = self.run_pass();
+            // A stop seen anywhere inside the pass is the answer, whatever shape the refusal
+            // took on the way out: a pause cut short by the stop comes back as a transient
+            // refusal, and a publication abandoned at the stop looks like lost ownership.
+            // Neither is true, and settling either would write a backoff — or a terminal
+            // disarm — into a driver that is leaving.
+            if self.stop.is_stopped() {
+                outcome = super::WorkspaceSearchApply::Stopping;
+            }
             self.passes.fetch_add(1, Ordering::SeqCst);
             state = match self.state.lock() {
                 Ok(state) => state,
@@ -278,7 +407,7 @@ impl OverlayRetry {
         if obligation {
             return true;
         }
-        let signals = match self.engine.lock() {
+        let signals = match self.engine.acquire_for_owner(&self.stop) {
             Ok(guard) => match guard.as_ref() {
                 Some(engine) => engine.workspace_overlay_retry_signals().ok(),
                 None => None,
@@ -297,12 +426,25 @@ impl OverlayRetry {
         self.pass_active.load(Ordering::SeqCst)
     }
 
+    /// Passes STARTED. Together with [`Self::pass_count`] (passes finished) and
+    /// [`Self::pass_active`] it tells a pass parked in its backoff — started, not finished,
+    /// not working — from one that has not begun, which reads the same from outside.
+    #[cfg(test)]
+    pub(super) fn passes_started(&self) -> usize {
+        self.passes_started.load(Ordering::SeqCst)
+    }
+
     fn run_pass(&self) -> super::WorkspaceSearchApply<OverlayWarmupState, String> {
+        #[cfg(test)]
+        self.passes_started.fetch_add(1, Ordering::SeqCst);
         let _active = PassActive::raise(&self.pass_active);
         // The syncing status is shown only for a pass that can actually reach the engine;
         // flipping it while the engine is absent would mask a terminal init `Failed`.
-        let engine_present =
-            self.engine.lock().map(|guard| guard.as_ref().is_some()).unwrap_or(false);
+        let engine_present = self
+            .engine
+            .acquire_for_owner(&self.stop)
+            .map(|guard| guard.as_ref().is_some())
+            .unwrap_or(false);
         if engine_present && self.lease.is_superseded() {
             super::SharedState::set_semantic_runtime_status(
                 &self.semantic_runtime,
@@ -317,15 +459,17 @@ impl OverlayRetry {
                 SemanticRuntimeStatus::OverlaySyncing,
             );
         }
-        let stop = &self.stop;
+        let stop = self.stop.clone();
         let mut publish_retry =
             RetryWindow::with_budget(RetryOwner::OverlayEmbedding, self.publish_retry_budget);
         let mut budget_exhausted = false;
+        let pass_active = &self.pass_active;
         let mut outcome = super::SharedState::run_overlay_warmup(
             &self.engine,
+            &self.stop,
             &self.overlay_warmup,
             &self.lease,
-            &|| !stop.load(Ordering::SeqCst),
+            &|| !stop.is_stopped(),
             &mut || {
                 let now = Instant::now();
                 let bounded_delay = retry_delay(publish_retry.streak());
@@ -336,7 +480,16 @@ impl OverlayRetry {
                         return false;
                     }
                 };
-                std::thread::sleep(delay);
+                // Waiting is not working: the pause is lowered out of the pass so the backend
+                // is free to go idle, and raised again for the attempt that follows. Held
+                // across the pause, this flag keeps a whole process alive for half an hour.
+                pass_active.store(false, Ordering::SeqCst);
+                let stopped = stop.sleep(delay);
+                pass_active.store(true, Ordering::SeqCst);
+                if stopped {
+                    // Told to go: not a refusal to be retried, and nothing more to publish.
+                    return false;
+                }
                 if publish_retry.expired(Instant::now()) {
                     budget_exhausted = true;
                     false
@@ -369,7 +522,10 @@ impl OverlayRetry {
                         SemanticRuntimeStatus::Ready,
                     );
                 }
-                super::WorkspaceSearchApply::TransientRefusal => {}
+                // Nothing to say about a pass that was asked to stop: the status it would
+                // write is about work nobody is doing any more.
+                super::WorkspaceSearchApply::TransientRefusal
+                | super::WorkspaceSearchApply::Stopping => {}
                 super::WorkspaceSearchApply::OperationError(error) => {
                     super::SharedState::set_semantic_runtime_status(
                         &self.semantic_runtime,
@@ -428,6 +584,18 @@ impl OverlayRetry {
                 state.obligation = true;
                 state.next_allowed = now + retry_delay(state.streak);
             }
+            // A stop is answered by leaving, and the worker's loop does that at its next
+            // look. The obligation stands untouched: nothing about the work has changed.
+            //
+            // But `Stopping` also comes from an engine CLOSED before the owners were told to
+            // go — the shutdown order does not promise otherwise — and then the loop's own
+            // stop check is still false. Left as a bare no-op the driver spun: the outcome
+            // moved nothing, so the next turn asked again immediately, and the pass count
+            // climbed with no pause until the stop finally arrived. Pacing it costs a live
+            // driver nothing, because a real stop leaves before the delay matters.
+            super::WorkspaceSearchApply::Stopping => {
+                state.next_allowed = now + retry_delay(state.streak.saturating_add(1));
+            }
             super::WorkspaceSearchApply::TransientRefusal => {
                 state.streak = state.streak.saturating_add(1);
                 state.obligation = true;
@@ -455,9 +623,17 @@ impl OverlayRetry {
             }
         }
         // A fresh kick landed WHILE the pass ran: its notification found no waiter, and the
-        // arming above would bury it under a backoff. The outcome predates the fresh fact,
-        // so the next check happens immediately.
-        if state.fresh_epoch != epoch_before && !state.failed {
+        // settling above would bury it — under a backoff, or under the failure this very
+        // pass ended in. The outcome predates the fresh fact either way, so the fact is
+        // honoured here exactly as `kick_fresh` would have honoured it had the worker been
+        // waiting: a failure that a later edit already answered is not a failure to wait on,
+        // and dropping the fact would leave the driver disarmed until some OTHER file
+        // changes.
+        if state.fresh_epoch != epoch_before {
+            if state.failed {
+                state.failed = false;
+                state.obligation = true;
+            }
             state.streak = 0;
             state.next_allowed = now;
         }
@@ -473,6 +649,68 @@ impl OverlayRetry {
                     .to_owned(),
             ),
         );
+    }
+}
+
+#[cfg(test)]
+mod every_wait_reads_the_stop {
+    /// Every branch of the worker loop reads the stop before it sleeps.
+    ///
+    /// Counted rather than tested behaviourally, and the reason is worth stating: the harm of
+    /// a missing read is a LOST notification — the stop's waker takes the state lock while the
+    /// worker holds none (it is off asking the engine whether there is work), notifies an empty
+    /// room and is done; the worker then re-takes the lock and sleeps out the whole `TICK` on a
+    /// wake-up already delivered. Reproducing that from a test means scheduling the waker to
+    /// complete inside a window the test cannot observe the worker entering, and a test that
+    /// cannot schedule it passes whether or not the read is there — which is exactly what the
+    /// first attempt at one did. What CAN be checked exactly is the property the fix is: no
+    /// branch waits without having read the stop since the last one did.
+    ///
+    /// The needles are assembled at run time: spelled out, they would match this gate's own
+    /// source and pass for the wrong reason.
+    #[test]
+    fn no_branch_of_the_loop_sleeps_without_reading_the_stop() {
+        let source = include_str!("overlay_retry.rs");
+        // A CRLF checkout (core.autocrlf on Windows, no .gitattributes pinning LF) gives this
+        // file "\r\n" endings, and a needle anchored on "\n" would then match nothing — the
+        // gate would fail on the line endings rather than on the code, in the very CI step that
+        // runs it by name. Normalised first, so the gate is about the source and not the
+        // checkout.
+        let source = &source.replace("\r\n", "\n");
+        let cut = ["\n#[cfg(test)]\n", "mod every_wait_reads_the_stop {"].concat();
+        assert_eq!(
+            source.matches(&cut).count(),
+            1,
+            "the production/test cut moved; this gate scans only what it can prove it scanned",
+        );
+        let production = source.split(&cut).next().unwrap_or(source);
+        let start = production.find("fn run(self: Arc<Self>)").expect("the worker loop");
+        let loop_body = &production[start..];
+        let sleeps = ["self.wake", ".wait_timeout("].concat();
+        let reads = ["self.stop", ".is_stopped()"].concat();
+
+        // Only a wait reached AFTER the lock was let go needs its own read. While the lock is
+        // held from the top of the loop to the wait, the stop's waker cannot get in front of
+        // the waiter — it blocks on that very lock — so the read at the top still covers it.
+        // The branch that does let go is the one that asks the engine whether there is work,
+        // and it is the one the lost notification belongs to.
+        let releases = ["drop(", "state);"].concat();
+        let waits = loop_body.match_indices(&sleeps).count();
+        assert!(waits >= 3, "the loop has fewer waits than it had; the needle must have moved");
+        assert!(loop_body.contains(&releases), "the loop no longer lets the lock go; recheck this");
+        for (at, _) in loop_body.match_indices(&sleeps) {
+            let from = loop_body[..at].rfind(&sleeps).map_or(0, |prev| prev + sleeps.len());
+            let since = &loop_body[from..at];
+            let Some(released) = since.rfind(&releases) else { continue };
+            assert!(
+                since[released..].contains(&reads),
+                "the worker lets the state lock go and then sleeps without reading the stop. A \
+                 stop delivered in that window runs its waker to completion against nobody: the \
+                 notification is lost, and the worker sleeps out the whole tick after being \
+                 asked to leave:\n{}",
+                &since[released..],
+            );
+        }
     }
 }
 
@@ -498,6 +736,34 @@ mod tests {
         assert_eq!(retry_delay(u32::MAX), Duration::from_secs(960));
     }
 
+    /// A request may wake the driver; it may not tell it that the world changed. Bumping the
+    /// fresh epoch would do the latter, because a moved epoch clears the backoff of the pass
+    /// that was running.
+    #[test]
+    fn a_request_coalesce_does_not_erase_the_backoff_of_a_running_pass() {
+        let dummy = unstarted_driver_over(
+            crate::state::shared_engine(None),
+            crate::workspace_lease::WorkspaceLease::unmanaged(),
+        );
+        let mut state = state();
+        let epoch_before = state.fresh_epoch;
+        dummy.coalesce();
+        assert_eq!(
+            dummy.state.lock().unwrap().fresh_epoch,
+            epoch_before,
+            "coalesce presented itself as a new external fact",
+        );
+
+        state.fresh_epoch = epoch_before;
+        dummy.settle_outcome(
+            &mut state,
+            super::super::WorkspaceSearchApply::TransientRefusal,
+            epoch_before,
+        );
+        assert_eq!(state.streak, 1, "the backoff of a refused pass was cleared");
+        assert!(state.next_allowed > Instant::now(), "the pass may restart immediately");
+    }
+
     #[test]
     fn publish_retry_window_keeps_one_deadline() {
         let start = Instant::now();
@@ -516,7 +782,10 @@ mod tests {
             RetryDecision::Stop(_)
         ));
 
-        assert!(retry.observe_external_work(true), "a later external pass gets a fresh budget");
+        assert!(
+            retry.observe_external_work(Instant::now(), true),
+            "a later external pass gets a fresh budget"
+        );
     }
 
     fn state() -> RetryState {
@@ -527,6 +796,7 @@ mod tests {
             obligation: false,
             failed: false,
             disarmed: false,
+            look_again: false,
         }
     }
 
@@ -544,6 +814,7 @@ mod tests {
     ) -> Arc<OverlayRetry> {
         OverlayRetry::new(
             engine,
+            super::super::OwnerStop::default(),
             Arc::new(Mutex::new(OverlayWarmupState::Pending)),
             Arc::new(Mutex::new(SemanticRuntimeStatus::Disabled)),
             lease,
@@ -565,7 +836,7 @@ mod tests {
         let _lock = env_lock();
         let _reset = ResetHook;
 
-        let engine: SharedSearchEngine = Arc::new(Mutex::new(None));
+        let engine: SharedSearchEngine = crate::state::shared_engine(None);
         let retry = unstarted_driver_over(engine, WorkspaceLease::unmanaged());
         assert!(!retry.pass_active(), "a driver that never ran a pass reads as running one");
 
@@ -588,7 +859,7 @@ mod tests {
     /// backend process for the rest of its life.
     #[test]
     fn a_departed_worker_settles_the_syncing_status() {
-        let engine: SharedSearchEngine = Arc::new(Mutex::new(None));
+        let engine: SharedSearchEngine = crate::state::shared_engine(None);
         let retry = unstarted_driver_over(engine, WorkspaceLease::unmanaged());
         *retry.semantic_runtime.lock().unwrap() = SemanticRuntimeStatus::OverlaySyncing;
 
@@ -605,7 +876,7 @@ mod tests {
     /// would pass the check above no matter what the worker had settled.
     #[test]
     fn a_settled_status_survives_the_departing_worker() {
-        let engine: SharedSearchEngine = Arc::new(Mutex::new(None));
+        let engine: SharedSearchEngine = crate::state::shared_engine(None);
         let retry = unstarted_driver_over(engine, WorkspaceLease::unmanaged());
         *retry.semantic_runtime.lock().unwrap() = SemanticRuntimeStatus::Ready;
 
@@ -624,12 +895,101 @@ mod tests {
         check()
     }
 
+    /// A stop that lands while the driver is asking whether it has work leaves it at once,
+    /// not thirty seconds later.
+    ///
+    /// That question takes the ENGINE, and the driver releases the state lock to ask it — a
+    /// request's `coalesce` must never queue behind the engine. So the stop's waker finds the
+    /// state lock free, takes it, notifies nobody, and is done. The driver then re-takes the
+    /// lock, finds nothing to do, and — before this was fixed — went to sleep on a notification
+    /// that had already been delivered to an empty room, for the whole `TICK`. The wake was not
+    /// lost for want of a notify; it was lost because nothing read the stop on this branch.
+    ///
+    /// The engine is held here for exactly that window, which is what makes the race a
+    /// schedule rather than a hope.
+    #[test]
+    fn a_stop_while_the_driver_is_asking_the_engine_is_not_slept_off() {
+        let _lock = env_lock();
+        let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
+        let _env = mock_embedding_env(&mock);
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let mut engine =
+            SearchEngine::new(&workspace.join("search.db"), mock_semantic_config(&mock)).unwrap();
+        let (roots, _) = bsl_search::WorkspaceRoots::build(workspace, workspace, &[]);
+        engine.set_workspace_roots(roots);
+        engine.enable_workspace_watcher_mode();
+        engine.initialize_workspace_overlay_clean().unwrap();
+        let shared: SharedSearchEngine = crate::state::shared_engine(Some(engine));
+        let retry = unstarted_driver_over(Arc::clone(&shared), WorkspaceLease::unmanaged());
+        let stop = retry.stop.clone();
+
+        // The engine is held, so the driver's question blocks inside `should_run` with the
+        // state lock released — the window the stop has to be answered in.
+        let held = shared.lock().unwrap();
+        retry.start();
+        assert!(wait_for(3_000, || stop.live() >= 1), "the driver never started");
+        std::thread::sleep(Duration::from_millis(200));
+
+        // The waker runs to completion here: it takes the free state lock, notifies an empty
+        // room and returns. Nothing is waiting to be woken.
+        stop.stop();
+        drop(held);
+
+        assert!(
+            wait_for(5_000, || stop.live() == 0),
+            "the driver slept off a stop it was told about while it had the engine; \
+             it must leave without waiting out the idle tick",
+        );
+    }
+
+    /// A batch the backlog owner settled can leave the driver work to do — entries without
+    /// vectors. Its wake reaches a driver that is between deciding it has nothing to do and
+    /// going to sleep, instead of being lost to it until the next idle tick.
+    #[test]
+    fn a_wake_between_the_check_and_the_sleep_is_not_lost() {
+        let _lock = env_lock();
+        let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
+        let _env = mock_embedding_env(&mock);
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let mut engine =
+            SearchEngine::new(&workspace.join("search.db"), mock_semantic_config(&mock)).unwrap();
+        let (roots, _) = bsl_search::WorkspaceRoots::build(workspace, workspace, &[]);
+        engine.set_workspace_roots(roots);
+        engine.enable_workspace_watcher_mode();
+        engine.initialize_workspace_overlay_clean().unwrap();
+        let shared: SharedSearchEngine = crate::state::shared_engine(Some(engine));
+        let retry = unstarted_driver_over(Arc::clone(&shared), WorkspaceLease::unmanaged());
+        {
+            let (engine, driver) = (Arc::clone(&shared), Arc::clone(&retry));
+            let file = workspace.join("New.bsl");
+            *retry.before_idle_wait.lock().unwrap() = Some(Box::new(move || {
+                std::fs::write(&file, "Процедура Новая()\nКонецПроцедуры").unwrap();
+                {
+                    // An entry settled without its vectors: the driver's work, not a mark.
+                    let guard = engine.lock().unwrap();
+                    let engine = guard.as_ref().unwrap();
+                    engine.mark_workspace_path_dirty(&file).unwrap();
+                    engine.workspace_overlay_stats().unwrap();
+                    assert!(engine.workspace_overlay_retry_signals().unwrap().demands_a_pass());
+                }
+                std::thread::spawn(move || driver.coalesce());
+                // Room for the wake to land before the worker goes to sleep.
+                std::thread::sleep(Duration::from_millis(100));
+            }));
+        }
+        retry.start();
+        assert!(wait_for(3_000, || retry.pass_count() >= 1), "the wake was lost to the idle tick");
+        retry.stop();
+    }
+
     /// The outcome classification: clean resets, incomplete/superseded keeps the obligation,
     /// transient retries, operation error waits for a fresh signal, and terminal disarms.
     #[test]
     fn outcomes_classify_into_retry_reset_and_disarm() {
         let dummy = driver_over(
-            Arc::new(Mutex::new(None)),
+            crate::state::shared_engine(None),
             crate::workspace_lease::WorkspaceLease::unmanaged(),
         );
         dummy.stop();
@@ -687,7 +1047,7 @@ mod tests {
     #[test]
     fn a_fresh_kick_during_a_pass_overrides_the_stale_backoff() {
         let dummy = driver_over(
-            Arc::new(Mutex::new(None)),
+            crate::state::shared_engine(None),
             crate::workspace_lease::WorkspaceLease::unmanaged(),
         );
         dummy.stop();
@@ -711,7 +1071,7 @@ mod tests {
     #[test]
     fn store_and_network_errors_wait_for_a_fresh_signal() {
         let dummy = driver_over(
-            Arc::new(Mutex::new(None)),
+            crate::state::shared_engine(None),
             crate::workspace_lease::WorkspaceLease::unmanaged(),
         );
         dummy.stop();
@@ -736,8 +1096,51 @@ mod tests {
         }
     }
 
+    /// The fresh fact that arrives WHILE a pass runs is not lost when that pass then fails.
+    /// Its notification found no waiter, so nothing but the settling can honour it — and a
+    /// failure that a later edit has already answered is not a failure to sit out. Dropped,
+    /// it leaves the driver disarmed until some OTHER file changes, with the overlay out of
+    /// date and the semantic status reading failed.
     #[test]
-    fn transient_budget_fails_once_ignores_active_kicks_and_rearms_on_new_drift() {
+    fn a_fresh_kick_during_a_failing_pass_rearms_the_driver() {
+        let dummy = driver_over(
+            crate::state::shared_engine(None),
+            crate::workspace_lease::WorkspaceLease::unmanaged(),
+        );
+        dummy.stop();
+
+        let mut s = state();
+        // The pass captured epoch 4; a kick_fresh bumped it to 5 while it ran.
+        s.fresh_epoch = 5;
+        dummy.settle_outcome_at(
+            &mut s,
+            super::super::WorkspaceSearchApply::OperationError("store write failed".to_owned()),
+            4,
+            Instant::now(),
+        );
+
+        assert!(!s.failed, "the fact that arrived mid-pass was buried under the failure");
+        assert!(s.obligation, "the work that fact asked for is owed");
+        assert_eq!(s.streak, 0);
+
+        // Control: with no fact arriving mid-pass, the failure stands and waits for one.
+        let mut quiet = state();
+        quiet.fresh_epoch = 4;
+        dummy.settle_outcome_at(
+            &mut quiet,
+            super::super::WorkspaceSearchApply::OperationError("store write failed".to_owned()),
+            4,
+            Instant::now(),
+        );
+        assert!(quiet.failed, "an operation error with no fresh fact still waits for one");
+        assert!(!quiet.obligation);
+    }
+
+    /// A budget spent is a failure that waits for a fresh fact — but facts that arrived while
+    /// the pass was failing are exactly that, and they buy one more attempt between them, not
+    /// one each.
+    #[test]
+    fn transient_budget_fails_once_answers_mid_pass_facts_and_rearms_on_new_drift() {
         let _lock = env_lock();
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
         let _env = mock_embedding_env(&mock);
@@ -748,7 +1151,7 @@ mod tests {
             SearchEngine::new(&workspace.join("search.db"), mock_semantic_config(&mock)).unwrap();
         let (roots, _) = bsl_search::WorkspaceRoots::build(workspace, workspace, &[]);
         engine.set_workspace_roots(roots);
-        let engine = Arc::new(Mutex::new(Some(engine)));
+        let engine = crate::state::shared_engine(Some(engine));
         let runtime = Arc::new(Mutex::new(SemanticRuntimeStatus::Disabled));
         let (expired_tx, expired_rx) = std::sync::mpsc::channel();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
@@ -762,21 +1165,29 @@ mod tests {
         }
         let _reset = ResetHooks;
         super::super::embed::FORCE_OVERLAY_PUBLICATION_REFUSALS.store(usize::MAX, Ordering::SeqCst);
-        let expired_tx = Mutex::new(Some(expired_tx));
+        // The hook survives a second exhaustion: the kicks below arrive while the first pass
+        // is parked in it, and facts that arrive mid-pass are answered by one more pass.
+        let expired_tx = Mutex::new(expired_tx);
         let resume_rx = Mutex::new(Some(resume_rx));
         *BUDGET_EXHAUSTED_HOOK.lock().unwrap() = Some(Box::new(move || {
-            expired_tx.lock().unwrap().take().unwrap().send(()).unwrap();
-            resume_rx.lock().unwrap().take().unwrap().recv().unwrap();
+            let _ = expired_tx.lock().unwrap().send(());
+            if let Some(resume) = resume_rx.lock().unwrap().take() {
+                resume.recv().unwrap();
+            }
         }));
 
         let retry = OverlayRetry::spawn(
             Arc::clone(&engine),
+            super::super::OwnerStop::default(),
             Arc::new(Mutex::new(OverlayWarmupState::Pending)),
             Arc::clone(&runtime),
             crate::workspace_lease::WorkspaceLease::unmanaged(),
             Duration::from_millis(100),
         );
         expired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Eight facts arrive while that pass is failing. They are answered by ONE more pass —
+        // a fact the pass did not see is work nobody else will do — and a storm of them is
+        // still one pass, not eight.
         for _ in 0..8 {
             retry.kick_fresh();
         }
@@ -785,8 +1196,13 @@ mod tests {
             *runtime.lock().unwrap(),
             SemanticRuntimeStatus::Failed(ref reason) if reason.contains("budget exhausted")
         )));
+        assert!(
+            wait_for(5_000, || retry.pass_count() >= 2),
+            "the facts that arrived mid-pass were never answered"
+        );
         let exhausted_passes = retry.pass_count();
-        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(exhausted_passes, 2, "a storm of mid-pass facts is one pass, not eight");
+        std::thread::sleep(Duration::from_millis(300));
         assert_eq!(retry.pass_count(), exhausted_passes, "budget failure does not self-repeat");
 
         super::super::embed::FORCE_OVERLAY_PUBLICATION_REFUSALS.store(1, Ordering::SeqCst);
@@ -812,7 +1228,7 @@ mod tests {
             SearchEngine::new(&workspace.join("search.db"), mock_semantic_config(&mock)).unwrap();
         let (roots, _) = bsl_search::WorkspaceRoots::build(workspace, workspace, &[]);
         engine.set_workspace_roots(roots);
-        let engine_arc: SharedSearchEngine = Arc::new(Mutex::new(Some(engine)));
+        let engine_arc: SharedSearchEngine = crate::state::shared_engine(Some(engine));
 
         let retry = driver_over(engine_arc, crate::workspace_lease::WorkspaceLease::unmanaged());
         let kickers: Vec<_> = (0..8)
@@ -837,7 +1253,7 @@ mod tests {
         let _lock = env_lock();
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
         let _env = mock_embedding_env(&mock);
-        let engine_arc: SharedSearchEngine = Arc::new(Mutex::new(None));
+        let engine_arc: SharedSearchEngine = crate::state::shared_engine(None);
         let retry = driver_over(
             Arc::clone(&engine_arc),
             crate::workspace_lease::WorkspaceLease::unmanaged(),
@@ -880,7 +1296,7 @@ mod tests {
     #[test]
     fn stop_freezes_the_driver() {
         let retry = unstarted_driver_over(
-            Arc::new(Mutex::new(None)),
+            crate::state::shared_engine(None),
             crate::workspace_lease::WorkspaceLease::unmanaged(),
         );
         retry.stop();
@@ -897,7 +1313,7 @@ mod tests {
     #[test]
     fn an_unstopped_driver_opens_its_startup_pass() {
         let retry = unstarted_driver_over(
-            Arc::new(Mutex::new(None)),
+            crate::state::shared_engine(None),
             crate::workspace_lease::WorkspaceLease::unmanaged(),
         );
         retry.start();
@@ -912,7 +1328,7 @@ mod tests {
         let (retry, lease) =
             crate::workspace_lease::WorkspaceLease::while_cache_lock_held(&cache, || {
                 let lease = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
-                let retry = driver_over(Arc::new(Mutex::new(None)), lease.clone());
+                let retry = driver_over(crate::state::shared_engine(None), lease.clone());
                 retry.kick_fresh();
                 std::thread::sleep(Duration::from_millis(100));
                 assert!(retry.pass_count() >= 1, "the workflow owns its admission attempt");
@@ -925,6 +1341,193 @@ mod tests {
         assert!(!lease.is_superseded());
         assert!(!retry.state.lock().unwrap().disarmed);
         retry.stop();
+    }
+
+    /// A driver parked in a publication backoff leaves on shutdown whatever order the three
+    /// middle steps are taken in — stop the owners, close the engine, shut the hub down. The
+    /// outcome must not depend on that order: each step releases a different wait, and a
+    /// driver whose exit needs them in one particular sequence is one reordering away from
+    /// sitting out a half-hour backoff after the daemon has gone.
+    #[test]
+    fn a_paused_driver_leaves_in_every_shutdown_order() {
+        use crate::change_hub::WorkspaceChangeHub;
+
+        const STOP_OWNERS: usize = 0;
+        const CLOSE_ENGINE: usize = 1;
+        const SHUT_THE_HUB: usize = 2;
+        const ORDERS: [[usize; 3]; 6] = [
+            [STOP_OWNERS, CLOSE_ENGINE, SHUT_THE_HUB],
+            [STOP_OWNERS, SHUT_THE_HUB, CLOSE_ENGINE],
+            [CLOSE_ENGINE, STOP_OWNERS, SHUT_THE_HUB],
+            [CLOSE_ENGINE, SHUT_THE_HUB, STOP_OWNERS],
+            [SHUT_THE_HUB, STOP_OWNERS, CLOSE_ENGINE],
+            [SHUT_THE_HUB, CLOSE_ENGINE, STOP_OWNERS],
+        ];
+
+        struct Daemon {
+            stop: super::super::OwnerStop,
+            engine: SharedSearchEngine,
+            hub: WorkspaceChangeHub,
+            retry: Arc<OverlayRetry>,
+            _dir: tempfile::TempDir,
+        }
+
+        let _lock = env_lock();
+        let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
+        let _env = mock_embedding_env(&mock);
+
+        // Everything a daemon needs is built first and the drivers are started only after,
+        // so the peer's hold of the lock covers every driver's first attempts. Started as
+        // each was built, the drivers would queue behind one another's setup and the earliest
+        // would publish before the last had a hold to be refused by.
+        let built: Vec<_> = (0..ORDERS.len())
+            .map(|_| {
+                let dir = tempdir().unwrap();
+                let workspace = dir.path();
+                std::fs::write(workspace.join("Модуль.bsl"), "Процедура П()\nКонецПроцедуры")
+                    .unwrap();
+                let cache = crate::cache::WorkspaceCacheLayout::for_workspace(workspace);
+                cache.ensure().unwrap();
+                let mut engine =
+                    SearchEngine::new(&cache.search_db_path(), mock_semantic_config(&mock))
+                        .unwrap();
+                let (roots, _) = bsl_search::WorkspaceRoots::build(workspace, workspace, &[]);
+                engine.set_workspace_roots(roots);
+                let engine: SharedSearchEngine = crate::state::shared_engine(Some(engine));
+                let stop = super::super::OwnerStop::default();
+                let hub = WorkspaceChangeHub::start(vec![workspace.to_path_buf()]);
+                let hub_waker = hub.clone();
+                stop.wakes(move || hub_waker.interrupt_waiters());
+                (dir, cache, engine, stop, hub)
+            })
+            .collect();
+
+        // The six are parked side by side: each waits out two refusals of two seconds, and
+        // one after another that alone would take half a minute.
+        let daemons: Vec<Daemon> = built
+            .into_iter()
+            .map(|(dir, cache, engine, stop, hub)| {
+                // Held for far longer than the two refusals need, because this test shares a
+                // machine with the rest of the suite: a hold that expires between the first
+                // refusal and the second lets the pass publish and end instead of parking.
+                // The holder is left to expire on its own — joining it would add its whole
+                // hold to the test, and all it does after this point is release a lock in a
+                // directory the test has finished with.
+                drop(crate::workspace_lease::WorkspaceLease::hold_cache_lock_for(
+                    &cache,
+                    Duration::from_secs(60),
+                ));
+                let retry = OverlayRetry::spawn(
+                    Arc::clone(&engine),
+                    stop.clone(),
+                    Arc::new(Mutex::new(OverlayWarmupState::Pending)),
+                    Arc::new(Mutex::new(SemanticRuntimeStatus::Disabled)),
+                    crate::workspace_lease::WorkspaceLease::claim_cache(&cache),
+                    super::super::bootstrap::DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
+                );
+                Daemon { stop, engine, hub, retry, _dir: dir }
+            })
+            .collect();
+
+        // Parked in the backoff: a pass began, has not ended, and is not working.
+        for daemon in &daemons {
+            assert!(
+                wait_for(30_000, || daemon.retry.passes_started() >= 1
+                    && daemon.retry.pass_count() == 0
+                    && !daemon.retry.pass_active()),
+                "a driver never reached its backoff (started {}, finished {}, active {})",
+                daemon.retry.passes_started(),
+                daemon.retry.pass_count(),
+                daemon.retry.pass_active(),
+            );
+        }
+
+        let asked = Instant::now();
+        for (daemon, order) in daemons.iter().zip(ORDERS) {
+            for step in order {
+                match step {
+                    STOP_OWNERS => daemon.stop.stop(),
+                    CLOSE_ENGINE => daemon.engine.close(),
+                    _ => daemon.hub.shutdown(),
+                }
+            }
+        }
+
+        for (daemon, order) in daemons.iter().zip(ORDERS) {
+            assert!(
+                wait_for(1_000, || daemon.stop.live() == 0),
+                "the driver stayed in its backoff under order {order:?}"
+            );
+            let owed =
+                daemon.engine.lock().unwrap().as_ref().unwrap().workspace_overlay_debt().unwrap();
+            assert!(
+                !owed.initialized,
+                "the driver published an overlay after its daemon stopped, order {order:?}"
+            );
+        }
+        assert!(
+            asked.elapsed() < Duration::from_secs(2),
+            "the six exits took {:?}",
+            asked.elapsed()
+        );
+    }
+
+    /// A driver sitting out a publication backoff is waiting, not working: the flag the
+    /// backend reads for "a pass is running" is lowered for the pause and raised again for
+    /// the attempt after it. Held across the pause, it keeps a whole process alive for the
+    /// length of a backoff that grows to half an hour.
+    #[test]
+    fn a_driver_in_its_retry_pause_is_not_a_running_pass() {
+        let _lock = env_lock();
+        let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
+        let _env = mock_embedding_env(&mock);
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        std::fs::write(workspace.join("Модуль.bsl"), "Процедура П()\nКонецПроцедуры").unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(workspace);
+        cache.ensure().unwrap();
+        let mut engine =
+            SearchEngine::new(&cache.search_db_path(), mock_semantic_config(&mock)).unwrap();
+        let (roots, _) = bsl_search::WorkspaceRoots::build(workspace, workspace, &[]);
+        engine.set_workspace_roots(roots);
+        let engine_arc: SharedSearchEngine = crate::state::shared_engine(Some(engine));
+        let mine = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
+
+        // A peer holds the fence's lock for longer than two of its waits: the first refusal
+        // backs off by nothing, the second by a whole tick — the pause under test.
+        let holder = crate::workspace_lease::WorkspaceLease::hold_cache_lock_for(
+            &cache,
+            Duration::from_secs(5),
+        );
+        let retry = OverlayRetry::spawn(
+            Arc::clone(&engine_arc),
+            super::super::OwnerStop::default(),
+            Arc::new(Mutex::new(OverlayWarmupState::Pending)),
+            Arc::new(Mutex::new(SemanticRuntimeStatus::Disabled)),
+            mine,
+            super::super::bootstrap::DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
+        );
+
+        assert!(
+            wait_for(10_000, || retry.pass_active()),
+            "no pass ever started, so the pause below would prove nothing"
+        );
+        assert!(
+            wait_for(10_000, || !retry.pass_active()),
+            "the paused driver still reads as a running pass"
+        );
+        assert_eq!(
+            retry.pass_count(),
+            0,
+            "the pass ended instead of pausing; this proves nothing about a pause"
+        );
+        assert!(
+            retry_delay(1) >= Duration::from_secs(5),
+            "the pause is short enough that a finished pass would pass for a paused one"
+        );
+
+        retry.stop();
+        holder.join().unwrap();
     }
 
     /// Observing a live foreign owner is terminal: releasing that owner and kicking again
@@ -940,12 +1543,13 @@ mod tests {
             SearchEngine::new(&workspace.join("search.db"), mock_semantic_config(&mock)).unwrap();
         let (roots, _) = bsl_search::WorkspaceRoots::build(workspace, workspace, &[]);
         engine.set_workspace_roots(roots);
-        let engine_arc: SharedSearchEngine = Arc::new(Mutex::new(Some(engine)));
+        let engine_arc: SharedSearchEngine = crate::state::shared_engine(Some(engine));
 
         let mine = crate::workspace_lease::WorkspaceLease::claim(workspace);
         let runtime = Arc::new(Mutex::new(SemanticRuntimeStatus::Disabled));
         let retry = OverlayRetry::spawn(
             Arc::clone(&engine_arc),
+            super::super::OwnerStop::default(),
             Arc::new(Mutex::new(OverlayWarmupState::Pending)),
             Arc::clone(&runtime),
             mine.clone(),
@@ -964,6 +1568,8 @@ mod tests {
             .mark_workspace_path_dirty(workspace.join("New.bsl"))
             .unwrap();
         let before = retry.pass_count();
+        // Marks alone are no work of the driver's; a fresh fact after its failure is.
+        retry.fail_for_test();
         retry.kick_fresh();
         assert!(wait_for(5_000, || mine.is_superseded()), "the fresh check observes takeover");
         assert_eq!(
@@ -1015,7 +1621,8 @@ mod tests {
         }));
         let runtime = Arc::new(Mutex::new(SemanticRuntimeStatus::Disabled));
         let retry = OverlayRetry::spawn(
-            Arc::new(Mutex::new(Some(engine))),
+            crate::state::shared_engine(Some(engine)),
+            super::super::OwnerStop::default(),
             Arc::new(Mutex::new(OverlayWarmupState::Pending)),
             Arc::clone(&runtime),
             mine.clone(),
@@ -1041,13 +1648,14 @@ mod tests {
             SearchEngine::new(&workspace.join("search.db"), mock_semantic_config(&mock)).unwrap();
         let (roots, _) = bsl_search::WorkspaceRoots::build(workspace, workspace, &[]);
         engine.set_workspace_roots(roots);
-        let engine_arc: SharedSearchEngine = Arc::new(Mutex::new(Some(engine)));
+        let engine_arc: SharedSearchEngine = crate::state::shared_engine(Some(engine));
         let overlay_warmup = Arc::new(Mutex::new(OverlayWarmupState::Pending));
 
         let mine = crate::workspace_lease::WorkspaceLease::claim(workspace);
         let _newer = crate::workspace_lease::WorkspaceLease::claim(workspace);
         let result = super::super::SharedState::run_overlay_warmup(
             &engine_arc,
+            &super::super::OwnerStop::default(),
             &overlay_warmup,
             &mine,
             &|| true,
@@ -1088,7 +1696,7 @@ mod tests {
             SearchEngine::new(&workspace.join("search.db"), mock_semantic_config(&mock)).unwrap();
         let (roots, _) = bsl_search::WorkspaceRoots::build(workspace, workspace, &[]);
         engine.set_workspace_roots(roots);
-        let engine_arc: SharedSearchEngine = Arc::new(Mutex::new(Some(engine)));
+        let engine_arc: SharedSearchEngine = crate::state::shared_engine(Some(engine));
 
         std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
         if std::fs::read_dir(&closed).is_ok() {
@@ -1099,6 +1707,7 @@ mod tests {
         let overlay_warmup = Arc::new(Mutex::new(OverlayWarmupState::Pending));
         let retry = OverlayRetry::spawn(
             Arc::clone(&engine_arc),
+            super::super::OwnerStop::default(),
             Arc::clone(&overlay_warmup),
             Arc::new(Mutex::new(SemanticRuntimeStatus::Disabled)),
             crate::workspace_lease::WorkspaceLease::unmanaged(),
@@ -1144,11 +1753,12 @@ mod tests {
         let (roots, _) = bsl_search::WorkspaceRoots::build(workspace, workspace, &[]);
         engine.set_workspace_roots(roots);
         engine.enable_workspace_watcher_mode();
-        let engine_arc: SharedSearchEngine = Arc::new(Mutex::new(Some(engine)));
+        let engine_arc: SharedSearchEngine = crate::state::shared_engine(Some(engine));
 
         let overlay_warmup = Arc::new(Mutex::new(OverlayWarmupState::Pending));
         let retry = OverlayRetry::spawn(
             Arc::clone(&engine_arc),
+            super::super::OwnerStop::default(),
             Arc::clone(&overlay_warmup),
             Arc::new(Mutex::new(SemanticRuntimeStatus::Disabled)),
             crate::workspace_lease::WorkspaceLease::unmanaged(),

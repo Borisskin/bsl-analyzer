@@ -39,6 +39,11 @@ pub(super) struct FpMapState {
 /// held across the walk, so concurrent callers serialize onto one scan per window.
 pub(super) struct ScanCache {
     pub(super) at: Instant,
+    /// The hub position this scan can vouch for: read BEFORE the walk, so every fact at or
+    /// below it reached the hub before the disk was looked at. A comparison that answers by a
+    /// number read later answers facts its own walk never saw — which is the same defect as a
+    /// build publishing a proof wider than its admission.
+    pub(super) observed_through: u64,
     pub(super) disk_fp: crate::graph_db::GraphFp,
     /// Whether the scan behind `disk_fp` covered the whole tree — the reload
     /// decision needs it to retire a `force_stale` build once the tree heals.
@@ -203,10 +208,21 @@ impl GraphPathIdentity {
 
 pub(super) struct PreparedSnapshotPool {
     entries: Vec<PooledSnapshotEntry>,
+    /// The artefact's own unread set, read STRICTLY and bound to the generation validated
+    /// above. `None` when the metadata would not read: that is a failure to look, and it says
+    /// nothing at all about what this publication owes.
+    declared_unread: Option<Vec<String>>,
     path_identity: GraphPathIdentity,
     expected_generation: u64,
     expected_fingerprint: crate::graph_db::GraphFp,
     expected_force_stale: bool,
+}
+
+impl PreparedSnapshotPool {
+    /// What the artefact this pool holds declares unread, read strictly at prepare time.
+    pub(super) fn declared_unread(&self) -> Option<&[String]> {
+        self.declared_unread.as_deref()
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -292,6 +308,58 @@ impl Drop for PooledGraphDb {
     }
 }
 
+/// What a publication actually did, for the obligations that were outstanding when it was
+/// prepared. Not a verdict — the raw facts the three positive proofs are read off.
+pub(super) enum RecoveryCoverage<'a> {
+    /// A build that enumerated the scope itself: every required address is either in its
+    /// universe or absent from it, and the walk says whether it may speak for the whole tree.
+    Walked {
+        scope: super::debt::RecoveryScope,
+        /// Every address the walk listed, borrowed from the walk — the universe is not cloned
+        /// to say what a handful of obligations were covered by.
+        enumerated: &'a std::collections::HashSet<&'a str>,
+        complete: bool,
+        /// Whether the tree moved while this build ran. Such a build enumerated a world that
+        /// no longer stands, so what it did not list is not thereby gone.
+        straddled: bool,
+    },
+    /// A patch that re-projected exactly these addresses. It proves nothing about absence:
+    /// a point rewrite never looked at what it did not touch.
+    Patched { rewritten: &'a std::collections::HashSet<&'a str> },
+    /// No fresh coverage authority at all — a cache served as it stands, or a test adapter.
+    None,
+}
+
+/// The scope descriptor of one actually loaded project, carried with whatever that project
+/// produced. `scan_roots`, never `search_roots`: what a walk can reach is what a walk was told
+/// to walk.
+pub(super) fn recovery_scope_of(
+    project: &super::input::ProjectSnapshot,
+) -> super::debt::RecoveryScope {
+    super::debt::RecoveryScope::of(&project.scan_roots, &project.excluded, project.validated)
+}
+
+/// What a recovery probe learned.
+///
+/// Three outcomes, not two: a probe that could not take a snapshot at all learned NOTHING, and
+/// reading that as "nothing has healed" pushes the next probe twice as far out for an
+/// observation that never happened.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ProbeOutcome {
+    /// The probe looked, and these are the levels it measured. Whether any of them is NEWS is
+    /// the schedule's question, not the prober's: only the schedule knows what was measured
+    /// last time, and a capability that was already positive is a repeat, not a healing.
+    Looked {
+        levels: Vec<(super::debt::Capability, super::debt::Level)>,
+        /// The scope the walk actually covered, when one was owed — from the same traversal
+        /// that reached the verdict beside it.
+        scope: Option<super::debt::RecoveryScope>,
+    },
+    /// The probe could not look: the lease was held, the handle would not open, the
+    /// generation moved. The pause stays where it is and the probe is owed again.
+    CouldNotLook,
+}
+
 impl GraphState {
     #[cfg(test)]
     pub(crate) fn set_background_snapshot_failure_for_test(
@@ -343,8 +411,13 @@ impl GraphState {
         if before != after {
             return Err(SnapshotPrepareError::Changed);
         }
+        // Read here, where the generation has just been checked against the expectation and
+        // the path identity brackets the read: a list taken later could belong to another
+        // artefact at the same name.
+        let declared_unread = entries.first().and_then(|entry| entry.db.unread_paths_strict().ok());
         Ok(PreparedSnapshotPool {
             entries,
+            declared_unread,
             path_identity: after,
             expected_generation,
             expected_fingerprint,
@@ -355,13 +428,25 @@ impl GraphState {
     /// Revalidate the prepared path under a short ownership fence, then install the
     /// descriptors and readiness metadata while request snapshots are excluded.
     ///
-    /// `reload_obligation` names the forced-reload epoch this publication discharges,
-    /// or `None` when it discharges none. It is discharged inside the same critical
-    /// section that installs the snapshot, so an observer holding `inner` — such as
-    /// [`GraphState::claim_reload_slot`] — sees the new publication and the discharged
-    /// obligation as ONE state. Discharging it after the section leaves a window in
-    /// which the graph reads "reloaded, and still owing a reload", and a claim landing
-    /// there starts a second full rebuild of what was just published.
+    /// `forced_through` is the fact the ticket carried — the demand this publication is
+    /// entitled to discharge — and `None` when it ran as an ordinary catch-up. It comes from
+    /// the ticket fixed at the admission, never from re-reading the debts here: a builder that
+    /// asks what is owed NOW answers for demands it was never admitted for.
+    ///
+    /// Two different numbers travel with a publication and they are not interchangeable. The
+    /// SPONSOR CUTOFF (`forced_through`) says which demand paid for this build; the
+    /// OBSERVATION (`Published::observed_through`) says how far its scan can vouch, and marks
+    /// are consumed against that. A build admitted for one fact may observe no further, and it
+    /// must not claim to have answered anything above either line.
+    ///
+    /// The debts are discharged inside the same critical section that installs the snapshot,
+    /// so an observer holding `inner` — such as [`GraphState::try_claim_reload`] — sees the
+    /// new publication and the discharged demand as ONE state. Discharging after the section
+    /// leaves a window in which the graph reads "reloaded, and still owing a reload", and a
+    /// claim landing there starts a second full rebuild of what was just published.
+    ///
+    /// Lock order, which this call sits inside and never inverts:
+    /// publication gate → lease → `inner` → debt.
     ///
     /// Only a successful install discharges: a refused lease, a `Changed` revalidation
     /// and a failed build all leave the obligation outstanding, so the forced reload is
@@ -371,7 +456,9 @@ impl GraphState {
         mut prepared: PreparedSnapshotPool,
         published: Published,
         status: GraphStatus,
-        reload_obligation: Option<usize>,
+        forced_through: Option<u64>,
+        recovery_through: Option<u64>,
+        recovery: super::debt::RecoveryPublicationProof,
     ) -> crate::workspace_lease::LeaseOperationOutcome<(), SnapshotInstallError> {
         #[cfg(test)]
         SNAPSHOT_OPEN_HOOK.with(|slot| {
@@ -379,9 +466,31 @@ impl GraphState {
                 hook();
             }
         });
-        let outcome = self.lease.publish_short(&mut prepared, |prepared| {
+        // The install is the other half of the critical section `consume_observed_marks` and
+        // `notify_published_pass` hold: they charge marks against whatever is published when
+        // their hook runs, so a publication swapped in midway would take marks that were
+        // cleared against another — and an unsound one would take marks no publication may
+        // consume at all. Taken BEFORE the fence, never inside it: a hook running under the
+        // gate publishes through the lease, so gate → lease is the only order both sides can
+        // agree on.
+        let _gate = crate::graph::state::lock_recover(&self.publication_gate);
+        // What the ledger hands back to be thrown away. Filled inside the section and dropped
+        // below it: freeing the answered obligations and the consumed proof is O(P) of
+        // allocator work, and the gate, the lease and `inner` are all held in there.
+        let retired = std::cell::RefCell::new(super::debt::RetiredPayload::default());
+        let discard = &retired;
+        let outcome = self.lease.publish_short(&mut prepared, move |prepared| {
             #[cfg(test)]
-            if REFUSE_SNAPSHOT_INSTALL.with(|refuse| refuse.replace(false)) {
+            if REFUSE_SNAPSHOT_INSTALL.with(|refuse| refuse.replace(false))
+                || self
+                    .refused_installs
+                    .fetch_update(
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                        |left| left.checked_sub(1),
+                    )
+                    .is_ok()
+            {
                 return Err(SnapshotInstallError::Changed);
             }
             let expected = (
@@ -412,20 +521,57 @@ impl GraphState {
             {
                 return Err(SnapshotInstallError::Changed);
             }
+            let observed_through = published.observed_through;
+            // What only a probe can heal: a scan that could not vouch for itself, and files
+            // whose bytes could not be read. Nothing on the fact stream announces either.
+            //
+            // Staleness by itself is neither. A knowingly stale publication is a cache served
+            // on purpose while the build that replaces it is already claimed, and its
+            // fingerprint differs from disk — the ordinary comparison owes that rebuild and
+            // will make it, so being behind disk asks for no probe of its own.
+            //
+            // What such a publication DECLARES UNREAD is a different thing and keeps every
+            // obligation it always had: those are the paths its own metadata names, opened
+            // here as for any other artefact, and a probe answers them one path at a time.
+            // Not a walk of the whole tree — an episode over strict unread carries no scan
+            // obligation, and reading it as one would refuse recovery to exactly the
+            // publication that needs it.
+            // Whether this artefact can vouch for itself travels WITH the proof, prepared
+            // outside every lock from the strict reader. What was here instead — a fresh
+            // lenient count of unread rows, read under the publication gate — answered
+            // "nothing left unread" for a database that would not answer at all.
+            let mut recovery = recovery;
+            recovery.straddled |= published.force_stale;
             let mut inner = lock_recover(&self.inner);
             let mut pool = lock_recover(&self.snapshot_pool);
             pool.generation = published.generation;
             pool.entries = std::mem::take(&mut prepared.entries);
             inner.published = Some(published);
             inner.status = status;
-            if let Some(epoch) = reload_obligation {
-                self.complete_project_reload_through(epoch);
+            // Inside the publishing critical section, under `inner`: a reader holding it never
+            // sees a publication whose debts still name what it has just discharged.
+            *discard.borrow_mut() = lock_recover(&self.debt).record_publication(
+                std::time::Instant::now(),
+                observed_through,
+                forced_through.is_some(),
+                recovery_through,
+                recovery,
+            );
+            #[cfg(test)]
+            if let Some(hook) = &self.install_section_hook {
+                // Still inside: the gate, the lease and `inner` are all held here.
+                hook("under-locks");
             }
             Ok(())
         });
-        if matches!(&outcome, crate::workspace_lease::LeaseOperationOutcome::Applied(())) {
-            *lock_recover(&self.graph_retry) = None;
+        drop(_gate);
+        #[cfg(test)]
+        if let Some(hook) = &self.install_section_hook {
+            // Outside every lock, and before the payload goes: what the next line frees is
+            // what the section would otherwise have freed with the gate held.
+            hook("gate-released");
         }
+        drop(retired);
         outcome
     }
 
@@ -491,6 +637,18 @@ impl GraphState {
                 published.search_roots.clone(),
             )
         };
+        // Asked BEFORE the open, not after it. Opening the graph database is seconds of I/O on
+        // a large configuration, and a generation that has lost the workspace has no business
+        // paying for it: the fence below would refuse the result anyway, but only once the
+        // cost was already sunk.
+        // Each outcome keeps its own name: a released lease is not a superseded one, and the
+        // caller's handling differs.
+        if self.lease.is_superseded() {
+            return LeaseOperationOutcome::Superseded;
+        }
+        if self.lease.is_released() {
+            return LeaseOperationOutcome::Released;
+        }
         let opened = (|| -> anyhow::Result<(PooledSnapshotEntry, GraphPathIdentity)> {
             #[cfg(test)]
             if self.background_snapshot_failure.load(std::sync::atomic::Ordering::SeqCst) == 2 {
@@ -604,6 +762,7 @@ impl GraphState {
                 stale,
                 reload: "none",
                 topology: snapshot.fingerprint.topology,
+                drift_watch: self.drift_watch(),
             };
         };
         let mut reload = published.reload.label();
@@ -634,6 +793,201 @@ impl GraphState {
             stale,
             reload,
             topology: snapshot.fingerprint.topology,
+            drift_watch: self.drift_watch(),
+        }
+    }
+
+    /// Look at what the published build could not read: is the tree whole again, and can the
+    /// modules it recorded as unread be opened now?
+    ///
+    /// The only owner a publication that cannot vouch for itself can have. A restored
+    /// permission is not a file change, so nothing on the fact stream will ever announce it;
+    /// without this the graph stays `stale` for the life of the daemon. Runs on the watcher's
+    /// thread, never on a request — a request may only ask for it sooner.
+    pub(super) fn recovery_probe(&self, plan: &super::debt::ProbePlan) -> ProbeOutcome {
+        // Ask what we can SEE before paying for the walk. The walk drops the cached
+        // fingerprint and the event-maintained map and then stats the whole tree; doing it
+        // first meant a probe that could not take a snapshot at all — a held lease, a database
+        // that will not open — paid for the walk every time before discovering it had nothing
+        // to compare against, and threw the caches away for nothing besides.
+        use crate::workspace_lease::LeaseOperationOutcome;
+        match self.snapshot_blocking() {
+            // And it must be a snapshot of the publication these obligations are the gaps OF.
+            // Acquired without asking, a walk could measure the tree against one artefact
+            // while reporting about another's gaps: the receipt is refused at completion for
+            // the same reason, and paying for the whole pass first is the part that is
+            // avoidable.
+            LeaseOperationOutcome::Applied(Some(snapshot))
+                if snapshot.generation != plan.basis.generation() =>
+            {
+                return ProbeOutcome::CouldNotLook
+            }
+            LeaseOperationOutcome::Applied(_) => {}
+            // A failure to LOOK, not a look that found nothing.
+            _ => return ProbeOutcome::CouldNotLook,
+        }
+
+        // The BACKGROUND acquire, not the request pool's — and P, not the newest unread list.
+        // An obligation the latest enumeration did not mention is still owed an observation:
+        // a short scan that stopped naming it answered nothing about it, and dropping it from
+        // the walk would leave it with memory and no observer. One level per path, BY path:
+        // an aggregate is true for the rest of the episode as soon as any one path opens, and
+        // the next path to heal is then invisible. A path that is GONE is told apart from one
+        // that will not open — a removal is a measured change of composition, not an open to
+        // retry for ever.
+        let mut levels: Vec<(super::debt::Capability, super::debt::Level)> = plan
+            .open
+            .iter()
+            .map(|path| {
+                let level = match std::fs::File::open(path) {
+                    Ok(_) => super::debt::Level::Granted,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        super::debt::Level::Absent
+                    }
+                    Err(_) => super::debt::Level::Denied,
+                };
+                (super::debt::Capability::Open(path.clone()), level)
+            })
+            .collect();
+
+        // The walk is a capability only while one is owed. Scope and verdict come back from
+        // the SAME traversal: read as three separate questions of three mutable caches, a
+        // verdict could be paired with the roots of a walk that never produced it.
+        let walked = plan.scan.as_ref().and_then(|_| {
+            *lock_recover(&self.scan) = None;
+            {
+                let mut fp_state = lock_recover(&self.fp_map);
+                fp_state.map = None;
+                fp_state.walked_at = None;
+            }
+            self.walk_scan_receipt()
+        });
+        if let Some((scope, complete)) = &walked {
+            levels.push((
+                super::debt::Capability::ScanRoots,
+                if *complete { super::debt::Level::Granted } else { super::debt::Level::Denied },
+            ));
+            let _ = scope;
+        }
+        ProbeOutcome::Looked { levels, scope: walked.map(|(scope, _)| scope) }
+    }
+
+    /// Pair what this publication did with what is outstanding. Called BEFORE the publication
+    /// gate and outside every lock: reading what is outstanding and matching it against what
+    /// this build covered is O(P + U) of comparisons, and the critical section is for the
+    /// swap, not for that.
+    ///
+    /// Only three things retire an obligation, and each is something the installed result
+    /// actually shows: it read the address, a complete identity-exact walk of the scope that
+    /// required it did not find it, or a validated declaration no longer asks for it. A
+    /// shorter unread list is none of those — an enumeration that came up short has answered
+    /// nothing.
+    pub(super) fn recovery_proof(
+        &self,
+        generation: u64,
+        declared_unread: Option<&[String]>,
+        coverage: RecoveryCoverage<'_>,
+    ) -> super::debt::RecoveryPublicationProof {
+        let outstanding = lock_recover(&self.debt).outstanding_recovery();
+        let mut proof = super::debt::RecoveryPublicationProof {
+            generation,
+            captured_seq: outstanding.captured_seq,
+            declared_unread: declared_unread.map(<[String]>::to_vec),
+            ..Default::default()
+        };
+        // Without a strict unread list this publication cannot say what it managed to read:
+        // the lenient reader turns a broken database into "everything was read", and that
+        // would retire every outstanding address on the strength of an error.
+        let still_unread: Option<std::collections::HashSet<&str>> =
+            declared_unread.map(|unread| unread.iter().map(String::as_str).collect());
+        match coverage {
+            RecoveryCoverage::Walked { scope, enumerated, complete, straddled } => {
+                for (key, occurrence) in outstanding.keys {
+                    // Whatever else is true of this address, an artefact that names it unread
+                    // requires it. Both halves come from the same installed database, and the
+                    // unread list is the half with authority.
+                    let Some(unread) = still_unread.as_ref() else { continue };
+                    if unread.contains(key.as_str()) {
+                        continue;
+                    }
+                    let listed = enumerated.contains(key.as_str());
+                    if listed {
+                        proof.read_covered.push((key, occurrence));
+                    } else if scope.speaks_for_removal() && !scope.requires(&key) {
+                        // A validated declaration whose roots all resolved no longer asks for
+                        // this address. Not a choice to forget it — a measured change of what
+                        // is required. A walk that LISTED the address says the opposite,
+                        // whatever spelling it arrives under, so it is answered above.
+                        proof.out_of_scope_covered.push((key, occurrence));
+                    } else if complete
+                        && !straddled
+                        && scope.speaks_for_removal()
+                        && scope.requires(&key)
+                    {
+                        // The walk could speak for the whole of the scope that required it,
+                        // and did not list it: it is gone, not merely unlisted. A restricted
+                        // fallback may not say that — it is what the loader does when it
+                        // cannot read the project, and a path it never looked for is not a
+                        // path that went away.
+                        proof.absent_covered.push((key, occurrence));
+                    }
+                }
+                proof.scan_complete = Some(complete);
+                proof.straddled = straddled;
+                proof.scope = Some(scope);
+            }
+            RecoveryCoverage::Patched { rewritten } => {
+                for (key, occurrence) in outstanding.keys {
+                    let read = rewritten.contains(key.as_str())
+                        && still_unread
+                            .as_ref()
+                            .is_some_and(|unread| !unread.contains(key.as_str()));
+                    if read {
+                        proof.read_covered.push((key, occurrence));
+                    }
+                }
+            }
+            RecoveryCoverage::None => {}
+        }
+        proof
+    }
+
+    /// One traversal, one receipt: the scope actually covered and whether the walk behind it
+    /// may speak for the whole tree.
+    ///
+    /// The two belong together. Asked separately — the verdict from one cache, the roots from
+    /// another — a verdict can be paired with a composition that never produced it, and the
+    /// pairing is exactly what says an obligation has been answered.
+    pub(super) fn walk_scan_receipt(&self) -> Option<(super::debt::RecoveryScope, bool)> {
+        let root = self.workspace_root.as_deref()?;
+        // Counted where the tree is actually walked. A walk is the expensive half of a
+        // recovery pass, and a cost nothing counts is a cost nobody can measure.
+        self.scan_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let project = super::input::ProjectSnapshot::load_excluding(root, &self.cache_exclusions());
+        let universe = super::universe::ScannedUniverse::scan_excluding(
+            &project.scan_roots,
+            &project.excluded,
+        );
+        #[cfg(test)]
+        if let Some(hook) = self.scan_receipt_hook.clone() {
+            // AFTER the walk and before the receipt is made: the window another owner's
+            // replacement lands in, and the one a receipt assembled from two reads would
+            // straddle without saying so.
+            hook(self);
+        }
+        Some((recovery_scope_of(&project), universe.clean()))
+    }
+
+    /// Give back the cursor the comparison keeps for its own scan cache.
+    ///
+    /// It is subscribed lazily, by the first comparison, and it is the graph's — not the
+    /// watcher's. When the observation ends nothing compares again for this generation, and a
+    /// cursor nobody drains makes the hub hold entries for a consumer that has left.
+    pub(super) fn release_scan_cursor(&self) {
+        let Some(hub) = &self.change_hub else { return };
+        let cursor = lock_recover(&self.hub_cursor).close();
+        if let Some(cursor) = cursor {
+            hub.unsubscribe(cursor);
         }
     }
 
@@ -653,10 +1007,12 @@ impl GraphState {
         let hub_healthy = matches!(
             &self.change_hub,
             Some(hub) if matches!(
-                hub.health_for(*lock_recover(&self.hub_cursor)),
+                hub.health_for(lock_recover(&self.hub_cursor).peek()),
                 crate::change_hub::Health::Healthy
             )
         );
+        // Before any look at disk, cached or fresh.
+        let observed_through = self.observation();
         if !hub_healthy {
             let mut fp_state = lock_recover(&self.fp_map);
             fp_state.map = None;
@@ -673,7 +1029,12 @@ impl GraphState {
                         topology: fp_state.topology,
                     };
                     let clean = fp_state.clean;
-                    *cache = Some(ScanCache { at: Instant::now(), disk_fp: fp, clean });
+                    *cache = Some(ScanCache {
+                        at: Instant::now(),
+                        disk_fp: fp,
+                        clean,
+                        observed_through,
+                    });
                     return Some((fp, clean));
                 }
             }
@@ -688,6 +1049,12 @@ impl GraphState {
             &project.excluded,
         );
         let clean = universe.clean();
+        #[cfg(test)]
+        if let Some(hook) = self.scan_window_hook.clone() {
+            // The tree has been enumerated and the position this look may vouch for was read
+            // before it: a change delivered here belongs to neither.
+            hook(self);
+        }
         let mut entries: Vec<(String, u128, u64)> =
             universe.stats.into_iter().map(|s| (s.path, s.mtime, s.len)).collect();
         entries.sort();
@@ -700,27 +1067,53 @@ impl GraphState {
             fp_state.topology = topology;
             fp_state.clean = clean;
         }
-        *cache = Some(ScanCache { at: Instant::now(), disk_fp: fp, clean });
+        *cache = Some(ScanCache { at: Instant::now(), disk_fp: fp, clean, observed_through });
         Some((fp, clean))
+    }
+
+    /// Forget every cached look at disk, so the next one walks the tree again.
+    ///
+    /// A statement about what is ON disk cannot be read through the throttle: the cached
+    /// answer is kept for pacing, and whether it still describes the tree depends on a
+    /// watcher having delivered the edit — a race, not an oracle.
+    #[cfg(test)]
+    pub(super) fn forget_the_disk_look(&self) {
+        *lock_recover(&self.scan) = None;
+        let mut fp_state = lock_recover(&self.fp_map);
+        fp_state.map = None;
+        fp_state.walked_at = None;
+    }
+
+    /// The hub position the comparison's current fingerprint can vouch for.
+    ///
+    /// A comparison answers what its own walk saw and no more. Answering by a number read at
+    /// the moment of the verdict retires facts delivered after the walk — including one the
+    /// walk could not possibly have covered, whose only record is that debt.
+    pub(super) fn scan_watermark(&self) -> u64 {
+        lock_recover(&self.scan)
+            .as_ref()
+            .map_or_else(|| self.observation(), |cache| cache.observed_through)
     }
 
     fn invalidate_scan_on_hub_drift(&self) {
         let Some(hub) = &self.change_hub else {
             return;
         };
-        let cursor = {
-            let mut slot = lock_recover(&self.hub_cursor);
-            match *slot {
-                Some(cursor) => cursor,
-                None => {
-                    let cursor = hub.subscribe();
-                    *slot = Some(cursor);
-                    cursor
-                }
-            }
+        // Taken with the epoch that names this slot's current life. The drain below runs with
+        // the lock released; the epoch is what tells a write-back that the cursor it is
+        // holding is still the slot's, and not one a release has already ended.
+        let Some((cursor, epoch)) = lock_recover(&self.hub_cursor).open(hub) else {
+            // Closed: the observation is over and nothing subscribes again.
+            return;
         };
         let batch = hub.drain(cursor);
-        *lock_recover(&self.hub_cursor) = Some(batch.cursor);
+        if !lock_recover(&self.hub_cursor).advance(epoch, batch.cursor) {
+            // The slot moved on or closed while this drain ran. Whoever ends a cursor's life
+            // unsubscribes it, and that is this drain: storing it would resurrect an id the
+            // hub has already forgotten.
+            hub.unsubscribe(batch.cursor);
+            return;
+        }
         if batch.rescan_required {
             *lock_recover(&self.scan) = None;
             let mut fp_state = lock_recover(&self.fp_map);
@@ -762,7 +1155,7 @@ impl GraphState {
     }
 }
 
-fn entry_touches_scan_universe(entry: &ChangeEntry) -> bool {
+pub(super) fn entry_touches_scan_universe(entry: &ChangeEntry) -> bool {
     if entry.kind == ChangeKind::SubtreeRemoved {
         return true;
     }
@@ -776,7 +1169,7 @@ fn entry_touches_scan_universe(entry: &ChangeEntry) -> bool {
 /// Whether a delivered change is one of the analyzer config files — an edit there
 /// can change the extension topology (and with it the scan-root universe) without
 /// touching a single `.bsl`/`.xml`.
-fn entry_is_config_file(entry: &ChangeEntry) -> bool {
+pub(super) fn entry_is_config_file(entry: &ChangeEntry) -> bool {
     let is_config = |path: &Path| {
         path.file_name()
             .and_then(|n| n.to_str())
@@ -807,6 +1200,132 @@ fn stat_pair(path: &Path) -> Option<(u128, u64)> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The three interleavings, run concurrently with real barriers rather than in sequence.
+    ///
+    /// The drain is what makes them races: it runs with the slot lock RELEASED, so a release
+    /// can land inside it. A — a copy written back after that release. B — a comparison
+    /// starting after it and subscribing a cursor nobody would unsubscribe. C — two drains
+    /// overlapping the release.
+    #[test]
+    fn a_closing_cursor_races_its_own_drain_and_a_second_comparison() {
+        use crate::graph::state::lock_recover;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        for round in 0..8 {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            crate::graph::test_support::sample_workspace(root);
+            let hub = crate::change_hub::WorkspaceChangeHub::start(vec![root.to_path_buf()]);
+            assert!(hub.wait_until_watching(std::time::Duration::from_secs(5)));
+            let before = hub.active_cursor_count();
+            let graph = Arc::new(
+                crate::graph::state::GraphState::for_workspace(root.to_path_buf())
+                    .with_change_hub(hub.clone()),
+            );
+            graph.invalidate_scan_on_hub_drift();
+
+            // A: a drain already holding a copy when the release lands.
+            let opened = lock_recover(&graph.hub_cursor).open(&hub).expect("an open slot");
+            let gate = Arc::new(Barrier::new(3));
+            let refused = Arc::new(AtomicUsize::new(0));
+
+            let drainer = {
+                let (graph, hub, gate, refused) =
+                    (Arc::clone(&graph), hub.clone(), Arc::clone(&gate), Arc::clone(&refused));
+                std::thread::spawn(move || {
+                    let (cursor, epoch) = opened;
+                    gate.wait();
+                    let batch = hub.drain(cursor);
+                    if !lock_recover(&graph.hub_cursor).advance(epoch, batch.cursor) {
+                        // Whoever ends a cursor's life unsubscribes it, and that is this drain.
+                        hub.unsubscribe(batch.cursor);
+                        refused.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+            };
+            // B and C: a release, and a second comparison starting beside it.
+            let releaser = {
+                let (graph, gate) = (Arc::clone(&graph), Arc::clone(&gate));
+                std::thread::spawn(move || {
+                    gate.wait();
+                    graph.release_scan_cursor();
+                })
+            };
+            let second = {
+                let (graph, gate) = (Arc::clone(&graph), Arc::clone(&gate));
+                std::thread::spawn(move || {
+                    gate.wait();
+                    graph.invalidate_scan_on_hub_drift();
+                })
+            };
+            drainer.join().unwrap();
+            releaser.join().unwrap();
+            second.join().unwrap();
+
+            let slot = lock_recover(&graph.hub_cursor);
+            assert!(slot.is_closed(), "round {round}: close is final");
+            assert!(
+                slot.holds().is_none(),
+                "round {round}: a closed slot holds an id the hub has already forgotten",
+            );
+            drop(slot);
+            assert_eq!(
+                hub.active_cursor_count(),
+                before,
+                "round {round}: a cursor outlived the observation — {} write-backs refused",
+                refused.load(Ordering::SeqCst),
+            );
+            hub.shutdown();
+        }
+    }
+
+    /// A cursor's life ends where the observation ends, and the three ways that end could be
+    /// raced all had the same shape: the drain runs with the slot lock released.
+    ///
+    /// A — a copied cursor written back after a release resurrected an id the hub had already
+    /// forgotten. B — a release that emptied the slot let the next comparison subscribe one
+    /// nobody would ever unsubscribe. C — two comparisons overlapping a release left the slot
+    /// holding whichever finished last.
+    #[test]
+    fn closing_a_scan_cursor_prevents_resubscription_and_stale_writeback() {
+        use crate::graph::state::lock_recover;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        crate::graph::test_support::sample_workspace(root);
+        let hub = crate::change_hub::WorkspaceChangeHub::start(vec![root.to_path_buf()]);
+        assert!(hub.wait_until_watching(std::time::Duration::from_secs(5)));
+        let before = hub.active_cursor_count();
+
+        let graph = crate::graph::state::GraphState::for_workspace(root.to_path_buf())
+            .with_change_hub(hub.clone());
+
+        // The comparison subscribes on its own.
+        graph.invalidate_scan_on_hub_drift();
+        assert_eq!(hub.active_cursor_count(), before + 1, "the comparison subscribed one cursor");
+
+        // A: the copy a drain is holding, taken before the release.
+        let (held, epoch) = lock_recover(&graph.hub_cursor).open(&hub).expect("an open slot");
+        graph.release_scan_cursor();
+        assert_eq!(hub.active_cursor_count(), before, "the release took the cursor with it");
+        assert!(
+            !lock_recover(&graph.hub_cursor).advance(epoch, held),
+            "a closed slot accepted a write-back and resurrected a dead cursor",
+        );
+
+        // B and C: nothing subscribes again, however many comparisons come through.
+        for _ in 0..3 {
+            graph.invalidate_scan_on_hub_drift();
+        }
+        assert!(lock_recover(&graph.hub_cursor).is_closed(), "the slot stays closed");
+        assert_eq!(
+            hub.active_cursor_count(),
+            before,
+            "a comparison after the release subscribed a cursor nobody will unsubscribe",
+        );
+        hub.shutdown();
+    }
     use super::super::scan::workspace_fingerprint;
     use super::super::state::{lock_recover, GraphState};
     use super::super::test_support::{
@@ -953,9 +1472,12 @@ mod tests {
                 reload: ReloadState::Idle,
                 force_stale,
                 search_roots: None,
+                observed_through: Some(0),
             },
             GraphStatus::Ready { files: 0 },
             None,
+            None,
+            super::super::debt::RecoveryPublicationProof::without_coverage(generation),
         );
         assert!(matches!(
             outcome,
@@ -1568,6 +2090,319 @@ mod tests {
             graph.scan_count(),
             scans_after_prime,
             "an irrelevant temp file must not invalidate the cache and re-trigger a scan",
+        );
+    }
+
+    /// The three positive proofs, and everything that is NOT one of them.
+    ///
+    /// This is the producer, where the policy lives: what the debt applies is whatever arrives
+    /// in these lists, so the lists are where "a complete walk of a validated scope" has to be
+    /// told apart from a short one, a restricted fallback, and a patch that never looked.
+    #[test]
+    fn only_three_positives_retire_an_obligation() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphState::for_workspace(dir.path().to_path_buf());
+        // Real places on disk, because a descriptor whose roots do not resolve may not say
+        // that an address has gone away — and a test that asserted removal against a spelling
+        // nothing answers to would prove the opposite of what it claims.
+        let root = dir.path().join("ws");
+        let excluded = root.join("Исключено");
+        let other_root = dir.path().join("другое");
+        std::fs::create_dir_all(&excluded).unwrap();
+        std::fs::create_dir_all(&other_root).unwrap();
+        let validated = super::super::debt::RecoveryScope::of(
+            std::slice::from_ref(&root),
+            std::slice::from_ref(&excluded),
+            true,
+        );
+        let fallback =
+            super::super::debt::RecoveryScope::of(std::slice::from_ref(&root), &[], false);
+        let module = root.join("Модуль.bsl");
+        let another = root.join("Другой.bsl");
+        std::fs::write(&module, "").unwrap();
+        std::fs::write(&another, "").unwrap();
+        let module = module.canonicalize().unwrap().to_string_lossy().into_owned();
+        let another = another.canonicalize().unwrap().to_string_lossy().into_owned();
+        let required: &str = &module;
+        let other: &str = &another;
+
+        // Declare the obligation the way an unsound publication does.
+        lock_recover(&graph.debt).record_publication(
+            std::time::Instant::now(),
+            Some(1),
+            false,
+            None,
+            super::super::debt::RecoveryPublicationProof {
+                generation: 1,
+                declared_unread: Some(vec![required.to_owned()]),
+                ..Default::default()
+            },
+        );
+
+        let enumerated_with: std::collections::HashSet<&str> =
+            [required, other].into_iter().collect();
+        let enumerated_without: std::collections::HashSet<&str> = [other].into_iter().collect();
+        let unread_none: Vec<String> = Vec::new();
+        let unread_it = vec![required.to_owned()];
+
+        let read = graph.recovery_proof(
+            2,
+            Some(&unread_none),
+            RecoveryCoverage::Walked {
+                scope: validated.clone(),
+                enumerated: &enumerated_with,
+                complete: true,
+                straddled: false,
+            },
+        );
+        assert_eq!(read.read_covered.len(), 1, "a build that enumerated and read it proves so");
+        assert!(read.absent_covered.is_empty() && read.out_of_scope_covered.is_empty());
+
+        let still_unread = graph.recovery_proof(
+            2,
+            Some(&unread_it),
+            RecoveryCoverage::Walked {
+                scope: validated.clone(),
+                enumerated: &enumerated_with,
+                complete: true,
+                straddled: false,
+            },
+        );
+        assert!(
+            still_unread.read_covered.is_empty(),
+            "a build that listed it and could not read it proved it read it",
+        );
+
+        let absent = graph.recovery_proof(
+            2,
+            Some(&unread_none),
+            RecoveryCoverage::Walked {
+                scope: validated.clone(),
+                enumerated: &enumerated_without,
+                complete: true,
+                straddled: false,
+            },
+        );
+        assert_eq!(absent.absent_covered.len(), 1, "a complete walk that did not list it");
+
+        let short = graph.recovery_proof(
+            2,
+            Some(&unread_none),
+            RecoveryCoverage::Walked {
+                scope: validated.clone(),
+                enumerated: &enumerated_without,
+                complete: false,
+                straddled: false,
+            },
+        );
+        assert!(short.absent_covered.is_empty(), "a SHORT walk proved an absence");
+
+        let restricted = graph.recovery_proof(
+            2,
+            Some(&unread_none),
+            RecoveryCoverage::Walked {
+                scope: fallback,
+                enumerated: &enumerated_without,
+                complete: true,
+                straddled: false,
+            },
+        );
+        assert!(
+            restricted.absent_covered.is_empty() && restricted.out_of_scope_covered.is_empty(),
+            "a restricted fallback declared a path gone",
+        );
+
+        // A narrower validated declaration no longer asks for it — that IS a proof.
+        let narrowed =
+            super::super::debt::RecoveryScope::of(std::slice::from_ref(&other_root), &[], true);
+        let out_of_scope = graph.recovery_proof(
+            2,
+            Some(&unread_none),
+            RecoveryCoverage::Walked {
+                scope: narrowed,
+                enumerated: &enumerated_without,
+                complete: true,
+                straddled: false,
+            },
+        );
+        assert_eq!(out_of_scope.out_of_scope_covered.len(), 1, "the roots no longer cover it");
+
+        // A point patch proves only what it rewrote, and never an absence.
+        let rewritten: std::collections::HashSet<&str> = [required].into_iter().collect();
+        let patched = graph.recovery_proof(
+            2,
+            Some(&unread_none),
+            RecoveryCoverage::Patched { rewritten: &rewritten },
+        );
+        assert_eq!(patched.read_covered.len(), 1, "the patch re-projected it");
+        assert!(patched.absent_covered.is_empty(), "a patch proved an absence");
+
+        let untouched: std::collections::HashSet<&str> = [other].into_iter().collect();
+        let elsewhere = graph.recovery_proof(
+            2,
+            Some(&unread_none),
+            RecoveryCoverage::Patched { rewritten: &untouched },
+        );
+        assert!(elsewhere.read_covered.is_empty(), "a patch that never touched it covered it");
+        assert!(
+            elsewhere.absent_covered.is_empty() && elsewhere.out_of_scope_covered.is_empty(),
+            "a patch proved something about an address it never looked at",
+        );
+
+        // A walk that straddled a write enumerated a world that has already been replaced.
+        let straddled = graph.recovery_proof(
+            2,
+            Some(&unread_none),
+            RecoveryCoverage::Walked {
+                scope: validated.clone(),
+                enumerated: &enumerated_without,
+                complete: true,
+                straddled: true,
+            },
+        );
+        assert!(
+            straddled.absent_covered.is_empty(),
+            "a build whose tree moved under it proved an absence",
+        );
+        assert_eq!(straddled.scan_complete, Some(true), "the walk itself was still whole");
+        assert!(straddled.straddled, "and the publication still cannot vouch for it");
+
+        // A root that could not be resolved keeps its declared spelling, under which the
+        // canonical addresses beneath it match nothing. That is not a removal.
+        let gone = dir.path().join("ушёл");
+        let unresolved =
+            super::super::debt::RecoveryScope::of(std::slice::from_ref(&gone), &[], true);
+        let denied_root = graph.recovery_proof(
+            2,
+            Some(&unread_none),
+            RecoveryCoverage::Walked {
+                scope: unresolved,
+                enumerated: &enumerated_without,
+                complete: true,
+                straddled: false,
+            },
+        );
+        assert!(
+            denied_root.out_of_scope_covered.is_empty() && denied_root.absent_covered.is_empty(),
+            "a root that would not resolve declared its subtree gone",
+        );
+
+        // An address the walk LISTED is required, whatever spelling the roots canonicalise
+        // to: a descendant reached through a symlink is enumerated under the walked name and
+        // canonicalises elsewhere.
+        let alias: std::collections::HashSet<&str> = [required, other].into_iter().collect();
+        let aliased = graph.recovery_proof(
+            2,
+            Some(&unread_it),
+            RecoveryCoverage::Walked {
+                scope: super::super::debt::RecoveryScope::of(
+                    std::slice::from_ref(&other_root),
+                    &[],
+                    true,
+                ),
+                enumerated: &alias,
+                complete: true,
+                straddled: false,
+            },
+        );
+        assert!(
+            aliased.out_of_scope_covered.is_empty(),
+            "an address the walk listed and the artefact could not read was retired anyway",
+        );
+
+        // No strict unread list at all: the database would not say what it managed to read,
+        // so nothing it did proves anything about an obligation.
+        let blind_metadata = graph.recovery_proof(
+            2,
+            None,
+            RecoveryCoverage::Walked {
+                scope: validated.clone(),
+                enumerated: &enumerated_with,
+                complete: true,
+                straddled: false,
+            },
+        );
+        assert!(
+            blind_metadata.read_covered.is_empty()
+                && blind_metadata.absent_covered.is_empty()
+                && blind_metadata.out_of_scope_covered.is_empty(),
+            "a publication that could not read its own metadata retired an obligation",
+        );
+
+        // And a cache, which did neither.
+        let cached = graph.recovery_proof(2, Some(&unread_none), RecoveryCoverage::None);
+        assert!(
+            cached.read_covered.is_empty()
+                && cached.absent_covered.is_empty()
+                && cached.out_of_scope_covered.is_empty(),
+            "a cache served as it stands proved something",
+        );
+    }
+
+    /// Unreadable metadata is a failure to LOOK, and it answers nothing.
+    ///
+    /// `read_unread_paths` returns an empty list for a database that will not read — the
+    /// lenient form the serving API has always used. Taken as authority it says "this build
+    /// read everything", which would retire every outstanding obligation on the strength of an
+    /// error.
+    #[test]
+    fn strict_unread_errors_never_become_an_empty_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphState::for_workspace(dir.path().to_path_buf());
+        lock_recover(&graph.debt).record_publication(
+            std::time::Instant::now(),
+            Some(1),
+            false,
+            None,
+            super::super::debt::RecoveryPublicationProof {
+                generation: 1,
+                declared_unread: Some(vec!["/ws/Модуль.bsl".to_owned()]),
+                ..Default::default()
+            },
+        );
+        let enumerated: std::collections::HashSet<&str> = ["/ws/Модуль.bsl"].into_iter().collect();
+        let blind = graph.recovery_proof(
+            2,
+            None,
+            RecoveryCoverage::Walked {
+                scope: super::super::debt::RecoveryScope::of(
+                    &[std::path::PathBuf::from("/ws")],
+                    &[],
+                    true,
+                ),
+                enumerated: &enumerated,
+                complete: true,
+                straddled: false,
+            },
+        );
+        assert!(
+            blind.read_covered.is_empty(),
+            "a publication whose metadata would not read claimed it had read the file",
+        );
+        assert!(
+            blind.declared_unread.is_none(),
+            "and it claimed authority over what is still unread",
+        );
+
+        // The strict reader itself: an absent key is an empty set, a broken payload is an
+        // error.
+        let path = dir.path().join("meta.sqlite");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)", []).unwrap();
+        assert_eq!(
+            crate::graph_db::read_unread_paths_strict(&conn).unwrap(),
+            Vec::<String>::new(),
+            "an artefact that recorded nothing unread has nothing unread",
+        );
+        conn.execute("INSERT INTO meta (key, value) VALUES ('unread_paths', 'not json')", [])
+            .unwrap();
+        assert!(
+            crate::graph_db::read_unread_paths_strict(&conn).is_err(),
+            "a payload that will not decode was read as an empty answer",
+        );
+        assert!(
+            crate::graph_db::read_unread_paths(&conn).is_empty(),
+            "control: the lenient reader still answers empty, which is why it is not authority",
         );
     }
 }

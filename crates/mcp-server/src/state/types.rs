@@ -1,6 +1,6 @@
 use bsl_search::SearchEngine;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// The search engine behind a mutex. It MUST stay a `Mutex` (not an `RwLock`): the engine
 /// owns a `rusqlite::Connection`, which is `Send` but `!Sync` — its internal statement cache
@@ -8,7 +8,13 @@ use std::sync::{Arc, Mutex};
 /// at once. Searches therefore serialize here by necessity. The "overlay warming up" failure
 /// under a concurrent batch is fixed in [`crate::tools::search`] by *blocking* on this lock
 /// (queueing) rather than bailing out on brief contention, not by widening the lock.
-pub(crate) type SharedSearchEngine = Arc<Mutex<Option<SearchEngine>>>;
+pub(crate) type SharedSearchEngine = Arc<crate::tools::search::AdmittedEngine>;
+
+/// A shared engine handle over `engine`, admitted in queue order (see
+/// [`crate::tools::search::AdmittedEngine`]).
+pub(crate) fn shared_engine(engine: Option<SearchEngine>) -> SharedSearchEngine {
+    Arc::new(crate::tools::search::AdmittedEngine::new(engine))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorkspaceSearchMode {
@@ -64,10 +70,19 @@ pub(crate) enum SemanticRuntimeStatus {
     Indexing,
     Ready,
     Failed(String),
+    /// The background pass left because the daemon asked its owners to go. Terminal, and
+    /// deliberately NOT [`Self::Indexing`]: that reads "come back in a moment", and after a
+    /// shutdown nothing is coming. Deliberately not [`Self::Ready`] either — the index may
+    /// have been left half filled, and a semantic search over it would answer a silent partial.
+    ///
+    /// Reported to callers exactly as [`Self::Failed`] is, so no reason code and no part of
+    /// the MCP contract changes; what differs is that the log and the status line say shutdown
+    /// rather than breakage.
+    Stopped,
 }
 
 /// How the boot must initialize the workspace overlay before the engine is published. The overlay
-/// is inert until initialized — `reindex_dirty_from_snapshots` no-ops on `!initialized` — so without
+/// is inert until initialized — a point refresh captures nothing before that — so without
 /// one of these the whole resident-fed incremental reindex (and overlay edit-freshness) is
 /// unreachable in local SQLite mode.
 pub(super) enum OverlayInit {
@@ -96,10 +111,6 @@ pub(super) struct WorkspaceSearchInit {
     pub(super) pending_embed: Option<PendingEmbed>,
     /// How to bring the workspace overlay online for this boot branch.
     pub(super) overlay_init: OverlayInit,
-    /// Whether the change hub was watching by the time this init read disk. Only then is
-    /// the event stream complete from the baseline onwards, and only then may a sink be
-    /// started to trust it.
-    pub(super) watch_armed: bool,
 }
 
 /// Inputs for the background embedding pass: its own database path and embedder config

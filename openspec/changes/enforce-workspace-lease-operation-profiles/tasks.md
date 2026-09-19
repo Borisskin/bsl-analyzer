@@ -68,6 +68,25 @@
 - [x] 7.5 Isolate temporary graph databases for overlapping backend generations in one process; prove refused/failed builds preserve another build's file and rerun the superseded-daemon lifecycle integration.
 - [x] 7.6 Make cold-graph name-dictionary fixtures hold a real lease lock before startup, release it for ready-graph controls, and cover the transport suite on Windows too.
 
+## 8. Debt lifecycle: one graph debt state and one background stop
+
+- [x] 8.1 Make declaring the roots idempotent in the hub: compare against the declaration the hub thread accepted, send no re-arm and ask for no reconcile when it is unchanged, announce a gap in the cover once, and heal it in the hub itself; read "never polled" as overdue rather than fresh; make `shutdown` a production method that stops the hub thread and the blind poll alike.
+- [x] 8.2 Replace the graph's seven flags with one debt state, one pure decision and one executor: change, forced reload, failed build (a loader that could not be spawned included), owed marks, an unsound publication with a probe of its own, and a pending topology/roots refresh; gate publication against mark consumption; hold marks on a lease that cannot be confirmed.
+- [x] 8.3 Give every background owner one stop: registered wakers released by `OwnerStop::stop` itself, a lock-free stop read for predicates that run under another owner's lock, stop-aware sleeps and acquires, `WorkspaceSearchApply::Stopping` as its own outcome, `AdmittedEngine::lock` test-only, and an explicit shutdown order whose outcome does not depend on the order of its middle steps.
+- [x] 8.4 Report the search overlay's debt honestly: expose `initialized` as its own fact beside the counts, and answer `partial` with `index_building` while the overlay has never been built.
+- [x] 8.5 Key the wait/acquire inventory by `(file, enclosing fn, token)`, classify every key, and prove the gate fails on a sleep injected into the retry driver; record the scenarios in `verification.md` and their exact filters in both CI `Drift contract` steps.
+- [x] 8.6 Run the full gates — formatting, strict Clippy, `git diff --check`, both crate suites, the contract snapshot, every exact filter and the non-existent-filter probe — and record the real counts and logs.
+
+## 9. Graph schedule v3: maturity, not openness — and one admission point for the stop
+
+- [x] 9.1 Give every kind of graph debt one schedule and one maturity answer (`Ripeness`: ripe now, due at a moment, a standing watch at a declared cap, exhausted with the external work that revives it, or queued behind a debt that is itself owned); build the decision and the alarm on that one account rather than on separate rules about what to mute.
+- [x] 9.2 Make the decision pick the ripest work instead of the merely open debt: a forced build is demanded by the work chosen, inherited only by a retry that is going to read disk anyway, and marks start through their own grace and budget.
+- [x] 9.3 Let an exhausted retry hold nothing, so the debts queued behind it come forward instead of starving; keep a delivered change ahead of a marks grace, because that grace exists to leave room for exactly such a change.
+- [x] 9.4 Put the stop inside the decision and make the claim the one linear admission point: `Facts.stopping`, `ReloadClaim::Stopping` read under the lock that grants the slot, and a first-build claim that refuses the same way.
+- [x] 9.5 Replace the tautological ownership check with an independent oracle: the model keeps its own ledger, reads the standing rather than re-running the decision, proves each named revival by applying it, and adds a bounded settling walk that catches both a hot loop and a debt nothing will ever run.
+- [x] 9.6 Fix the verified findings of the same round: a watcher that never started abandons its advisory; the retry driver reads the stop before sleeping on every branch that let the lock go; the first drain records without deciding; the recovery probe opens a descriptor of its own; a stop exit of the embed pass says how it ended; a point batch may not settle in the other baseline mode; a status answer does not publish an ownership verdict nothing has checked.
+- [x] 9.7 Run the gates and the mutation controls: eleven controls, each reddening a check named in advance, with the production text restored byte-for-byte afterwards.
+
 <!-- GOAL_CURSOR -->
 Tasks 0-7 are complete with final local verification recorded on 2026-09-09.
 The user authorized publication of the follow-up and live CI verification. Maintainer acceptance

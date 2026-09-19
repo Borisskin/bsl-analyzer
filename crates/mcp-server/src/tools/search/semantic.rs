@@ -28,7 +28,7 @@ use tracing::warn;
     reason = "semantic search has the lexical inputs plus its runtime status; a one-use context struct would only rename them"
 )]
 pub(super) fn semantic_code_hits(
-    engine: &Arc<Mutex<Option<SearchEngine>>>,
+    engine: &crate::state::SharedSearchEngine,
     cancel: &CancellationToken,
     semantic_runtime: &Arc<Mutex<SemanticRuntimeStatus>>,
     workspace_search_mode: WorkspaceSearchMode,
@@ -65,7 +65,11 @@ pub(super) fn semantic_code_hits(
             ));
         };
 
-        if let SemanticRuntimeStatus::Failed(_) = semantic_runtime {
+        if let SemanticRuntimeStatus::Failed(_) | SemanticRuntimeStatus::Stopped = semantic_runtime
+        {
+            // One answer for both: the semantic runtime is not there. A stopped pass is not a
+            // failure, but to a caller it is the same absence, and it earns no reason code of
+            // its own.
             return Ok(CodeHits::Unavailable(SemanticUnavailable::RuntimeFailed));
         }
 
@@ -240,7 +244,7 @@ pub(super) fn semantic_code_hits(
         );
         match direct {
             DirectResult::Found(hits) => {
-                return Ok(CodeHits::Ready { hits, roots });
+                return Ok(CodeHits::Ready { hits, roots, overlay: None });
             }
             DirectResult::Terminal(error) => {
                 return Err(external_baseline_mcp_error(&error).into());
@@ -260,7 +264,7 @@ pub(super) fn semantic_code_hits(
     }
 
     match engine.search_with_embedding_read_only(&query_embedding, limit, Some("code")) {
-        Ok(hits) => Ok(CodeHits::Ready { hits, roots }),
+        Ok(hits) => Ok(CodeHits::Ready { hits, roots, overlay: None }),
         Err(e) => Err(McpError::internal_error(format!("search error: {e}"), None).into()),
     }
 }
@@ -476,7 +480,7 @@ mod tests {
     fn semantic_core_reports_unavailable_when_runtime_failed() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("workspace-search.db");
-        let engine = Arc::new(Mutex::new(Some(SearchEngine::fts_only(&db_path).unwrap())));
+        let engine = crate::state::shared_engine(Some(SearchEngine::fts_only(&db_path).unwrap()));
         let outcome = semantic_code_hits(
             &engine,
             &tokio_util::sync::CancellationToken::new(),
@@ -496,7 +500,7 @@ mod tests {
     fn semantic_core_reports_pending_when_indexing() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("workspace-search.db");
-        let engine = Arc::new(Mutex::new(Some(SearchEngine::fts_only(&db_path).unwrap())));
+        let engine = crate::state::shared_engine(Some(SearchEngine::fts_only(&db_path).unwrap()));
         let outcome = semantic_code_hits(
             &engine,
             &tokio_util::sync::CancellationToken::new(),
@@ -526,7 +530,8 @@ mod tests {
             },
             ..SearchConfig::default()
         };
-        let engine = Arc::new(Mutex::new(Some(SearchEngine::new(&db_path, config).unwrap())));
+        let engine =
+            crate::state::shared_engine(Some(SearchEngine::new(&db_path, config).unwrap()));
         let outcome = semantic_code_hits(
             &engine,
             &tokio_util::sync::CancellationToken::new(),

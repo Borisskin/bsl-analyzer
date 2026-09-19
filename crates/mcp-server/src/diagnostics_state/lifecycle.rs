@@ -76,6 +76,10 @@ pub(crate) struct DiagnosticsState {
     pub(super) scan: Arc<Mutex<Option<ScanCache>>>,
     pub(super) last_access: Arc<Mutex<Instant>>,
     pub(super) shutdown: Arc<AtomicBool>,
+    /// Released together with the flag above: the sweeper parks between ticks, and a flag it
+    /// only reads on waking would keep it asleep for a whole interval after the daemon has
+    /// gone.
+    pub(super) shutdown_wake: Arc<(Mutex<bool>, std::sync::Condvar)>,
     /// Guards spawning exactly one idle sweeper for the lifetime of the handle.
     pub(super) sweeper_started: Arc<AtomicBool>,
     pub(super) workspace_root: Option<PathBuf>,
@@ -102,6 +106,11 @@ pub(crate) struct DiagnosticsState {
     /// the scan, because a retry reads each hole WHOLE off disk (`read_to_string`
     /// fails UTF-8 only after reading), and `poll_drift` runs on every request.
     pub(super) last_hole_retry: Arc<Mutex<Option<Instant>>>,
+    /// When each hole was last re-read on a request's account. A file that stays unreadable
+    /// is the steady state a hole exists for, and re-reading it whole under the resident's
+    /// write lock on every request about it is the very cost the sweep above is paced to
+    /// avoid — so the named retry is paced too, per file.
+    pub(super) last_named_hole_retry: Arc<Mutex<HashMap<String, Instant>>>,
     /// When the reconciler last ran a watchdog scan.
     pub(super) last_reconcile: Arc<Mutex<Instant>>,
     pub(super) reconcile_interval: Duration,
@@ -111,6 +120,16 @@ pub(crate) struct DiagnosticsState {
     /// When the drift poll last compared the scope's resolved git refs, so the
     /// ref-only-movement check stays off the per-request hot path.
     pub(super) scope_ref_check_at: Arc<Mutex<Option<Instant>>>,
+    /// Whether the hub's stream can be trusted to carry everything since this resident read
+    /// disk: the watch was already armed when the resident subscribed, or a scan has since
+    /// run under an armed one. False puts the drift back on its own walk — the window
+    /// between a build that raced the arming and the arming itself is in no event.
+    pub(super) hub_armed: Arc<AtomicBool>,
+    /// Whether the idle sweeper thread is running right now. Raised before the thread starts
+    /// and lowered by a guard it owns, so every way out — a return, a panic, a thread that
+    /// never started — lowers it. A test cannot otherwise see a detached thread leave.
+    #[cfg(test)]
+    pub(super) sweeper_live: Arc<AtomicBool>,
     /// Full rebuilds STARTED — the operation itself, not one of its effects. A rebuild
     /// that is declined at the swap leaves no trace in the resident, so nothing else can
     /// tell "asked for and thrown away" from "never asked for".
@@ -218,6 +237,7 @@ impl DiagnosticsState {
             scan: Arc::new(Mutex::new(None)),
             last_access: Arc::new(Mutex::new(Instant::now())),
             shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown_wake: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
             sweeper_started: Arc::new(AtomicBool::new(false)),
             workspace_root,
             excluded: Vec::new(),
@@ -227,10 +247,14 @@ impl DiagnosticsState {
             hub_cursor: Arc::new(Mutex::new(None)),
             force_scan: Arc::new(AtomicBool::new(false)),
             last_hole_retry: Arc::new(Mutex::new(None)),
+            last_named_hole_retry: Arc::new(Mutex::new(HashMap::new())),
             last_reconcile: Arc::new(Mutex::new(Instant::now())),
             reconcile_interval: reconcile_interval(),
             scan_count: Arc::new(AtomicUsize::new(0)),
             scope_ref_check_at: Arc::new(Mutex::new(None)),
+            hub_armed: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            sweeper_live: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             rebuilds_started: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
@@ -297,9 +321,25 @@ impl DiagnosticsState {
         }
     }
 
+    /// Whether the idle sweeper thread is running right now.
+    #[cfg(test)]
+    pub(crate) fn sweeper_running(&self) -> bool {
+        self.sweeper_live.load(Ordering::SeqCst)
+    }
+
+    /// Start the idle sweeper without a resident build to hang it on, for a test whose
+    /// subject is the sweeper's own lifetime.
+    #[cfg(test)]
+    pub(crate) fn spawn_sweeper_for_test(&self) {
+        self.spawn_sweeper();
+    }
+
     /// Stop the idle sweeper (called on server shutdown).
     pub(crate) fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        let (stopped, wake) = &*self.shutdown_wake;
+        *lock_recover(stopped) = true;
+        wake.notify_all();
     }
 
     /// Trigger the background build if this is the first call (or the db was evicted).
@@ -625,8 +665,20 @@ impl DiagnosticsState {
             }
             Err(msg) => {
                 tracing::warn!("diagnostics resident db reload failed: {msg}");
-                let mut inner = lock_recover(&self.inner);
-                inner.reload = ReloadState::Failed(msg);
+                {
+                    let mut inner = lock_recover(&self.inner);
+                    inner.reload = ReloadState::Failed(msg);
+                }
+                // The SERVING resident is the old one, and this rebuild already moved the
+                // cursor past every event it was assumed to cover and raised `hub_armed` for
+                // a resident that never arrived. Both of those describe a build that did not
+                // happen: the old resident may well have been derived while the watch was
+                // still arming, and the window between arming and its baseline is carried by
+                // no event at all. A scan re-derives it from disk — the same repair the
+                // declined-swap branch above makes, for the same reason.
+                *lock_recover(&self.scan) = None;
+                self.hub_armed.store(false, Ordering::SeqCst);
+                self.force_scan.store(true, Ordering::SeqCst);
             }
         }
     }
@@ -843,25 +895,41 @@ impl DiagnosticsState {
     /// needing a replacement sweeper.
     fn spawn_sweeper(&self) {
         let state = self.clone();
-        let _ = std::thread::Builder::new().name("bsl-diag-sweep".to_owned()).spawn(move || loop {
-            std::thread::sleep(
-                SWEEP_INTERVAL.min(state.eviction_after).min(state.reconcile_interval),
-            );
-            if state.shutdown.load(Ordering::SeqCst) {
-                return;
-            }
+        #[cfg(test)]
+        let live = SweeperLive::raise(&self.sweeper_live);
+        let _ = std::thread::Builder::new().name("bsl-diag-sweep".to_owned()).spawn(move || {
+            #[cfg(test)]
+            let _live = live;
+            loop {
+                let tick = SWEEP_INTERVAL.min(state.eviction_after).min(state.reconcile_interval);
+                {
+                    // Parked on the shutdown's own signal rather than sleeping it out: the
+                    // difference between leaving in a moment and leaving in half a minute.
+                    let (stopped, wake) = &*state.shutdown_wake;
+                    let guard = lock_recover(stopped);
+                    let (guard, _) = wake
+                        .wait_timeout_while(guard, tick, |stopped| !*stopped)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if *guard {
+                        return;
+                    }
+                }
+                if state.shutdown.load(Ordering::SeqCst) {
+                    return;
+                }
 
-            // Watchdog: catch drift the hub's event stream may have missed. Runs on this
-            // existing thread (no new one), independent of eviction, at its own cadence.
-            if state.change_hub.is_some()
-                && lock_recover(&state.last_reconcile).elapsed() >= state.reconcile_interval
-                && matches!(state.status(), DiagnosticsStatus::Ready { .. })
-            {
-                *lock_recover(&state.last_reconcile) = Instant::now();
-                state.reconcile_tick();
-            }
+                // Watchdog: catch drift the hub's event stream may have missed. Runs on this
+                // existing thread (no new one), independent of eviction, at its own cadence.
+                if state.change_hub.is_some()
+                    && lock_recover(&state.last_reconcile).elapsed() >= state.reconcile_interval
+                    && matches!(state.status(), DiagnosticsStatus::Ready { .. })
+                {
+                    *lock_recover(&state.last_reconcile) = Instant::now();
+                    state.reconcile_tick();
+                }
 
-            state.evict_if_idle();
+                state.evict_if_idle();
+            }
         });
     }
 
@@ -915,6 +983,25 @@ impl DiagnosticsState {
     }
 }
 
+/// Raised while the idle sweeper thread runs; lowered on every way out of it.
+#[cfg(test)]
+struct SweeperLive(Arc<AtomicBool>);
+
+#[cfg(test)]
+impl SweeperLive {
+    fn raise(flag: &Arc<AtomicBool>) -> Self {
+        flag.store(true, Ordering::SeqCst);
+        Self(Arc::clone(flag))
+    }
+}
+
+#[cfg(test)]
+impl Drop for SweeperLive {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// An owned snapshot of one drift scan, decoupled from the cache lock.
 /// The freshness verdict for `inner` against an optional drift `scan`. Computed by the
 /// caller while holding the inner lock, so the verdict (`revision`/`stale`/`reload`) is
@@ -930,6 +1017,40 @@ pub(crate) fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> 
 mod tests {
     use super::*;
     use crate::diagnostics_state::test_support::sample_workspace;
+
+    /// The sweeper parks between ticks, and the shutdown wakes it out of that park rather
+    /// than leaving it to time out. The tick is half a minute: slept out, a daemon told to
+    /// stop keeps a thread walking its workspace for the rest of it.
+    #[test]
+    fn a_shutdown_wakes_the_idle_sweeper_out_of_its_tick() {
+        use crate::change_hub::test_support::eventually;
+        use std::time::Instant;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = DiagnosticsState::for_workspace(dir.path().to_path_buf());
+        state.spawn_sweeper();
+        assert!(
+            eventually(Duration::from_secs(5), || state.sweeper_running()),
+            "the sweeper never started, so its exit below would prove nothing"
+        );
+
+        // Parked: its next tick is SWEEP_INTERVAL away and nothing else wakes it.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(state.sweeper_running());
+        assert!(
+            SWEEP_INTERVAL >= Duration::from_secs(5),
+            "the tick is short enough that timing out would pass for being woken"
+        );
+
+        let asked = Instant::now();
+        state.shutdown();
+
+        assert!(
+            eventually(Duration::from_secs(1), || !state.sweeper_running()),
+            "the sweeper slept through the shutdown"
+        );
+        assert!(asked.elapsed() < Duration::from_secs(1));
+    }
 
     /// One resident build is exactly ONE traversal: the file set and the drift
     /// baseline are projections of the same scan. Historically this path walked

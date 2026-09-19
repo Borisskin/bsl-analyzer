@@ -52,8 +52,11 @@
 
 ### Версии и lifecycle справочной поверхности
 
-`search` публикует tool-wide `outputSchema` версии `4`: `search_code`, `find_docs` и
-`search_docs` (включая `not_ready`) различаются по `action` и `schema_version="4"`;
+`search` публикует tool-wide `outputSchema`: `search_code` (включая `not_ready`) — версии `5`,
+`find_docs` и `search_docs` (включая `not_ready`) — версии `4`; варианты различаются по
+`action` и `schema_version`. С контракта `2.3` у `search_code` свой номер: он вырос из-за
+`freshness.drift_watch`, а справочные действия не менялись и остались на `4` — схема `search`
+справочного профиля та же, что прежде;
 `list_platform` имеет версию `1`; `status` обоих профилей имеет точную форму
 `{action:"status",schema_version:"1",profile,state}`, где `state` —
 `ready|loading|busy|failed`. `syntax_help` имеет версию `2`, а все успешные варианты
@@ -841,7 +844,7 @@ config reload.
 `structuredContent`. Машинный потребитель читает поля, а не разбирает колонки:
 
 ```json tool=search
-{"action":"search_code","schema_version":"4",
+{"action":"search_code","schema_version":"5",
  "hits":[{"rank":1,"modality":"L","root_id":"","path":"CommonModules/Утилиты/Ext/Module.bsl",
           "line_start":181,"line_end":201,"symbol":"ПроверитьИНН","kind":"procedure",
           "graph_id":"method/common/Утилиты/ПроверитьИНН",
@@ -852,12 +855,18 @@ config reload.
           "snippet":"Процедура ПроверитьИНН(…)\n…","snippet_truncated_lines":16}],
  "shown":10,"total":10,
  "freshness":{"source":"search-index","revision":null,"topology_fingerprint":null,
-              "stale":null,"completeness":{"status":"complete","reasons":[]}}}
+              "stale":null,"drift_watch":"watching",
+              "completeness":{"status":"complete","reasons":[]}}}
 ```
 
 `line_start`/`line_end` (1-based, конец включающий) остаются как были; `location` — общий
 объект места (0-based, конец исключающий), см. `docs/mcp/LOCATION_CONTRACT.md`. У поиска нет
-своей ревизии, поэтому поля свежести равны `null`, а источник назван явно.
+своей ревизии, поэтому поля свежести равны `null`, а источник назван явно. `drift_watch`
+говорит, следит ли кто-нибудь за исходниками рабочего пространства для индекса
+(`starting`/`watching`/`polling`/`unobserved`, см. `docs/mcp/LOCATION_CONTRACT.md`); пока
+оверлей догоняет правки или его очередь не обрабатывается, `completeness` становится
+`partial` с причинами `index_building` / `modality_degraded` и `detail`. Версия `5` — это
+появление этого поля.
 
 Правила чтения:
 

@@ -72,11 +72,15 @@ pub(super) fn graph_state_summary(graph: &GraphState) -> String {
         )
     });
     format!(
-        "status {:?}; published: {}; project_reload_epoch {}, completed {}",
+        "status {:?}; published: {}; owed: change {:?}, forced {:?}, failed {}, marks {}, \
+         recovery {}",
         inner.status,
         published.as_deref().unwrap_or("none"),
-        graph.project_reload_epoch(),
-        graph.completed_project_reload_epoch.load(std::sync::atomic::Ordering::SeqCst),
+        graph.owes_change(),
+        graph.owes_forced(),
+        graph.owes_failed(),
+        graph.owes_marks(),
+        graph.owes_recovery(),
     )
 }
 
@@ -130,7 +134,7 @@ pub(crate) fn wait_until_within(
 /// So a test that waits here and then asserts something a publish pass leaves behind —
 /// a hook counter, a consumed mark, a refreshed root table — is asserting a value that
 /// need not exist yet. Wait for the asserted quantity itself with [`wait_until`], or for
-/// the whole pass with [`wait_publish_pass`].
+/// the whole pass with [`wait_publish_pass_within`].
 pub(crate) fn wait_ready(graph: &GraphState) {
     wait_until(graph, "the graph to become ready", || match graph.status() {
         GraphStatus::Ready { .. } => true,
@@ -144,16 +148,9 @@ pub(crate) fn wait_ready(graph: &GraphState) {
 /// Wait until at least `passes` completed publish passes have been counted.
 ///
 /// The barrier for everything `notify_published` leaves behind, including the part that
-/// runs AFTER its hook returns: the tail consumes leftover marks with
-/// `leftover_bound.swap(0)` … `fetch_max`, and a test sampling between those two reads an
-/// obligation as discharged that is about to be re-armed. Waiting on the hook alone lands
-/// inside that remainder; waiting here lands after it.
-pub(crate) fn wait_publish_pass(graph: &GraphState, passes: usize) {
-    wait_publish_pass_within(graph, WAIT_CEILING, passes);
-}
-
-/// [`wait_publish_pass`] with an explicit ceiling, for callers whose setup makes the
-/// build legitimately slower than the default allows.
+/// runs AFTER its hook returns: the ledger prune and the obligation it settles. Waiting on
+/// the hook alone lands before them; waiting here lands after. `ceiling` is explicit: every
+/// caller's setup makes the build legitimately slower than the default allows.
 pub(crate) fn wait_publish_pass_within(graph: &GraphState, ceiling: Duration, passes: usize) {
     wait_until_within(graph, ceiling, &format!("{passes} completed publish pass(es)"), || {
         graph.publish_passes.load(std::sync::atomic::Ordering::SeqCst) >= passes
@@ -212,4 +209,102 @@ pub(crate) fn meta_string(path: &Path, key: &str) -> String {
         .unwrap()
         .query_row("SELECT value FROM meta WHERE key=?1", [key], |row| row.get(0))
         .unwrap()
+}
+
+/// A workspace graph with a change hub and a running drift watcher — the graph every workspace
+/// boot builds. A graph nobody watches reports itself stale, so a test about any OTHER reason
+/// for staleness starts from this one.
+pub(crate) fn watched_graph(
+    root: &Path,
+) -> (GraphState, crate::change_hub::WorkspaceChangeHub, crate::state::OwnerStop) {
+    let hub = crate::change_hub::WorkspaceChangeHub::start(vec![root.to_path_buf()]);
+    assert!(hub.wait_until_watching(Duration::from_secs(5)), "the hub did not arm");
+    let graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
+    let stop = crate::state::OwnerStop::default();
+    assert!(super::watcher::start(&graph, &hub, None, stop.clone()));
+    wait_until(&graph, "the watcher to run", || {
+        graph.watch_state().0 == super::watcher::WatchPhase::Running
+    });
+    (graph, hub, stop)
+}
+
+/// Wait until the hub's sequence has moved past `floor`, and return it.
+///
+/// A delivered write becomes a hub fact asynchronously; a test that needs the fact NUMBER has
+/// to wait for the number, not for a duration.
+pub(crate) fn wait_for_hub_seq_above(
+    hub: &crate::change_hub::WorkspaceChangeHub,
+    floor: u64,
+) -> u64 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let seq = hub.seq();
+        if seq > floor {
+            return seq;
+        }
+        assert!(std::time::Instant::now() < deadline, "the hub never saw the write");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// The workspace graph's first build, held by a test.
+///
+/// The claim is production's own single flight ([`GraphState::try_begin_external_build`]): while
+/// it is held, every other claimant — the boot's fused pass, a request, the drift watcher — is
+/// refused exactly as it refuses whichever claimant loses the race. So a source is unconsulted
+/// here because nothing may build it, not because no build has got there yet, and the verdict
+/// holds for as long as the hold does instead of for as long as the machine is slow. Dropped, it
+/// returns the graph to `Idle` and the ordinary lifecycle owns the build again.
+pub(crate) struct HeldFirstBuild {
+    graph: GraphState,
+}
+
+impl HeldFirstBuild {
+    /// Whether the graph is still what this hold makes it: claimed, and nothing published.
+    pub(crate) fn holds_unconsulted(&self) -> bool {
+        matches!(self.graph.status(), GraphStatus::Loading) && self.graph.snapshot().is_none()
+    }
+}
+
+impl Drop for HeldFirstBuild {
+    fn drop(&mut self) {
+        self.graph.abort_external_build();
+    }
+}
+
+thread_local! {
+    /// Armed by [`holding_the_first_build`] for the boot that runs on this thread. The graph is
+    /// created deep inside that boot, where no parameter reaches, and the claim has to be taken
+    /// there: by the time the constructor returns, the search init it spawned is already racing
+    /// for the same claim.
+    static FIRST_BUILD_HOLD: std::cell::RefCell<Option<Option<HeldFirstBuild>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Taken by the boot, once, as soon as the workspace graph exists.
+pub(crate) fn hold_the_first_build(graph: &GraphState) {
+    FIRST_BUILD_HOLD.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(held) = slot.as_mut() else { return };
+        if held.is_none() {
+            *held =
+                graph.try_begin_external_build().then(|| HeldFirstBuild { graph: graph.clone() });
+        }
+    });
+}
+
+/// Run `boot` with this thread armed to hold its graph's first build from the moment the graph
+/// exists. The whole construction is the argument so that nothing can take the claim between
+/// arming and booting.
+pub(crate) fn holding_the_first_build<T>(boot: impl FnOnce() -> T) -> (T, HeldFirstBuild) {
+    FIRST_BUILD_HOLD.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        // One boot, one reservation. A nested one took the outer boot's slot and the outer
+        // boot then found its own reservation gone, far from the call that took it.
+        assert!(slot.is_none(), "holding_the_first_build does not nest");
+        *slot = Some(None);
+    });
+    let booted = boot();
+    let held = FIRST_BUILD_HOLD.with(|slot| slot.borrow_mut().take()).flatten();
+    (booted, held.expect("the boot reached its graph with the first build free to claim"))
 }

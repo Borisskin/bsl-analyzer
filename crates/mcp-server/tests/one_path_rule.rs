@@ -30,7 +30,7 @@ const WATCHED: &[(&str, usize, &str)] = &[
     ("src/state/bootstrap.rs", 0, "the boot refusal asks PathScope::hole_covering_a_root"),
     (
         "src/change_hub.rs",
-        7,
+        8,
         "three that compute which watch targets COVER which — an operation about the \
          target set, not about holes, and one PathScope deliberately does not offer. The \
          third of them, `an_armed_recursive_watch_reaches`, asks whether the watcher is \
@@ -48,7 +48,10 @@ const WATCHED: &[(&str, usize, &str)] = &[
          both about the spellings the backend was given and about nothing else. The \
          seventh sits beside the fourth: a record may be left out only for a path that lies \
          inside another registration BOTH ways — under its spelling, so the unwatch takes \
-         it, and inside the tree it reaches, so the arm that follows puts it back",
+         it, and inside the tree it reaches, so the arm that follows puts it back. The \
+         eighth, in the poll's `take`, asks whether a file the walk did not see lies beneath \
+         a path that walk could not read, comparing the walk's own spellings: such a file is \
+         carried, not reported removed",
     ),
 ];
 

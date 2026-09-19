@@ -458,6 +458,15 @@ impl GraphDb {
         crate::graph_db::read_unread_paths(&self.conn).len()
     }
 
+    /// The modules themselves, for the probe that asks whether any of them can be read again.
+    /// A count cannot answer that question: the probe has to open the very paths the build
+    /// could not — and read strictly — an error is an error, not an empty set. See
+    /// [`crate::graph_db::read_unread_paths_strict`]: only this form may speak for what a
+    /// publication still owes.
+    pub fn unread_paths_strict(&self) -> anyhow::Result<Vec<String>> {
+        crate::graph_db::read_unread_paths_strict(&self.conn)
+    }
+
     fn count(&self, sql: &str) -> anyhow::Result<usize> {
         let n: i64 = self.conn.query_row(sql, [], |r| r.get(0)).context("counting graph rows")?;
         Ok(n as usize)

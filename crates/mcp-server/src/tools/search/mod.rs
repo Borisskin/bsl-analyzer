@@ -16,18 +16,20 @@ mod test_support;
 mod types;
 mod wait;
 #[cfg(test)]
-pub(crate) use acquire::try_acquire_engine;
+pub(crate) use acquire::{try_acquire_engine, ACQUIRE_POLL};
+pub(crate) use acquire::{AdmittedEngine, OwnerLockRefused, OwnerWait};
 pub(crate) use call::search_call;
-pub(crate) use types::search_output_schema;
-#[cfg(test)]
-pub(crate) use types::AcquireFailure;
+pub(crate) use render::WorkspaceFacts;
+pub(crate) use types::{reference_search_output_schema, search_output_schema};
 pub(crate) use wait::{await_reply, Withdrawn, REPLY_POLL};
 
 pub use docs::{find_docs, search_docs};
 #[allow(unused_imports)]
 pub use hybrid::{hybrid_code, hybrid_code_cancellable};
 pub use status::search_status;
-pub(crate) use status::{baseline_warming_not_ready, docs_not_ready, search_not_ready};
+pub(crate) use status::{
+    append_workspace_changes, baseline_warming_not_ready, docs_not_ready, search_not_ready,
+};
 
 #[cfg(test)]
 mod tests {
