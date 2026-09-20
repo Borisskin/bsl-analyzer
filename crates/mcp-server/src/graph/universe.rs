@@ -7,8 +7,8 @@
 //! lossy string, and both filter BEFORE de-duplicating — the order the old code
 //! used, which decides who survives when several spellings collapse into one key.
 
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use project_model::{file_role::FileRole, SourceSet};
@@ -40,23 +40,33 @@ use super::scan::FileStat;
 pub(crate) struct ScanVerdict {
     unreadable: usize,
     canonical_fallbacks: usize,
+    content_unreadable: usize,
 }
 
 impl ScanVerdict {
     /// The only way a verdict comes into being: read off a walk that produced it.
     pub(crate) fn of(set: &SourceSet) -> ScanVerdict {
-        ScanVerdict { unreadable: set.unreadable, canonical_fallbacks: set.canonical_fallbacks }
+        ScanVerdict {
+            unreadable: set.unreadable,
+            canonical_fallbacks: set.canonical_fallbacks,
+            content_unreadable: 0,
+        }
+    }
+
+    pub(crate) fn with_content_unreadable(mut self, count: usize) -> ScanVerdict {
+        self.content_unreadable = count;
+        self
     }
 
     /// A verdict stated outright, for tests about what a consumer DOES with one.
     #[cfg(test)]
     pub(crate) fn for_test(unreadable: usize, canonical_fallbacks: usize) -> ScanVerdict {
-        ScanVerdict { unreadable, canonical_fallbacks }
+        ScanVerdict { unreadable, canonical_fallbacks, content_unreadable: 0 }
     }
 
     /// Whether this walk may speak for the whole tree — see [`SourceSet::clean`].
     pub(crate) fn clean(&self) -> bool {
-        self.coverage_complete() && self.identity_exact()
+        self.coverage_complete() && self.identity_exact() && self.content_unreadable == 0
     }
 
     /// Nothing was hidden from the walk, so a file it did not list is genuinely
@@ -80,8 +90,12 @@ impl ScanVerdict {
 pub(crate) struct ScannedUniverse {
     /// The `.bsl` enumeration — see [`bsl_files_from`].
     pub(crate) files: Vec<(FileId, PathBuf)>,
-    /// The `.bsl` + `.xml` stats rows — see [`file_stats_from`].
+    /// The `.bsl` + `.xml` stats rows — see [`file_stats_with_content_errors`].
     pub(crate) stats: Vec<FileStat>,
+    /// The first walked spelling for each canonical path in this exact scan. The
+    /// graph keeps canonical source paths for reading, but durable root attribution
+    /// needs the walked alias when a symlink target lies outside the registered roots.
+    walked_by_canonical: HashMap<PathBuf, PathBuf>,
     verdict: ScanVerdict,
 }
 
@@ -97,10 +111,21 @@ impl ScannedUniverse {
     /// [`Self::scan`] without descending into `excluded`.
     pub(crate) fn scan_excluding(roots: &[PathBuf], excluded: &[PathBuf]) -> ScannedUniverse {
         let set = SourceSet::scan_excluding(roots, excluded);
+        let (stats, unreadable) = file_stats_with_content_errors(&set);
+        let mut walked_by_canonical = HashMap::new();
+        for file in &set.files {
+            walked_by_canonical
+                .entry(file.canonical.clone())
+                .or_insert_with(|| file.walked.clone());
+        }
+        // The content pass is part of the same walk's authority. A listed
+        // file that could not be hashed must keep the snapshot dirty; it is
+        // never equivalent to an empty or deleted input.
         ScannedUniverse {
             files: bsl_files_from(&set),
-            stats: file_stats_from(&set),
-            verdict: ScanVerdict::of(&set),
+            stats,
+            walked_by_canonical,
+            verdict: ScanVerdict::of(&set).with_content_unreadable(unreadable),
         }
     }
 
@@ -110,6 +135,40 @@ impl ScannedUniverse {
     /// against one.
     pub(crate) fn clean(&self) -> bool {
         self.verdict.clean()
+    }
+
+    /// The walked spelling paired with a canonical path in this scan, if the path
+    /// was present in the universe.
+    pub(crate) fn walked_path_for(&self, canonical: &Path) -> Option<&Path> {
+        self.walked_by_canonical.get(canonical).map(PathBuf::as_path)
+    }
+
+    /// Resolve every graph-relevant row through the roots and expose aliases under
+    /// both canonical and walked spellings. Node rows use the walked spelling, while
+    /// unread reports and file rows may still carry the canonical one.
+    pub(crate) fn file_key_aliases(
+        &self,
+        roots: &bsl_search::WorkspaceRoots,
+    ) -> Option<rustc_hash::FxHashMap<String, bsl_search::FileKey>> {
+        let mut aliases = rustc_hash::FxHashMap::default();
+        for stat in &self.stats {
+            let key = stat.key(roots)?;
+            aliases.insert(stat.path.replace('\\', "/"), key.clone());
+            aliases.insert(stat.path.clone(), key.clone());
+            aliases.insert(stat.walked.to_string_lossy().replace('\\', "/"), key);
+        }
+        Some(aliases)
+    }
+
+    /// Resolve a canonical path from this scan using the walked spelling retained
+    /// for it. This is used for unread files whose loader reports the canonical path.
+    pub(crate) fn key_for_path(
+        &self,
+        roots: &bsl_search::WorkspaceRoots,
+        canonical: &Path,
+    ) -> Option<bsl_search::FileKey> {
+        let walked = self.walked_path_for(canonical)?;
+        roots.root_of(walked, canonical)
     }
 }
 
@@ -135,12 +194,18 @@ pub(crate) fn bsl_files_from(set: &SourceSet) -> Vec<(FileId, PathBuf)> {
 }
 
 /// The `.bsl` + `.xml` universe in stats shape: `(canonical lossy string, mtime,
-/// len)` rows, first occurrence of each STRING winning — the stats scan has always
-/// keyed by the converted string, so two canonical paths that collapse into one
-/// lossy spelling still yield one row.
+/// len, complete content hash)` rows, first occurrence of each STRING winning —
+/// the stats scan has always keyed by the converted string, so two canonical paths
+/// that collapse into one lossy spelling still yield one row.
+#[cfg(test)]
 pub(crate) fn file_stats_from(set: &SourceSet) -> Vec<FileStat> {
+    file_stats_with_content_errors(set).0
+}
+
+pub(crate) fn file_stats_with_content_errors(set: &SourceSet) -> (Vec<FileStat>, usize) {
     let mut stats: Vec<FileStat> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
+    let mut content_unreadable = 0;
     for file in &set.files {
         if file.role == FileRole::Ignored {
             continue;
@@ -156,9 +221,23 @@ pub(crate) fn file_stats_from(set: &SourceSet) -> Vec<FileStat> {
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        stats.push(FileStat { path, mtime, len: file.metadata.len() });
+        let content_hash = match std::fs::read(&file.canonical) {
+            Ok(bytes) => Some(*blake3::hash(&bytes).as_bytes()),
+            Err(_) => {
+                content_unreadable += 1;
+                None
+            }
+        };
+        stats.push(FileStat {
+            path,
+            canonical: file.canonical.clone(),
+            walked: file.walked.clone(),
+            mtime,
+            len: file.metadata.len(),
+            content_hash,
+        });
     }
-    stats
+    (stats, content_unreadable)
 }
 
 #[cfg(test)]

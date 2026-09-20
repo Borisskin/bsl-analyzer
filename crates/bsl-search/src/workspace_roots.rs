@@ -117,9 +117,8 @@ pub struct WorkspaceRoots {
     /// content of the last full walk. The value belongs to whoever owns the subtree
     /// (the server's derived cache); this type only carries it to the walk.
     ///
-    /// Not part of root identity: [`Self::changed_root_ids`] and the transition
-    /// machinery compare roots, and a cache moved without the roots moving is not a
-    /// topology change.
+    /// Not part of root identity: the transition machinery compares roots, and a cache
+    /// moved without the roots moving is not a topology change.
     excluded: Vec<PathBuf>,
 }
 
@@ -308,6 +307,7 @@ impl WorkspaceRoots {
     /// The file a stored key points at, spelled as the project declared it.
     pub fn resolve(&self, key: &FileKey) -> Option<PathBuf> {
         let root = self.roots.iter().find(|root| root.id == key.root_id)?;
+        validate_relative_key_path(&key.path)?;
         Some(root.declared.join(&key.path))
     }
 
@@ -321,6 +321,7 @@ impl WorkspaceRoots {
     /// of them has been retargeted — and then the id names a node this generation never held.
     pub fn resolve_walked(&self, key: &FileKey) -> Option<PathBuf> {
         let root = self.roots.iter().find(|root| root.id == key.root_id)?;
+        validate_relative_key_path(&key.path)?;
         Some(root.canonical.join(&key.path))
     }
 
@@ -375,33 +376,6 @@ impl WorkspaceRoots {
         self.roots.is_empty()
     }
 
-    /// Root identifiers whose physical binding was added, removed or changed.
-    ///
-    /// The identifier alone is not a binding: the configuration keeps the empty identifier when
-    /// its directory moves, and an extension can keep a workspace-relative identifier while an
-    /// alias is retargeted. Comparing the complete declared and canonical spellings makes a live
-    /// transition rebuild those key spaces instead of serving rows from the old directory through
-    /// the new one. Added identifiers are included so stale persistent state from an earlier use of
-    /// the same keyspace is retracted before their current files are installed.
-    pub(crate) fn changed_root_ids(&self, next: &Self) -> std::collections::HashSet<String> {
-        self.roots
-            .iter()
-            .filter(|root| {
-                next.roots
-                    .iter()
-                    .find(|candidate| candidate.id == root.id)
-                    .is_none_or(|candidate| candidate != *root)
-            })
-            .map(|root| root.id.clone())
-            .chain(
-                next.roots
-                    .iter()
-                    .filter(|root| !self.roots.iter().any(|candidate| candidate.id == root.id))
-                    .map(|root| root.id.clone()),
-            )
-            .collect()
-    }
-
     /// The root with the longest matching prefix, under the given spelling.
     ///
     /// Longest rather than first: roots may nest, and the innermost one is what
@@ -423,6 +397,42 @@ impl WorkspaceRoots {
             .max_by_key(|(depth, _)| *depth)
             .map(|(_, key)| key)
     }
+}
+
+/// A persisted file key is data, not a path supplied by the current process.
+/// Keep the check in this module so every graph/search reader gets the same
+/// rejection rules before joining it to a root.  In particular, `Path::join`
+/// would otherwise accept an absolute right hand side and escape the declared
+/// root, while a parent component could reach an unrelated directory.
+fn validate_relative_key_path(path: &str) -> Option<()> {
+    if path.is_empty() || path.contains('\0') {
+        return None;
+    }
+    // Durable keys are emitted with the current platform's separator, but a key
+    // may have been persisted on Windows and inspected on another platform.  Do
+    // the security check for both separator conventions before asking `Path` to
+    // validate the native spelling; otherwise Linux treats `..\\outside` as one
+    // ordinary filename and Windows can later escape the declared root with it.
+    if path.starts_with('/')
+        || path.starts_with('\\')
+        || path.as_bytes().get(1) == Some(&b':')
+        || path.contains(':')
+    {
+        return None;
+    }
+    if path
+        .split(['/', '\\'])
+        .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return None;
+    }
+    if Path::new(path)
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(())
 }
 
 /// The store key of a path relative to its root.
@@ -1044,32 +1054,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn binding_diff_detects_removed_added_and_rebound_ids() {
-        let dir = tempfile::tempdir().unwrap();
-        let workspace = dir.path().join("ws");
-        let old_made = dirs(&workspace, &["old-cf", "ext/kept", "ext/removed"]);
-        let new_made = dirs(&workspace, &["new-cf", "ext/kept", "ext/added"]);
-        let old = WorkspaceRoots::build(
-            &workspace,
-            &old_made[0],
-            &[old_made[1].clone(), old_made[2].clone()],
-        )
-        .0;
-        let next = WorkspaceRoots::build(
-            &workspace,
-            &new_made[0],
-            &[new_made[1].clone(), new_made[2].clone()],
-        )
-        .0;
-
-        let changed = old.changed_root_ids(&next);
-        assert!(changed.contains(CONFIGURATION_ROOT_ID), "the stable empty id was rebound");
-        assert!(changed.contains("ext/removed"));
-        assert!(changed.contains("ext/added"));
-        assert!(!changed.contains("ext/kept"));
-    }
-
     mod containment {
         use super::*;
 
@@ -1096,5 +1080,46 @@ mod tests {
             assert!(file.is_under(&FileKey::new("ext-1", "Dir")));
             assert!(!file.is_under(&FileKey::configuration("Dir")));
         }
+    }
+
+    #[test]
+    fn resolve_rejects_native_and_foreign_absolute_or_parent_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let configuration = dirs(dir.path(), &["cf"]).remove(0);
+        let (roots, _) = WorkspaceRoots::build(dir.path(), &configuration, &[]);
+
+        for path in [
+            "/outside/file.bsl",
+            "\\outside\\file.bsl",
+            "C:/outside/file.bsl",
+            r"C:\\outside\\file.bsl",
+            r"\\server\share\file.bsl",
+            "nested/../outside/file.bsl",
+            r"nested\..\outside\file.bsl",
+            "nested/./file.bsl",
+            r"nested\.\file.bsl",
+        ] {
+            assert_eq!(
+                roots.resolve(&FileKey::configuration(path)),
+                None,
+                "malformed persisted path must not be joined to a root: {path:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_accepts_a_relative_path_in_either_persisted_separator_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let configuration = dirs(dir.path(), &["cf"]).remove(0);
+        let (roots, _) = WorkspaceRoots::build(dir.path(), &configuration, &[]);
+
+        assert_eq!(
+            roots.resolve(&FileKey::configuration("nested/file.bsl")),
+            Some(configuration.join("nested/file.bsl")),
+        );
+        assert_eq!(
+            roots.resolve(&FileKey::configuration(r"nested\file.bsl")),
+            Some(configuration.join(r"nested\file.bsl")),
+        );
     }
 }

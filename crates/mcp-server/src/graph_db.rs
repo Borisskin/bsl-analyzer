@@ -24,6 +24,7 @@ use ide::graph_index::{EdgeRow, NodeRow};
 use ide::{GraphBuildSummary, GraphBuildTicker, MethodCallDigest, ModuleId, RootDatabaseImpl};
 use rusqlite::{params, Connection, OptionalExtension};
 use rustc_hash::FxHashMap;
+use serde::{Deserialize, Serialize};
 use vfs::FileId;
 
 #[cfg(test)]
@@ -73,16 +74,23 @@ use crate::graph::input::{build_source_root, db_for_files};
 // fingerprint moves and no patch would ever rewrite a module nobody edited, so a reused
 // artefact would answer `not_found` for the ids this binary now hands out — and an
 // incremental patch would leave one database holding both spellings for nodes of one kind.
-pub(crate) const SCHEMA_VERSION: u32 = 20;
+// 21: graph file addresses are persisted as root_id/path pairs and the files
+// table carries full BLAKE3 content hashes, so absolute paths and stat-only
+// identity cannot survive as the current format.
+pub(crate) const SCHEMA_VERSION: u32 = 21;
 
-/// One file's persisted identity in the `files` table: its stat-only fingerprint
-/// and (for `.bsl`) its resolution-signature hash. Persisting these per path lets a
-/// reload classify drift granularly (which files changed) instead of only knowing
-/// the whole-workspace fingerprint moved.
+/// One file's persisted identity in the `files` table: its complete content hash,
+/// a compact projection retained for the existing drift API, and (for `.bsl`) its
+/// resolution-signature hash. Persisting these per key lets a reload classify drift
+/// granularly instead of only knowing the whole-workspace fingerprint moved.
 pub(crate) struct FileFingerprint {
-    /// Canonical, `/`-normalised path — the same string `workspace_fingerprint` folds.
+    /// Root-relative durable identity. The pair is never flattened into a
+    /// single string in the SQLite key space.
+    pub root_id: String,
     pub path: String,
-    /// `hash(mtime, len)` for this file.
+    /// Full BLAKE3 digest of the file bytes.
+    pub content_hash: [u8; 32],
+    /// Compact projection retained for the existing drift API.
     pub fingerprint: u64,
     /// Resolution-signature hash, `None` for `.xml` (filled in by the body-only fast
     /// path; currently always `None`).
@@ -90,14 +98,14 @@ pub(crate) struct FileFingerprint {
 }
 
 /// The workspace identity a graph build reflects, as two independent components.
-/// `files` folds every graph-relevant file's `(path, mtime, len)`; `topology`
+/// `files` folds every graph-relevant file's `(root_id, path, content_hash)`; `topology`
 /// identifies the extension dependency graph (declared roots + `dependsOn`
 /// closures). Kept structured — not XOR-folded into one word — so a change in one
 /// component can never algebraically cancel a change in the other, and so a
 /// consumer can tell a topology-triggered rebuild from a plain file edit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GraphFp {
-    /// Order-independent fold of the on-disk file stats.
+    /// Stable BLAKE3 fold of the durable file keys and complete content hashes.
     pub files: u64,
     /// Stable hash of the extension-topology fingerprint.
     pub topology: u64,
@@ -109,7 +117,7 @@ pub struct GraphFp {
 pub struct GraphMeta {
     /// The [`GraphState`](crate::graph) generation this build reflects.
     pub revision: u64,
-    /// Workspace identity (file stats + extension topology) at build time.
+    /// Workspace identity (portable file contents + extension topology) at build time.
     pub fingerprint: GraphFp,
     /// Number of `.bsl` files indexed.
     pub files: usize,
@@ -146,30 +154,32 @@ pub fn read_sqlite_method_call_digest(path: &Path) -> anyhow::Result<MethodCallD
 /// Callers obtain `source_root_files` by resolving the anchor file's `SourceRootId` and
 /// enumerating that root's file set. Requiring both endpoints matches the compact index,
 /// which retains only modules from that same source root.
-pub fn read_source_root_scoped_sqlite_method_call_digest<I, P>(
+pub fn read_source_root_scoped_sqlite_method_call_digest<I>(
     path: &Path,
     source_root_files: I,
 ) -> anyhow::Result<MethodCallDigest>
 where
-    I: IntoIterator<Item = P>,
-    P: AsRef<Path>,
+    I: IntoIterator<Item = bsl_search::FileKey>,
 {
     let mut conn = Connection::open(path)
         .with_context(|| format!("opening graph database at {}", path.display()))?;
     let tx = conn.transaction().context("starting source-root scope transaction")?;
     tx.execute_batch(
         "CREATE TEMP TABLE source_root_files (
-             path TEXT PRIMARY KEY
+             root_id TEXT NOT NULL,
+             path TEXT NOT NULL,
+             PRIMARY KEY (root_id, path)
          ) WITHOUT ROWID;",
     )
     .context("creating source-root file scope")?;
     {
         let mut insert = tx
-            .prepare("INSERT OR IGNORE INTO source_root_files (path) VALUES (?1)")
+            .prepare("INSERT OR IGNORE INTO source_root_files (root_id, path) VALUES (?1, ?2)")
             .context("preparing source-root file scope insert")?;
         for file in source_root_files {
-            let path = file.as_ref().to_string_lossy().replace('\\', "/");
-            insert.execute(params![path]).context("adding file to source-root scope")?;
+            insert
+                .execute(params![file.root_id, file.path])
+                .context("adding file to source-root scope")?;
         }
     }
 
@@ -178,8 +188,10 @@ where
          FROM edges AS edge \
          JOIN nodes AS target ON target.id = edge.to_id \
          JOIN nodes AS caller ON caller.id = edge.from_id \
-         JOIN source_root_files AS target_file ON target_file.path = target.file \
-         JOIN source_root_files AS caller_file ON caller_file.path = caller.file \
+         JOIN source_root_files AS target_file ON target_file.root_id = target.file_root_id \
+             AND target_file.path = target.file_path \
+         JOIN source_root_files AS caller_file ON caller_file.root_id = caller.file_root_id \
+             AND caller_file.path = caller.file_path \
          WHERE target.kind = 'method' \
            AND caller.kind = 'method' \
            AND edge.kind IN ('call', 'notify_ref', 'idle_handler') \
@@ -197,6 +209,11 @@ where
 /// secondary indexes and the in-degree table in one pass over the bulk data.
 pub(crate) struct GraphDbWriter {
     conn: Connection,
+    roots: Option<bsl_search::WorkspaceRoots>,
+    /// Canonical and walked spellings from the one scan that produced this graph.
+    /// A row may carry either spelling; both must resolve to the same durable key
+    /// when a symlink target lies outside the canonical root table.
+    file_key_aliases: FxHashMap<String, bsl_search::FileKey>,
 }
 
 impl GraphDbWriter {
@@ -227,7 +244,8 @@ impl GraphDbWriter {
                 name        TEXT NOT NULL,
                 qualified   TEXT NOT NULL,
                 module      TEXT,
-                file        TEXT,
+                file_root_id TEXT,
+                file_path   TEXT,
                 name_offset INTEGER,
                 sig_end     INTEGER,
                 src_start   INTEGER,
@@ -259,22 +277,37 @@ impl GraphDbWriter {
             );
 
             CREATE TABLE files (
-                path        TEXT PRIMARY KEY,
-                fingerprint INTEGER NOT NULL,
-                sig_hash    INTEGER
+                root_id      TEXT NOT NULL,
+                path         TEXT NOT NULL,
+                content_hash BLOB NOT NULL,
+                fingerprint  INTEGER NOT NULL,
+                sig_hash     INTEGER,
+                PRIMARY KEY (root_id, path)
             ) WITHOUT ROWID;
 
             CREATE TABLE unresolved_calls (
                 target_scope TEXT NOT NULL,
                 method_lower TEXT NOT NULL,
-                caller_file  TEXT NOT NULL,
-                PRIMARY KEY (target_scope, method_lower, caller_file)
+                caller_root_id TEXT NOT NULL,
+                caller_path    TEXT NOT NULL,
+                PRIMARY KEY (target_scope, method_lower, caller_root_id, caller_path)
             ) WITHOUT ROWID;
             ",
         )
         .context("initialising graph schema")?;
 
-        Ok(Self { conn })
+        Ok(Self { conn, roots: None, file_key_aliases: FxHashMap::default() })
+    }
+
+    pub(crate) fn set_workspace_roots(&mut self, roots: Option<&bsl_search::WorkspaceRoots>) {
+        self.roots = roots.cloned();
+    }
+
+    pub(crate) fn set_file_key_aliases(
+        &mut self,
+        aliases: &FxHashMap<String, bsl_search::FileKey>,
+    ) {
+        self.file_key_aliases = aliases.clone();
     }
 
     /// Append a batch of nodes. A node id may be projected more than once across
@@ -282,24 +315,38 @@ impl GraphDbWriter {
     /// spelling wins and later duplicates are ignored, matching the in-memory
     /// graph's first-seen node identity.
     pub(crate) fn write_nodes(&mut self, rows: &[NodeRow]) -> anyhow::Result<()> {
+        let roots = self.roots.clone();
+        let aliases = &self.file_key_aliases;
         let tx = self.conn.transaction().context("begin node batch")?;
         {
             let mut stmt = tx.prepare_cached(
                 "INSERT OR IGNORE INTO nodes \
-                 (id, kind, name, qualified, module, file, name_offset, sig_end, src_start, \
+                 (id, kind, name, qualified, module, file_root_id, file_path, name_offset, sig_end, src_start, \
                   src_end, dispatch, is_export, addressable) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             )?;
             for row in rows {
                 let dispatch =
                     if row.dispatch.is_empty() { None } else { Some(row.dispatch.join(",")) };
+                let (file_root_id, file_path) =
+                    durable_file_key_with_aliases(roots.as_ref(), row.file.as_deref(), aliases);
+                if row.file.is_some()
+                    && roots.is_some()
+                    && (file_root_id.is_none() || file_path.is_none())
+                {
+                    anyhow::bail!(
+                        "graph node source is outside registered workspace roots: {}",
+                        row.file.as_deref().unwrap_or_default()
+                    );
+                }
                 stmt.execute(params![
                     row.id,
                     row.kind,
                     row.name,
                     row.qualified,
                     row.module,
-                    row.file,
+                    file_root_id,
+                    file_path,
                     row.name_offset,
                     row.sig_end,
                     row.src_start,
@@ -349,11 +396,14 @@ impl GraphDbWriter {
         let tx = self.conn.transaction().context("begin files batch")?;
         {
             let mut stmt = tx.prepare_cached(
-                "INSERT OR REPLACE INTO files (path, fingerprint, sig_hash) VALUES (?1, ?2, ?3)",
+                "INSERT OR REPLACE INTO files (root_id, path, content_hash, fingerprint, sig_hash) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
             for row in rows {
                 stmt.execute(params![
+                    row.root_id,
                     row.path,
+                    row.content_hash.as_slice(),
                     row.fingerprint as i64,
                     row.sig_hash.map(|h| h as i64),
                 ])?;
@@ -385,14 +435,24 @@ impl GraphDbWriter {
         &mut self,
         rows: &[(String, String, String)],
     ) -> anyhow::Result<()> {
+        let roots = self.roots.clone();
+        let aliases = &self.file_key_aliases;
         let tx = self.conn.transaction().context("begin unresolved_calls batch")?;
         {
             let mut stmt = tx.prepare_cached(
-                "INSERT OR IGNORE INTO unresolved_calls (target_scope, method_lower, caller_file) \
-                 VALUES (?1, ?2, ?3)",
+                "INSERT OR IGNORE INTO unresolved_calls \
+                 (target_scope, method_lower, caller_root_id, caller_path) \
+                 VALUES (?1, ?2, ?3, ?4)",
             )?;
             for (target_scope, method_lower, caller_file) in rows {
-                stmt.execute(params![target_scope, method_lower, caller_file])?;
+                let (root_id, path) =
+                    durable_file_key_with_aliases(roots.as_ref(), Some(caller_file), aliases);
+                let (Some(root_id), Some(path)) = (root_id, path) else {
+                    anyhow::bail!(
+                        "unresolved call caller is outside registered workspace roots: {caller_file}"
+                    );
+                };
+                stmt.execute(params![target_scope, method_lower, root_id, path])?;
             }
         }
         tx.commit().context("commit unresolved_calls batch")?;
@@ -442,17 +502,76 @@ impl GraphDbWriter {
     }
 }
 
-/// Persist the modules whose bytes could not be read, as a JSON array under one
-/// `meta` key.
-///
-/// PATHS, not a count: the patch has to compute a union with what the artefact
-/// already holds, and cardinalities cannot be unioned — an inherited hole that healed
-/// and a freshly unreadable module both read as "1", while the truth is 2.
-pub(crate) fn write_unread_paths(
-    conn: &rusqlite::Connection,
-    unread: &BTreeSet<PathBuf>,
+fn durable_file_key(
+    roots: Option<&bsl_search::WorkspaceRoots>,
+    file: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let Some(file) = file else { return (None, None) };
+    if let Some(roots) = roots {
+        if let Some(key) = roots.key_of_path(Path::new(file)) {
+            return (Some(key.root_id), Some(key.path));
+        }
+        // A source row outside the registered roots is deliberately not made
+        // readable through a guessed absolute fallback.
+        return (None, None);
+    }
+    // Unit fixtures that construct a writer without a project root use
+    // already-relative paths. Keep the legacy column populated only for those
+    // fixtures; production writers always install WorkspaceRoots.
+    (Some(String::new()), Some(file.replace('\\', "/")))
+}
+
+fn durable_file_key_with_aliases(
+    roots: Option<&bsl_search::WorkspaceRoots>,
+    file: Option<&str>,
+    aliases: &FxHashMap<String, bsl_search::FileKey>,
+) -> (Option<String>, Option<String>) {
+    if let Some(file) = file {
+        if let Some(key) = aliases.get(file).or_else(|| aliases.get(&file.replace('\\', "/"))) {
+            return (Some(key.root_id.clone()), Some(key.path.clone()));
+        }
+    }
+    durable_file_key(roots, file)
+}
+
+fn install_changed_file_keys(
+    conn: &Connection,
+    changed_files: &[String],
+    roots: Option<&bsl_search::WorkspaceRoots>,
 ) -> anyhow::Result<()> {
-    let list: Vec<String> = unread.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    conn.execute_batch(
+        "CREATE TEMP TABLE changed_file_keys (
+             root_id TEXT NOT NULL,
+             path TEXT NOT NULL,
+             PRIMARY KEY (root_id, path)
+         ) WITHOUT ROWID;",
+    )?;
+    let mut insert = conn.prepare_cached(
+        "INSERT OR IGNORE INTO changed_file_keys (root_id, path) VALUES (?1, ?2)",
+    )?;
+    for file in changed_files {
+        let (Some(root_id), Some(path)) = durable_file_key(roots, Some(file)) else {
+            anyhow::bail!("incremental update: changed file is outside registered roots: {file}");
+        };
+        insert.execute(params![root_id, path])?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredFileKey {
+    root_id: String,
+    path: String,
+}
+
+fn write_unread_keys(
+    conn: &rusqlite::Connection,
+    unread: &std::collections::BTreeSet<bsl_search::FileKey>,
+) -> anyhow::Result<()> {
+    let list: Vec<StoredFileKey> = unread
+        .iter()
+        .map(|key| StoredFileKey { root_id: key.root_id.clone(), path: key.path.clone() })
+        .collect();
     conn.execute(
         "INSERT OR REPLACE INTO meta (key, value) VALUES ('unread_paths', ?1)",
         rusqlite::params![serde_json::to_string(&list)?],
@@ -460,29 +579,57 @@ pub(crate) fn write_unread_paths(
     Ok(())
 }
 
+fn unread_keys_from_paths(
+    unread: &BTreeSet<PathBuf>,
+    roots: Option<&bsl_search::WorkspaceRoots>,
+    universe: Option<&crate::graph::universe::ScannedUniverse>,
+) -> anyhow::Result<BTreeSet<bsl_search::FileKey>> {
+    unread
+        .iter()
+        .map(|path| {
+            if let Some(roots) = roots {
+                universe
+                    .and_then(|universe| universe.key_for_path(roots, path))
+                    .or_else(|| roots.key_of_path(path))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "unread file is outside registered roots: {}",
+                            path.display()
+                        )
+                    })
+            } else {
+                Ok(bsl_search::FileKey::configuration(path.to_string_lossy().into_owned()))
+            }
+        })
+        .collect()
+}
+
 /// The same modules, read STRICTLY: an absent key means "nothing was unread" — the schema
 /// version gates out artefacts that predate the key — but a query that fails or a payload that
-/// will not decode is a failure to LOOK, not an empty answer.
-///
-/// The lenient reader below serves the old public surface, where an empty list is harmless. It
-/// is not authority for retiring a recovery obligation: `unwrap_or_default` there turns a
-/// broken database into "this build read everything", which would retire every outstanding
-/// path on the strength of an error.
-pub(crate) fn read_unread_paths_strict(conn: &rusqlite::Connection) -> anyhow::Result<Vec<String>> {
-    use rusqlite::OptionalExtension;
+/// will not decode is a failure to LOOK, not an empty answer. The structured key is retained
+/// all the way to recovery; it must never be flattened with a separator that can collide with a
+/// root or path.
+pub(crate) fn read_unread_keys_strict(
+    conn: &rusqlite::Connection,
+) -> anyhow::Result<Vec<bsl_search::FileKey>> {
     let raw: Option<String> = conn
         .query_row("SELECT value FROM meta WHERE key = 'unread_paths'", [], |r| r.get(0))
         .optional()
         .context("reading unread_paths")?;
-    let Some(raw) = raw else { return Ok(Vec::new()) };
-    serde_json::from_str::<Vec<String>>(&raw).context("decoding unread_paths")
+    let Some(raw) = raw else {
+        anyhow::bail!("missing unread_paths metadata");
+    };
+    let keys = serde_json::from_str::<Vec<StoredFileKey>>(&raw)
+        .context("decoding structured unread_paths")?;
+    Ok(keys.into_iter().map(|key| bsl_search::FileKey::new(key.root_id, key.path)).collect())
 }
 
-/// The modules an artefact recorded as unreadable when it was built or last patched.
-pub(crate) fn read_unread_paths(conn: &rusqlite::Connection) -> Vec<String> {
-    let raw: Option<String> =
-        conn.query_row("SELECT value FROM meta WHERE key = 'unread_paths'", [], |r| r.get(0)).ok();
-    raw.and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok()).unwrap_or_default()
+/// The modules an artefact recorded as unreadable when it was built or last patched. This
+/// lenient view is used for counts and diagnostics; it keeps the structured key even when a
+/// caller elects to ignore a metadata read error, and is deliberately not an authority for
+/// retiring recovery obligations.
+pub(crate) fn read_unread_paths(conn: &rusqlite::Connection) -> Vec<bsl_search::FileKey> {
+    read_unread_keys_strict(conn).unwrap_or_default()
 }
 
 /// Build the whole-workspace call graph straight into a fresh SQLite file at
@@ -714,10 +861,18 @@ fn build_graph_database_inner(
     meta: &GraphMeta,
     chunk_sink: Option<&mut dyn ide::FusedChunkSink>,
 ) -> anyhow::Result<GraphBuildSummary> {
+    if !project.validated || project.search_roots.is_none() {
+        anyhow::bail!("cannot persist a portable graph without validated workspace roots");
+    }
     let files = &universe.files;
     let modules: Vec<ModuleId> = files.iter().map(|(f, _)| ModuleId::new(*f)).collect();
-    let paths: FxHashMap<FileId, String> =
-        files.iter().map(|(f, p)| (*f, p.to_string_lossy().replace('\\', "/"))).collect();
+    let paths: FxHashMap<FileId, String> = files
+        .iter()
+        .map(|(f, p)| {
+            let walked = universe.walked_path_for(p).unwrap_or(p);
+            (*f, walked.to_string_lossy().replace('\\', "/"))
+        })
+        .collect();
     let file_paths: FxHashMap<FileId, PathBuf> =
         files.iter().map(|(f, p)| (*f, p.clone())).collect();
 
@@ -736,6 +891,12 @@ fn build_graph_database_inner(
     let source_root = build_source_root(files);
 
     let mut writer = GraphDbWriter::create(out_path)?;
+    writer.set_workspace_roots(project.search_roots.as_ref());
+    let roots = project.search_roots.as_ref().expect("validated roots");
+    let aliases = universe
+        .file_key_aliases(roots)
+        .ok_or_else(|| anyhow::anyhow!("graph scan file is outside registered workspace roots"))?;
+    writer.set_file_key_aliases(&aliases);
 
     // One configuration cache shared across every batch database (and their per-job
     // clones), so the whole-config metadata load runs once for this build instead of
@@ -803,15 +964,27 @@ fn build_graph_database_inner(
             file_paths.get(&m.file_id).map(|p| (p.to_string_lossy().into_owned(), h))
         })
         .collect();
-    let file_rows: Vec<FileFingerprint> = universe
+    let file_rows: anyhow::Result<Vec<FileFingerprint>> = universe
         .stats
         .iter()
-        .map(|s| FileFingerprint {
-            fingerprint: s.fingerprint(),
-            sig_hash: sig_by_path.get(&s.path).copied(),
-            path: s.path.clone(),
+        .map(|s| {
+            let Some(key) = s.key(roots) else {
+                return Err(anyhow::anyhow!(
+                    "graph scan file is outside registered workspace roots: {}",
+                    s.path
+                ));
+            };
+            let content_hash = s.persisted_content_hash();
+            Ok(FileFingerprint {
+                root_id: key.root_id,
+                path: key.path,
+                content_hash,
+                fingerprint: s.fingerprint(),
+                sig_hash: sig_by_path.get(&s.path).copied(),
+            })
         })
         .collect();
+    let file_rows = file_rows?;
     writer.write_files(&file_rows)?;
     writer.write_casing_variants(&summary.casing_variant_objects)?;
     writer.write_unresolved_calls(&summary.unresolved_calls)?;
@@ -825,7 +998,9 @@ fn build_graph_database_inner(
     {
         let conn = rusqlite::Connection::open(out_path)
             .with_context(|| format!("reopening {} to record unread paths", out_path.display()))?;
-        write_unread_paths(&conn, &unread)?;
+        let unread_keys =
+            unread_keys_from_paths(&unread, project.search_roots.as_ref(), Some(universe))?;
+        write_unread_keys(&conn, &unread_keys)?;
     }
     Ok(summary)
 }
@@ -898,8 +1073,11 @@ fn incremental_safety_check(
     conn: &Connection,
     changed_files: &[String],
     rows: &ide::ReprojectedRows,
+    roots: Option<&bsl_search::WorkspaceRoots>,
 ) -> anyhow::Result<()> {
     use std::collections::{HashMap, HashSet};
+
+    install_changed_file_keys(conn, changed_files, roots)?;
 
     // (C) Objects the full build saw with inconsistent casing across modules. Their
     // cross-module first-seen ordering is not reconstructable from the canonicalised
@@ -955,17 +1133,13 @@ fn incremental_safety_check(
     }
 
     // (B) Aux objects the changed modules referenced before the edit.
-    let placeholders = changed_files.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let old_sql = format!(
-        "SELECT DISTINCT e.to_id FROM edges e JOIN nodes n ON e.from_id = n.id \
-         WHERE n.file IN ({placeholders}) \
-         AND (e.to_id LIKE 'mdo/%' OR e.to_id LIKE 'attribute/%')"
-    );
+    let old_sql = "SELECT DISTINCT e.to_id FROM edges e JOIN nodes n ON e.from_id = n.id \
+         JOIN changed_file_keys changed ON changed.root_id = n.file_root_id \
+             AND changed.path = n.file_path \
+         WHERE e.to_id LIKE 'mdo/%' OR e.to_id LIKE 'attribute/%'";
     let old_aux: HashSet<String> = {
-        let mut stmt = conn.prepare(&old_sql)?;
-        let it = stmt.query_map(rusqlite::params_from_iter(changed_files.iter()), |r| {
-            r.get::<_, String>(0)
-        })?;
+        let mut stmt = conn.prepare(old_sql)?;
+        let it = stmt.query_map([], |r| r.get::<_, String>(0))?;
         it.filter_map(|r| r.ok()).collect()
     };
     for id in &old_aux {
@@ -983,17 +1157,13 @@ fn incremental_safety_check(
         .collect();
     // A surviving reference is one from BSL source outside the changed set. The
     // kind says so; `file` alone no longer does, now that an object carries one.
-    let survivors_sql = format!(
-        "SELECT COUNT(*) FROM edges e JOIN nodes n ON e.from_id = n.id \
+    let survivors_sql = "SELECT COUNT(*) FROM edges e JOIN nodes n ON e.from_id = n.id \
          WHERE e.to_id = ?1 AND n.kind IN ('method','module') \
-           AND n.file NOT IN ({placeholders})"
-    );
+           AND NOT EXISTS (SELECT 1 FROM changed_file_keys changed \
+                           WHERE changed.root_id = n.file_root_id \
+                             AND changed.path = n.file_path)";
     for dropped in old_aux.iter().filter(|x| !new_aux.contains(x.as_str())) {
-        let mut params: Vec<&dyn rusqlite::ToSql> = vec![dropped];
-        for f in changed_files {
-            params.push(f);
-        }
-        let survivors: i64 = conn.query_row(&survivors_sql, params.as_slice(), |r| r.get(0))?;
+        let survivors: i64 = conn.query_row(survivors_sql, params![dropped], |r| r.get(0))?;
         if survivors > 0 {
             anyhow::bail!(
                 "incremental update: dropped aux ref {dropped} still referenced by an unchanged module; full rebuild"
@@ -1005,13 +1175,25 @@ fn incremental_safety_check(
 
 /// Insert one node row, overriding only its `id` (for aux-id canonicalisation).
 /// `INSERT OR IGNORE` keeps the first-seen spelling, exactly like the bulk writer.
-fn insert_node_row(tx: &rusqlite::Transaction<'_>, row: &NodeRow, id: &str) -> anyhow::Result<()> {
+fn insert_node_row(
+    tx: &rusqlite::Transaction<'_>,
+    row: &NodeRow,
+    id: &str,
+    roots: Option<&bsl_search::WorkspaceRoots>,
+) -> anyhow::Result<()> {
     let dispatch = if row.dispatch.is_empty() { None } else { Some(row.dispatch.join(",")) };
+    let (file_root_id, file_path) = durable_file_key(roots, row.file.as_deref());
+    if row.file.is_some() && roots.is_some() && (file_root_id.is_none() || file_path.is_none()) {
+        anyhow::bail!(
+            "incremental graph node source is outside registered workspace roots: {}",
+            row.file.as_deref().unwrap_or_default()
+        );
+    }
     tx.prepare_cached(
         "INSERT OR IGNORE INTO nodes \
-         (id, kind, name, qualified, module, file, name_offset, sig_end, src_start, \
+         (id, kind, name, qualified, module, file_root_id, file_path, name_offset, sig_end, src_start, \
           src_end, dispatch, is_export, addressable) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
     )?
     .execute(params![
         id,
@@ -1019,7 +1201,8 @@ fn insert_node_row(tx: &rusqlite::Transaction<'_>, row: &NodeRow, id: &str) -> a
         row.name,
         row.qualified,
         row.module,
-        row.file,
+        file_root_id,
+        file_path,
         row.name_offset,
         row.sig_end,
         row.src_start,
@@ -1052,6 +1235,9 @@ pub(crate) fn update_graph_database_bodies(
     batch_size: usize,
     meta: &GraphMeta,
 ) -> anyhow::Result<GraphBuildSummary> {
+    if !project.validated || project.search_roots.is_none() {
+        anyhow::bail!("cannot patch a portable graph without validated workspace roots");
+    }
     let files = &universe.files;
     let all_modules: Vec<ModuleId> = files.iter().map(|(f, _)| ModuleId::new(*f)).collect();
     let paths: FxHashMap<FileId, String> =
@@ -1117,7 +1303,7 @@ pub(crate) fn update_graph_database_bodies(
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // Normalised `nodes.file` keys for the changed modules — used both to gate the
+    // Normalised `(file_root_id, file_path)` keys for the changed modules — used both to gate the
     // fast path and to scope the per-module deletes below.
     let changed_files: Vec<String> =
         changed_modules.iter().map(|m| paths[&m.file_id].clone()).collect();
@@ -1127,7 +1313,7 @@ pub(crate) fn update_graph_database_bodies(
     {
         let src = Connection::open_with_flags(src_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("opening graph db {} read-only", src_path.display()))?;
-        incremental_safety_check(&src, &changed_files, &rows)?;
+        incremental_safety_check(&src, &changed_files, &rows, project.search_roots.as_ref())?;
     }
 
     // Patch a copy, never the published file (a reader keeps its snapshot until the
@@ -1136,10 +1322,13 @@ pub(crate) fn update_graph_database_bodies(
         format!("copying graph db {} → {}", src_path.display(), out_path.display())
     })?;
 
-    let stat_fp: FxHashMap<String, u64> =
-        universe.stats.iter().map(|s| (s.path.clone(), s.fingerprint())).collect();
+    let stat_by_path: FxHashMap<String, &crate::graph::scan::FileStat> =
+        universe.stats.iter().map(|s| (s.path.clone(), s)).collect();
 
     let mut conn = Connection::open(out_path)?;
+    let changed_path_strings: Vec<String> =
+        changed_paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    install_changed_file_keys(&conn, &changed_path_strings, project.search_roots.as_ref())?;
     {
         let tx = conn.transaction().context("begin incremental patch")?;
 
@@ -1156,32 +1345,34 @@ pub(crate) fn update_graph_database_bodies(
         // module still has a module-level edge — matching a full rebuild, which emits
         // it solely as an edge endpoint. Deleting it (rather than INSERT OR IGNORE)
         // is what lets a module that lost its last module-level edge shed the node.
-        for nfile in &changed_files {
-            // Only the module's body-derived outgoing edges (from its method/module-code
-            // nodes) are reprojected, so only those are deleted. `contains` edges have
-            // `mdo`/`form` from-endpoints — never method/module — and the form pass is
-            // full-build-only, so the kind filter keeps reprojection from dropping form
-            // structure it cannot re-emit. (A no-op when no form nodes exist: all current
-            // edge sources are method/module nodes.)
-            tx.execute(
-                "DELETE FROM edges WHERE from_id IN \
-                 (SELECT id FROM nodes WHERE file = ?1 AND kind IN ('method', 'module'))",
-                params![nfile],
-            )?;
-            tx.execute(
-                "DELETE FROM nodes WHERE file = ?1 AND kind IN ('method', 'module')",
-                params![nfile],
-            )?;
-        }
+        // Only the module's body-derived outgoing edges (from its method/module-code
+        // nodes) are reprojected, so only those are deleted. `contains` edges have
+        // `mdo`/`form` from-endpoints — never method/module — and the form pass is
+        // full-build-only, so the kind filter keeps reprojection from dropping form
+        // structure it cannot re-emit.
+        tx.execute(
+            "DELETE FROM edges WHERE from_id IN \
+             (SELECT n.id FROM nodes n JOIN changed_file_keys changed \
+              ON changed.root_id = n.file_root_id AND changed.path = n.file_path \
+              WHERE n.kind IN ('method', 'module'))",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM nodes WHERE id IN \
+             (SELECT n.id FROM nodes n JOIN changed_file_keys changed \
+              ON changed.root_id = n.file_root_id AND changed.path = n.file_path \
+              WHERE n.kind IN ('method', 'module'))",
+            [],
+        )?;
 
         // Re-insert the reprojected nodes, canonicalising aux ids against the store.
         for row in &rows.nodes {
             match row.kind {
                 "mdo" | "attribute" => {
                     let id = canonicalize_aux_id(&existing_mdo, &row.id);
-                    insert_node_row(&tx, row, &id)?;
+                    insert_node_row(&tx, row, &id, project.search_roots.as_ref())?;
                 }
-                _ => insert_node_row(&tx, row, &row.id)?,
+                _ => insert_node_row(&tx, row, &row.id, project.search_roots.as_ref())?,
             }
         }
         // Re-insert the edges, canonicalising aux `to_id`s the same way.
@@ -1246,11 +1437,24 @@ pub(crate) fn update_graph_database_bodies(
         // Refresh the changed modules' persisted fingerprint + signature hash.
         for module in &changed_modules {
             let canonical = file_paths[&module.file_id].to_string_lossy().into_owned();
-            let fp = stat_fp.get(&canonical).copied().unwrap_or(0);
+            let Some(stat) = stat_by_path.get(&canonical).copied() else {
+                anyhow::bail!(
+                    "incremental update: changed file disappeared from scan: {canonical}"
+                );
+            };
+            let (Some(root_id), Some(path)) =
+                durable_file_key(project.search_roots.as_ref(), Some(&canonical))
+            else {
+                anyhow::bail!(
+                    "incremental update: changed file is outside registered roots: {canonical}"
+                );
+            };
+            let content_hash = stat.persisted_content_hash();
             let sig = rows.sig_hashes.get(module).copied();
             tx.execute(
-                "INSERT OR REPLACE INTO files (path, fingerprint, sig_hash) VALUES (?1, ?2, ?3)",
-                params![canonical, fp as i64, sig.map(|h| h as i64)],
+                "INSERT OR REPLACE INTO files (root_id, path, content_hash, fingerprint, sig_hash) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![root_id, path, content_hash.as_slice(), stat.fingerprint() as i64, sig.map(|h| h as i64)],
             )?;
         }
 
@@ -1267,34 +1471,53 @@ pub(crate) fn update_graph_database_bodies(
         // so `unread` reports far more than this patch touched.)
         //
         // Keyed by the canonical spelling `changed_paths` carries, NOT by the
-        // '/'-normalised `nodes.file` spelling: the unread paths are raw `PathBuf`s,
+        // '/'-normalised `(file_root_id, file_path)` spelling: the unread paths are raw `PathBuf`s,
         // and on Windows the two differ.
         {
-            let rewritten: std::collections::HashSet<String> =
-                changed_paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
-            let mut carried: BTreeSet<PathBuf> = read_unread_paths(&tx)
-                .into_iter()
-                .filter(|p| !rewritten.contains(p))
-                .map(PathBuf::from)
+            let rewritten: std::collections::BTreeSet<bsl_search::FileKey> = changed_paths
+                .iter()
+                .filter_map(|path| {
+                    let path_text = path.to_string_lossy();
+                    let (root_id, key_path) =
+                        durable_file_key(project.search_roots.as_ref(), Some(path_text.as_ref()));
+                    root_id.zip(key_path).map(|(root, key)| bsl_search::FileKey::new(root, key))
+                })
                 .collect();
-            carried.extend(
-                unread.iter().filter(|p| rewritten.contains(p.to_string_lossy().as_ref())).cloned(),
-            );
-            write_unread_paths(&tx, &carried)?;
+            let mut carried: BTreeSet<bsl_search::FileKey> = read_unread_keys_strict(&tx)?
+                .into_iter()
+                .filter(|key| !rewritten.contains(key))
+                .collect();
+            let unread_keys =
+                unread_keys_from_paths(&unread, project.search_roots.as_ref(), Some(universe))?;
+            carried.extend(unread_keys.into_iter().filter(|key| rewritten.contains(key)));
+            write_unread_keys(&tx, &carried)?;
         }
 
         // Refresh the reverse index of unresolved calls for the reprojected modules:
         // drop their old rows, insert their fresh ones. Unchanged modules' rows stay.
-        for nfile in &changed_files {
-            tx.execute("DELETE FROM unresolved_calls WHERE caller_file = ?1", params![nfile])?;
-        }
+        tx.execute(
+            "DELETE FROM unresolved_calls WHERE EXISTS (
+                 SELECT 1 FROM changed_file_keys changed
+                 WHERE changed.root_id = unresolved_calls.caller_root_id
+                   AND changed.path = unresolved_calls.caller_path
+             )",
+            [],
+        )?;
         {
             let mut stmt = tx.prepare_cached(
-                "INSERT OR IGNORE INTO unresolved_calls (target_scope, method_lower, caller_file) \
-                 VALUES (?1, ?2, ?3)",
+                "INSERT OR IGNORE INTO unresolved_calls \
+                 (target_scope, method_lower, caller_root_id, caller_path) \
+                 VALUES (?1, ?2, ?3, ?4)",
             )?;
             for (target_scope, method_lower, caller_file) in &rows.unresolved_calls {
-                stmt.execute(params![target_scope, method_lower, caller_file])?;
+                let (Some(root_id), Some(path)) =
+                    durable_file_key(project.search_roots.as_ref(), Some(caller_file))
+                else {
+                    anyhow::bail!(
+                        "incremental unresolved call caller is outside registered workspace roots: {caller_file}"
+                    );
+                };
+                stmt.execute(params![target_scope, method_lower, root_id, path])?;
             }
         }
 
@@ -1421,24 +1644,34 @@ pub fn recompute_module_profiles(
 ///   old or new), or an added resolvable name on a module whose scope is not
 ///   name-keyed (so its callers cannot be found). The caller must do a full rebuild.
 ///
-/// `sig_changed` pairs each changed module's normalised `nodes.file` key with its
+/// `sig_changed` pairs each changed module's normalised `(file_root_id, file_path)` key with its
 /// freshly-recomputed [`ModuleProfile`].
 pub fn caller_delta_plan(
     db_path: &Path,
     sig_changed: &[(&str, &ModuleProfile)],
+    roots: Option<&bsl_search::WorkspaceRoots>,
 ) -> anyhow::Result<Option<Vec<PathBuf>>> {
     let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let changed_file_names: Vec<String> =
+        sig_changed.iter().map(|(file, _)| (*file).to_owned()).collect();
+    install_changed_file_keys(&conn, &changed_file_names, roots)?;
 
     // What the stored artefact recorded as unreadable. Compared verbatim: both this and
     // the keys of `sig_changed` are the raw canonical spelling of the same scanned
     // path — `unread_paths` from the batch loader's `PathBuf`s, the keys from
     // `files.path`. Normalising either side would break the match on the one platform
     // where the two spellings could differ at all.
-    let was_unread: std::collections::HashSet<String> =
-        read_unread_paths(&conn).into_iter().collect();
+    let was_unread: std::collections::HashSet<bsl_search::FileKey> =
+        read_unread_keys_strict(&conn)?.into_iter().collect();
 
     let mut index_callers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (file, profile) in sig_changed {
+        let (root_id, path) = durable_file_key(roots, Some(file));
+        let Some(file_key) =
+            root_id.zip(path).map(|(root_id, path)| bsl_search::FileKey::new(root_id, path))
+        else {
+            return Ok(None);
+        };
         if profile.has_collision {
             return Ok(None); // first-wins shadowing — exported set ≠ resolvable set
         }
@@ -1456,21 +1689,30 @@ pub fn caller_delta_plan(
         // by-name lookup below cannot find them (the disputed method may well be
         // declared only next door). Take every caller the artefact recorded as blocked
         // on this scope, whatever the name.
-        if was_unread.contains(*file) {
+        if was_unread.contains(&file_key) {
             let Some(scope) = ide::scope_for_path(file) else {
                 return Ok(None); // not name-keyed → its callers aren't indexable
             };
-            let mut stmt =
-                conn.prepare("SELECT caller_file FROM unresolved_calls WHERE target_scope = ?1")?;
-            let rows = stmt.query_map(params![scope], |r| r.get::<_, String>(0))?;
+            let mut stmt = conn.prepare(
+                "SELECT caller_root_id, caller_path FROM unresolved_calls WHERE target_scope = ?1",
+            )?;
+            let rows = stmt.query_map(params![scope], |r| {
+                Ok(bsl_search::FileKey::new(r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
             for row in rows {
-                index_callers.insert(row?);
+                let key = row?;
+                let Some(path) = roots.and_then(|roots| roots.resolve_walked(&key)) else {
+                    return Ok(None);
+                };
+                index_callers.insert(path.to_string_lossy().into_owned());
             }
         }
         // OLD resolvable surface from the stored method nodes.
-        let mut stmt =
-            conn.prepare("SELECT name, is_export FROM nodes WHERE file = ?1 AND kind = 'method'")?;
-        let rows = stmt.query_map([file], |r| {
+        let mut stmt = conn.prepare(
+            "SELECT name, is_export FROM nodes \
+             WHERE file_root_id = ?1 AND file_path = ?2 AND kind = 'method'",
+        )?;
+        let rows = stmt.query_map(params![file_key.root_id, file_key.path], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(0) != 0))
         })?;
         let mut old_lowers: Vec<String> = Vec::new();
@@ -1498,13 +1740,19 @@ pub fn caller_delta_plan(
                 return Ok(None); // not name-keyed → its callers aren't indexable
             };
             let mut stmt = conn.prepare(
-                "SELECT caller_file FROM unresolved_calls \
+                "SELECT caller_root_id, caller_path FROM unresolved_calls \
                  WHERE target_scope = ?1 AND method_lower = ?2",
             )?;
             for name in added {
-                let rows = stmt.query_map(params![scope, name], |r| r.get::<_, String>(0))?;
+                let rows = stmt.query_map(params![scope, name], |r| {
+                    Ok(bsl_search::FileKey::new(r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?;
                 for row in rows {
-                    index_callers.insert(row?);
+                    let key = row?;
+                    let Some(path) = roots.and_then(|roots| roots.resolve_walked(&key)) else {
+                        return Ok(None);
+                    };
+                    index_callers.insert(path.to_string_lossy().into_owned());
                 }
             }
         }
@@ -1513,7 +1761,6 @@ pub fn caller_delta_plan(
     // Resolved callers: modules with a stored edge into a changed module's method node.
     let changed_files: std::collections::BTreeSet<&str> =
         sig_changed.iter().map(|(f, _)| *f).collect();
-    let placeholders = changed_files.iter().map(|_| "?").collect::<Vec<_>>().join(",");
 
     // A signature change in an event-subscription handler module can invalidate its
     // config-level `mdo -> method` subscription edge — but that edge's source is an
@@ -1522,30 +1769,36 @@ pub fn caller_delta_plan(
     // Bail to a full rebuild so a removed/unexported/renamed handler cannot leave a
     // dangling subscription edge.
     {
-        let sql = format!(
+        let mut stmt = conn.prepare(
             "SELECT 1 FROM edges e JOIN nodes n1 ON e.to_id = n1.id \
-             WHERE n1.file IN ({placeholders}) AND n1.kind = 'method' \
-             AND e.kind = 'event_subscription' LIMIT 1"
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        if stmt.exists(rusqlite::params_from_iter(changed_files.iter()))? {
+             JOIN changed_file_keys changed ON changed.root_id = n1.file_root_id \
+                 AND changed.path = n1.file_path \
+             WHERE n1.kind = 'method' AND e.kind = 'event_subscription' LIMIT 1",
+        )?;
+        if stmt.exists([])? {
             return Ok(None);
         }
     }
 
-    let sql = format!(
-        "SELECT DISTINCT n2.file FROM edges e \
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT n2.file_root_id, n2.file_path FROM edges e \
          JOIN nodes n1 ON e.to_id = n1.id \
          JOIN nodes n2 ON e.from_id = n2.id \
-         WHERE n1.file IN ({placeholders}) AND n1.kind = 'method' \
-           AND n2.kind IN ('method','module') AND n2.file IS NOT NULL"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt
-        .query_map(rusqlite::params_from_iter(changed_files.iter()), |r| r.get::<_, String>(0))?;
+         JOIN changed_file_keys changed ON changed.root_id = n1.file_root_id \
+             AND changed.path = n1.file_path \
+         WHERE n1.kind = 'method' \
+           AND n2.kind IN ('method','module') AND n2.file_path IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(bsl_search::FileKey::new(r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
     let mut callers: std::collections::BTreeSet<String> = index_callers;
     for row in rows {
-        callers.insert(row?);
+        let key = row?;
+        let Some(path) = roots.and_then(|roots| roots.resolve_walked(&key)) else {
+            return Ok(None);
+        };
+        callers.insert(path.to_string_lossy().into_owned());
     }
     Ok(Some(
         callers
@@ -1706,8 +1959,20 @@ mod tests {
 
         let mut w = GraphDbWriter::create(&path).unwrap();
         w.write_files(&[
-            FileFingerprint { path: "/cfg/A.bsl".to_string(), fingerprint: 111, sig_hash: None },
-            FileFingerprint { path: "/cfg/A.xml".to_string(), fingerprint: 222, sig_hash: None },
+            FileFingerprint {
+                root_id: "".to_string(),
+                path: "cfg/A.bsl".to_string(),
+                content_hash: [1; 32],
+                fingerprint: 111,
+                sig_hash: None,
+            },
+            FileFingerprint {
+                root_id: "".to_string(),
+                path: "cfg/A.xml".to_string(),
+                content_hash: [2; 32],
+                fingerprint: 222,
+                sig_hash: None,
+            },
         ])
         .unwrap();
         w.finalize(&GraphMeta {
@@ -1721,7 +1986,7 @@ mod tests {
         let conn = open(&path);
         let (fp, sig): (i64, Option<i64>) = conn
             .query_row(
-                "SELECT fingerprint, sig_hash FROM files WHERE path = '/cfg/A.bsl'",
+                "SELECT fingerprint, sig_hash FROM files WHERE root_id = '' AND path = 'cfg/A.bsl'",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -1730,7 +1995,11 @@ mod tests {
         assert_eq!(sig, None, "sig_hash is NULL until the body-only fast path fills it");
 
         let xml_fp: i64 = conn
-            .query_row("SELECT fingerprint FROM files WHERE path = '/cfg/A.xml'", [], |r| r.get(0))
+            .query_row(
+                "SELECT fingerprint FROM files WHERE root_id = '' AND path = 'cfg/A.xml'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(xml_fp as u64, 222);
     }
@@ -1826,6 +2095,9 @@ mod tests {
             built_at: "t".to_string(),
         })
         .unwrap();
+        open(&path)
+            .execute("INSERT INTO meta (key, value) VALUES ('unread_paths', '[]')", [])
+            .unwrap();
 
         let profile = ModuleProfile {
             sig_hash: 999,
@@ -1833,8 +2105,8 @@ mod tests {
             has_collision: false,
             unread: false,
         };
-        let plan =
-            caller_delta_plan(&path, &[("CommonModules/X/Ext/Module.bsl", &profile)]).unwrap();
+        let plan = caller_delta_plan(&path, &[("CommonModules/X/Ext/Module.bsl", &profile)], None)
+            .unwrap();
         assert!(
             plan.is_none(),
             "a signature change to a subscription handler module must force a full rebuild"
@@ -1890,25 +2162,26 @@ mod tests {
     }
 
     /// `None` covers both "no such row" and "a row with no file": neither is a
-    /// placed object, and the tests below care only about that.
-    fn stored_file(db: &Path, id: &str) -> Option<String> {
+    /// placed object, and the tests below care only about that. A placed object is
+    /// asserted by its durable `(root_id, path)` pair, never by a physical address.
+    fn stored_file(db: &Path, id: &str) -> Option<(String, String)> {
         use rusqlite::OptionalExtension;
         Connection::open(db)
             .unwrap()
-            .query_row("SELECT file FROM nodes WHERE id = ?1", [id], |row| {
-                row.get::<_, Option<String>>(0)
+            .query_row("SELECT file_root_id, file_path FROM nodes WHERE id = ?1", [id], |row| {
+                Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?))
             })
             .optional()
             .unwrap()
-            .flatten()
+            .and_then(|(root_id, path)| root_id.zip(path))
     }
 
     /// The path the build is expected to store, taken from the tree rather than
     /// spelled out: a hand-built string would agree with a row written in any
     /// shape, and the shape is the whole point — the dictionary resolves this
     /// against the scanned universe.
-    fn expected_file(root: &Path, relative: &str) -> String {
-        root.join(relative).canonicalize().unwrap().to_string_lossy().replace('\\', "/")
+    fn expected_file(_root: &Path, relative: &str) -> (String, String) {
+        (String::new(), relative.replace('\\', "/"))
     }
 
     /// The full build is the path that places an object: the catalog, role and
@@ -2034,7 +2307,9 @@ mod tests {
         let path_key = changed[0].to_string_lossy().into_owned();
         let stored_sig: i64 = Connection::open(&db_pre)
             .unwrap()
-            .query_row("SELECT sig_hash FROM files WHERE path = ?1", [&path_key], |row| row.get(0))
+            .query_row("SELECT sig_hash FROM files WHERE path LIKE '%Module.bsl'", [], |row| {
+                row.get(0)
+            })
             .unwrap();
 
         // When: a top-level variable shifts method local ids but preserves its signature.
@@ -2075,9 +2350,9 @@ mod tests {
             for (label, query, columns) in [
                 (
                     "nodes",
-                    "SELECT id, kind, name, qualified, module, file, name_offset, sig_end, src_start, \
-                     src_end, dispatch, is_export, addressable FROM nodes ORDER BY id",
-                    13,
+                    "SELECT id, kind, name, qualified, module, file_root_id, file_path, name_offset, \
+                     sig_end, src_start, src_end, dispatch, is_export, addressable FROM nodes ORDER BY id",
+                    14,
                 ),
                 (
                     "edges",
@@ -2088,11 +2363,16 @@ mod tests {
                 ("in_degree", "SELECT id, degree FROM in_degree ORDER BY id", 2),
                 (
                     "unresolved_calls",
-                    "SELECT target_scope, method_lower, caller_file FROM unresolved_calls \
-                     ORDER BY target_scope, method_lower, caller_file",
-                    3,
+                    "SELECT target_scope, method_lower, caller_root_id, caller_path \
+                     FROM unresolved_calls ORDER BY target_scope, method_lower, caller_root_id, caller_path",
+                    4,
                 ),
-                ("files", "SELECT path, fingerprint, sig_hash FROM files ORDER BY path", 3),
+                (
+                    "files",
+                    "SELECT root_id, path, content_hash, fingerprint, sig_hash \
+                     FROM files ORDER BY root_id, path",
+                    5,
+                ),
             ] {
                 let mut statement = conn.prepare(query).unwrap();
                 let rows = statement
@@ -2334,7 +2614,17 @@ mod tests {
         // When: source-root membership is derived from the anchor root's two module files.
         let digest = read_source_root_scoped_sqlite_method_call_digest(
             &path,
-            [path_a, root_a.join("Target.bsl"), root_a.join("Target.bsl")],
+            [
+                bsl_search::FileKey::new("", path_a.to_string_lossy().into_owned()),
+                bsl_search::FileKey::new(
+                    "",
+                    root_a.join("Target.bsl").to_string_lossy().into_owned(),
+                ),
+                bsl_search::FileKey::new(
+                    "",
+                    root_a.join("Target.bsl").to_string_lossy().into_owned(),
+                ),
+            ],
         )
         .unwrap();
 
@@ -2353,12 +2643,15 @@ mod tests {
         let source_root = std::env::var_os("BSL_SOURCE_ROOT").expect("BSL_SOURCE_ROOT is required");
         let graph_db = PathBuf::from(graph_db);
         let source_root = PathBuf::from(source_root);
-        let files = enumerate_bsl_files(&crate::graph::ProjectSnapshot::load(&source_root));
+        let project = crate::graph::ProjectSnapshot::load(&source_root);
+        let files = enumerate_bsl_files(&project);
 
         // Given: the persisted graph and the exact BSL files in the anchor's source root.
         let digest = read_source_root_scoped_sqlite_method_call_digest(
             &graph_db,
-            files.iter().map(|(_, path)| path),
+            files.iter().filter_map(|(_, path)| {
+                project.search_roots.as_ref().and_then(|roots| roots.key_of_path(path))
+            }),
         )
         .unwrap();
 

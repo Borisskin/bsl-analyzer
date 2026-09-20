@@ -19,6 +19,10 @@ pub(crate) struct ProjectSnapshot {
     pub workspace_root: PathBuf,
     pub scan_roots: Vec<PathBuf>,
     pub configs: ide::WorkspaceConfigsSnapshot,
+    /// Topology identity in the graph's durable address space. The physical
+    /// configuration fingerprint in `configs` remains available to diagnostics
+    /// and coordination; this value is only for graph/search reuse.
+    pub portable_topology: u64,
     /// Search ownership derived from the same validated project as `scan_roots` and
     /// `configs`. It travels with a published build so the publish hook never reloads a
     /// newer project and mixes its roots with an older graph.
@@ -62,6 +66,7 @@ impl ProjectSnapshot {
                     workspace_root: workspace_root.to_path_buf(),
                     scan_roots: vec![workspace_root.to_path_buf()],
                     configs: ide::WorkspaceConfigsSnapshot::default(),
+                    portable_topology: 0,
                     search_roots: None,
                     excluded: excluded.to_vec(),
                     validated: false,
@@ -86,15 +91,74 @@ impl ProjectSnapshot {
         // canonicalizes every `.bsl`), so the registered roots must be canonical
         // too — a raw symlinked root would miss both prefix matching and the
         // unbootstrapped root-join fallbacks.
+        let search_roots = crate::project::workspace_roots(project, excluded).0;
+        let portable_topology = portable_topology(project, &search_roots, excluded);
         Self {
             workspace_root: project.root.clone(),
             scan_roots,
             configs: ide::WorkspaceConfigsSnapshot::from_project(project).canonicalized(),
-            search_roots: Some(crate::project::workspace_roots(project, excluded).0),
+            portable_topology,
+            search_roots: Some(search_roots),
             excluded: excluded.to_vec(),
             validated: true,
         }
     }
+}
+
+fn portable_topology(
+    project: &project_model::Project,
+    roots: &bsl_search::WorkspaceRoots,
+    excluded: &[PathBuf],
+) -> u64 {
+    let base = project.configuration_path().unwrap_or(&project.root);
+    let topology = project.extension_topology().portable_fingerprint(base, &project.root);
+    let workspace = std::fs::canonicalize(&project.root).unwrap_or_else(|_| project.root.clone());
+    let mut exclusions: Vec<Vec<u8>> = excluded
+        .iter()
+        .filter_map(|path| portable_exclusion_key(roots, &workspace, path))
+        .collect();
+    exclusions.sort();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bsl-analyzer-portable-topology-v1\0");
+    hasher.update(topology.as_bytes());
+    for exclusion in exclusions {
+        hasher.update(&(exclusion.len() as u64).to_le_bytes());
+        hasher.update(&exclusion);
+    }
+    let digest = hasher.finalize();
+    u64::from_le_bytes(digest.as_bytes()[..8].try_into().expect("blake3 yields >= 8 bytes"))
+}
+
+fn portable_exclusion_key(
+    roots: &bsl_search::WorkspaceRoots,
+    workspace: &Path,
+    path: &Path,
+) -> Option<Vec<u8>> {
+    let declared = path;
+    let declared_key = roots.key_of_path(declared);
+    let canonical = std::fs::canonicalize(declared).unwrap_or_else(|_| declared.to_path_buf());
+    let mut encoded = Vec::new();
+    match declared_key.or_else(|| roots.key_of_path(&canonical)) {
+        Some(key) => {
+            encoded.push(0);
+            append_len_prefixed(&mut encoded, key.root_id.as_bytes());
+            append_len_prefixed(&mut encoded, key.path.as_bytes());
+        }
+        None => {
+            let relative = canonical
+                .strip_prefix(workspace)
+                .ok()
+                .or_else(|| declared.strip_prefix(roots.workspace()).ok())?;
+            encoded.push(1);
+            append_len_prefixed(&mut encoded, relative.to_string_lossy().as_bytes());
+        }
+    }
+    Some(encoded)
+}
+
+fn append_len_prefixed(target: &mut Vec<u8>, bytes: &[u8]) {
+    target.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    target.extend_from_slice(bytes);
 }
 
 /// The configuration source directory plus every extension directory — the file

@@ -2,7 +2,6 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::cache::graph_db_path;
 use crate::graph_db::build_graph_database;
 
 use super::build::GRAPH_BUILD_BATCH;
@@ -53,6 +52,19 @@ pub(crate) fn sample_workspace(root: &Path) {
     write_common_module(root, "Сервер", true, "&НаСервере\nФункция Считать() Экспорт КонецФункции");
 }
 
+/// Start the graph test watcher with the same cache exclusion as production.
+///
+/// Graph builds write their derived SQLite files below `<workspace>/.build`. A raw recursive
+/// watcher would report those writes as workspace changes and make an otherwise coherent test
+/// publication stale.
+pub(crate) fn workspace_hub(root: &Path) -> crate::change_hub::WorkspaceChangeHub {
+    let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+    crate::change_hub::WorkspaceChangeHub::start_targets_excluding(
+        vec![crate::change_hub::WatchTarget::recursive(root.to_path_buf())],
+        cache.spellings().iter().map(|path| path.to_path_buf()).collect(),
+    )
+}
+
 /// How often a bounded wait re-reads the state it is waiting on.
 pub(crate) const WAIT_POLL: Duration = Duration::from_millis(10);
 /// The default ceiling for a bounded wait on graph state.
@@ -63,12 +75,13 @@ pub(crate) const WAIT_CEILING: Duration = Duration::from_secs(30);
 pub(super) fn graph_state_summary(graph: &GraphState) -> String {
     let inner = lock_recover(&graph.inner);
     let published = inner.published.as_ref().map(|published| {
+        let reload = match &published.reload {
+            super::state::ReloadState::Failed(message) => format!("failed: {message}"),
+            _ => published.reload.label().to_owned(),
+        };
         format!(
             "generation {}, reload {}, stale {}, force_stale {}",
-            published.generation,
-            published.reload.label(),
-            published.stale,
-            published.force_stale
+            published.generation, reload, published.stale, published.force_stale
         )
     });
     format!(
@@ -185,10 +198,26 @@ pub(super) fn write_extension_config(root: &Path, depends_on: bool) {
 }
 
 pub(super) fn seed_cache(root: &Path, fingerprint: crate::graph_db::GraphFp) {
-    let out = graph_db_path(root);
+    seed_cache_with_layout(
+        root,
+        &crate::cache::WorkspaceCacheLayout::for_workspace(root),
+        fingerprint,
+    );
+}
+
+pub(super) fn seed_cache_with_layout(
+    root: &Path,
+    cache: &crate::cache::WorkspaceCacheLayout,
+    fingerprint: crate::graph_db::GraphFp,
+) {
+    let out = cache.graph_db_path();
     fs::create_dir_all(out.parent().unwrap()).unwrap();
-    let project = crate::graph::ProjectSnapshot::load(root);
-    let universe = crate::graph::universe::ScannedUniverse::scan(&project.scan_roots);
+    let excluded: Vec<_> = cache.spellings().iter().map(|path| path.to_path_buf()).collect();
+    let project = crate::graph::ProjectSnapshot::load_excluding(root, &excluded);
+    let universe = crate::graph::universe::ScannedUniverse::scan_excluding(
+        &project.scan_roots,
+        &project.excluded,
+    );
     build_graph_database(
         &project,
         &universe,
@@ -217,7 +246,7 @@ pub(crate) fn meta_string(path: &Path, key: &str) -> String {
 pub(crate) fn watched_graph(
     root: &Path,
 ) -> (GraphState, crate::change_hub::WorkspaceChangeHub, crate::state::OwnerStop) {
-    let hub = crate::change_hub::WorkspaceChangeHub::start(vec![root.to_path_buf()]);
+    let hub = workspace_hub(root);
     assert!(hub.wait_until_watching(Duration::from_secs(5)), "the hub did not arm");
     let graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
     let stop = crate::state::OwnerStop::default();

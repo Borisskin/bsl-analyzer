@@ -2689,7 +2689,13 @@ impl SearchEngine {
         known.extend(cache.root_keyed_keys());
         drop(cache);
 
-        let changed_ids = plan.old_roots.changed_root_ids(&plan.next_roots);
+        // A root id is the durable identity. Its declared/canonical directory may move while
+        // the `(root_id,path)` key space and its content remain unchanged; that move must not
+        // evict chunks or vectors. Only ids entering or leaving the table change a key space.
+        let old_ids: HashSet<String> = plan.old_roots.ids().map(str::to_owned).collect();
+        let next_ids: HashSet<String> = plan.next_roots.ids().map(str::to_owned).collect();
+        let changed_ids: HashSet<String> =
+            old_ids.symmetric_difference(&next_ids).cloned().collect();
         let readable_keys: HashSet<FileKey> =
             plan.files.iter().map(|file| file.key.clone()).collect();
         let unread_keys: HashSet<FileKey> =
@@ -2705,11 +2711,12 @@ impl SearchEngine {
         let mut rebuilt = 0;
         let mut added = 0;
         for file in &plan.files {
-            let old_owner =
-                plan.old_roots.root_of(&file.identity.abs_path, &file.identity.canonical);
+            let stored_hash = self.store.file_hash(&file.key.root_id, &file.key.path)?;
+            let content_same =
+                stored_hash.as_deref().is_some_and(|hash| hash == file.content_hash.as_slice());
             if changed_ids.contains(&file.key.root_id)
-                || old_owner.as_ref() != Some(&file.key)
                 || !known.contains(&file.key)
+                || !content_same
             {
                 cleanup.insert(file.key.clone());
                 affected_files.push(file);
@@ -9135,6 +9142,51 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].root_id, CONFIGURATION_ROOT_ID);
         assert_eq!(engine.configuration_root(), Some(new_configuration.as_path()));
+    }
+
+    #[test]
+    fn moving_workspace_roots_preserves_matching_chunks_and_vectors() {
+        let dir = tempdir().unwrap();
+        let old_workspace = dir.path().join("old");
+        let new_workspace = dir.path().join("new");
+        let old_configuration = old_workspace.join("cf");
+        let new_configuration = new_workspace.join("cf");
+        write_transition_module(&old_configuration, "Перенесена");
+        write_transition_module(&new_configuration, "Перенесена");
+
+        let mut engine = SearchEngine::fts_only(&dir.path().join("search.db")).unwrap();
+        let old_roots = crate::WorkspaceRoots::build(&old_workspace, &old_configuration, &[]).0;
+        engine.initialize_workspace_roots(old_roots).unwrap();
+        engine.index_directory_fts(&old_configuration).unwrap();
+
+        let key = FileKey::configuration("CommonModules/Один/Ext/Module.bsl");
+        let chunk_ids = engine.store().chunk_ids_for_file("code", &key.root_id, &key.path).unwrap();
+        assert_eq!(chunk_ids.len(), 1);
+        let embedding = vec![0.25_f32; 1024];
+        engine.store().set_chunk_embeddings(&[(chunk_ids[0], embedding)]).unwrap();
+        let (_, before) = engine.store().load_all_embeddings_with_generation(1024).unwrap();
+
+        let new_roots = crate::WorkspaceRoots::build(&new_workspace, &new_configuration, &[]).0;
+        let plan = engine.workspace_roots_transition_seed(new_roots).unwrap().plan().unwrap();
+        let outcome = engine
+            .apply_validated_workspace_roots_transition(plan.revalidate().unwrap().unwrap())
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            super::WorkspaceRootsTransitionOutcome::Applied {
+                removed: 0,
+                rebuilt: 0,
+                added: 0,
+                pending_collection_embeddings: false,
+                ..
+            }
+        ));
+        let (_, after) = engine.store().load_all_embeddings_with_generation(1024).unwrap();
+        assert_eq!(after, before, "a physical move must keep the stored vectors");
+        assert_eq!(engine.vector_count(), 1, "the live vector index keeps the matching vector");
+        assert_eq!(engine.configuration_root(), Some(new_configuration.as_path()));
+        assert_eq!(engine.text_search("Перенесена", 10, Some("code")).unwrap().len(), 1);
     }
 
     #[test]

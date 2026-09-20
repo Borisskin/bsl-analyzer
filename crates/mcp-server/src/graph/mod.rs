@@ -19,6 +19,8 @@ pub(crate) mod scan;
 mod snapshot;
 #[cfg(test)]
 pub(crate) use snapshot::{BackgroundSnapshotFailure, SNAPSHOT_POOL_CAP};
+#[cfg(test)]
+mod portable_workspace_graph_tests;
 mod state;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -30,7 +32,7 @@ pub(crate) mod watcher;
     unused_imports,
     reason = "the stable graph facade preserves crate::graph helper paths while leaf consumers import directly"
 )]
-pub(crate) use build::{read_stored_fingerprints, read_stored_sig_hashes};
+pub(crate) use build::{read_stored_fingerprints_with_roots, read_stored_sig_hashes};
 #[allow(
     unused_imports,
     reason = "the stable graph facade preserves crate::graph helper paths while leaf consumers import directly"

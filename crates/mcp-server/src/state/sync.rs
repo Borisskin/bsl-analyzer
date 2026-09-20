@@ -1096,7 +1096,7 @@ impl SharedState {
             LeaseOperationOutcome::Released => return ReferencingFilesOutcome::Released,
         };
         for mdo_id in mdo_ids {
-            match snapshot.graph.referencing_files(&mdo_id) {
+            match snapshot.graph.referencing_files(&mdo_id, snapshot.workspace_roots()) {
                 Ok(found) => files.extend(found.into_iter().map(PathBuf::from)),
                 Err(error) => {
                     return ReferencingFilesOutcome::OperationError(format!(

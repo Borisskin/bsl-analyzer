@@ -335,7 +335,12 @@ impl SharedState {
             );
             return (false, false, false);
         };
-        let Some(provider) = Self::published_graph_context_provider(cache, signal.topology) else {
+        let Some(provider) = Self::published_graph_context_provider(
+            cache,
+            signal.revision,
+            signal.fingerprint,
+            Some(&roots),
+        ) else {
             return (false, false, false);
         };
         let seed = {
@@ -535,7 +540,9 @@ impl SharedState {
 
     fn published_graph_context_provider(
         cache: &crate::cache::WorkspaceCacheLayout,
-        topology: u64,
+        revision: u64,
+        expected_fingerprint: crate::graph_db::GraphFp,
+        roots: Option<&bsl_search::WorkspaceRoots>,
     ) -> Option<Arc<crate::graph_query::GraphDbContextProvider>> {
         let graph_path = cache.graph_db_path();
         let graph_db = match crate::graph_query::GraphDb::open(&graph_path) {
@@ -546,13 +553,16 @@ impl SharedState {
             }
         };
         match graph_db.freshness_token() {
-            Ok((_, fingerprint, _)) if fingerprint.topology == topology => {
-                Some(Arc::new(crate::graph_query::GraphDbContextProvider::new(graph_db)))
+            Ok((actual_revision, fingerprint, _))
+                if actual_revision == revision && fingerprint == expected_fingerprint =>
+            {
+                Some(Arc::new(crate::graph_query::GraphDbContextProvider::new(graph_db, roots)))
             }
             _ => {
                 tracing::warn!(
-                    published_topology = topology,
-                    "graph database on disk is not the published build; skipping root transition"
+                    published_revision = revision,
+                    published_topology = expected_fingerprint.topology,
+                    "graph database on disk is not the published generation; skipping root transition"
                 );
                 None
             }
@@ -955,6 +965,9 @@ impl SharedState {
             mark_bound,
             topology_changed,
             topology,
+            revision,
+            fingerprint,
+            workspace_roots,
             ..
         } = signal;
         // Fast-path skip (an optimization, not correctness): a follow-up reload is already
@@ -982,16 +995,19 @@ impl SharedState {
         // workspace's answers, so treat the mismatch like an unavailable graph — the marks
         // stay dirty and a later publish re-renders them from our own build.
         match graph_db.freshness_token() {
-            Ok((_, fingerprint, _)) if fingerprint.topology == topology => {}
+            Ok((actual_revision, actual_fingerprint, _))
+                if actual_revision == revision && actual_fingerprint == fingerprint => {}
             _ => {
                 tracing::warn!(
+                    published_revision = revision,
                     published_topology = topology,
-                    "graph database on disk is not the published build; skipping context refresh"
+                    "graph database on disk is not the published generation; skipping context refresh"
                 );
                 return false;
             }
         }
-        let provider = crate::graph_query::GraphDbContextProvider::new(graph_db);
+        let provider =
+            crate::graph_query::GraphDbContextProvider::new(graph_db, workspace_roots.as_ref());
         let refreshed = match engine.acquire_for_owner(stop) {
             Ok(guard) => match guard.as_ref() {
                 Some(engine) => {
@@ -1800,15 +1816,19 @@ mod tests {
         (engine, runtime, flight)
     }
 
-    /// The extension topology recorded in the graph database a test just built — what a real
+    /// The graph freshness token recorded in the database a test just built — what a real
     /// publish would put in its signal, and what the refresh checks the file against.
+    fn built_graph_token(workspace: &std::path::Path) -> (u64, crate::graph_db::GraphFp) {
+        let (revision, fingerprint, _) =
+            crate::graph_query::GraphDb::open(&crate::cache::graph_db_path(workspace))
+                .expect("graph database built by the test")
+                .freshness_token()
+                .expect("graph database carries its freshness token");
+        (revision, fingerprint)
+    }
+
     fn built_graph_topology(workspace: &std::path::Path) -> u64 {
-        crate::graph_query::GraphDb::open(&crate::cache::graph_db_path(workspace))
-            .expect("graph database built by the test")
-            .freshness_token()
-            .expect("graph database carries its freshness token")
-            .1
-            .topology
+        built_graph_token(workspace).1.topology
     }
 
     /// The publish hook the leftover-pickup tests drive: the real context refresh over a shared
@@ -2038,6 +2058,8 @@ mod tests {
             mark_bound: 0,
             topology_changed: false,
             topology: built_graph_topology(&workspace),
+            revision: built_graph_token(&workspace).0,
+            fingerprint: built_graph_token(&workspace).1,
             roots_refresh_requested: true,
             workspace_roots: crate::project::at(&workspace)
                 .ok()
@@ -2087,6 +2109,8 @@ mod tests {
             mark_bound: 0,
             topology_changed: false,
             topology: built_graph_topology(&workspace),
+            revision: built_graph_token(&workspace).0,
+            fingerprint: built_graph_token(&workspace).1,
             roots_refresh_requested: true,
             workspace_roots: crate::project::at(&workspace)
                 .ok()
@@ -2727,6 +2751,8 @@ mod tests {
                 mark_bound: i64::MAX,
                 topology_changed: false,
                 topology: built_graph_topology(&workspace),
+                revision: built_graph_token(&workspace).0,
+                fingerprint: built_graph_token(&workspace).1,
                 roots_refresh_requested: false,
                 workspace_roots: None,
             },
@@ -2757,6 +2783,8 @@ mod tests {
                 mark_bound: i64::MAX,
                 topology_changed: false,
                 topology: built_graph_topology(&workspace),
+                revision: built_graph_token(&workspace).0,
+                fingerprint: built_graph_token(&workspace).1,
                 roots_refresh_requested: false,
                 workspace_roots: None,
             },
@@ -3280,6 +3308,11 @@ mod tests {
         let index_progress = bsl_search::IndexProgress::new();
         let embed_flight = super::EmbedFlight::new();
         let refresh = |topology: u64| {
+            let (revision, fingerprint) = if crate::cache::graph_db_path(&workspace).exists() {
+                built_graph_token(&workspace)
+            } else {
+                (0, crate::graph_db::GraphFp { files: 0, topology })
+            };
             SharedState::refresh_search_contexts_after_graph(
                 &engine_arc,
                 &crate::state::OwnerStop::default(),
@@ -3293,6 +3326,8 @@ mod tests {
                     mark_bound: i64::MAX,
                     topology_changed: false,
                     topology,
+                    revision,
+                    fingerprint,
                     roots_refresh_requested: false,
                     workspace_roots: None,
                 },

@@ -34,10 +34,16 @@ pub(crate) struct GraphPublishSignal {
     pub(crate) topology_changed: bool,
     /// The extension topology of the snapshot this publish made current. A consumer that
     /// re-opens the graph database by path must check it against the file it actually got:
-    /// a daemon of another generation may have renamed ITS build into the same path, and
-    /// rendering contexts from a foreign topology would write wrong answers into the
-    /// persisted search index.
+    /// a daemon of another generation may have renamed ITS build into the same path. The
+    /// topology alone is insufficient: two generations can share it while carrying different
+    /// files and roots, so consumers compare the complete token below.
     pub(crate) topology: u64,
+    /// The revision recorded by the published graph database. Together with `fingerprint`,
+    /// this identifies the exact generation whose graph rows and roots the hook may use.
+    pub(crate) revision: u64,
+    /// The complete graph fingerprint recorded by the published graph database. It is paired
+    /// with `revision` to prevent a rename race from mixing generations that share a topology.
+    pub(crate) fingerprint: crate::graph_db::GraphFp,
     /// Whether the consumer must compare/install the search root table carried by this
     /// publication. False for a context-only retry, so a root transition failure never
     /// inflates into an unrelated whole-collection context refresh.

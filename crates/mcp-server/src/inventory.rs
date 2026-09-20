@@ -766,7 +766,7 @@ fn production_waits() -> Vec<(String, String, String)> {
     found
 }
 
-/// The module-level exemption above is real: these four are built only for tests, and the
+/// The module-level exemption above is real: these modules are built only for tests, and the
 /// gate would otherwise have to classify every wait their helpers make.
 #[test]
 fn the_test_only_modules_are_the_ones_the_parent_gates() {
@@ -782,6 +782,7 @@ fn the_test_only_modules_are_the_ones_the_parent_gates() {
         exempt,
         [
             "diagnostics_state/test_support.rs",
+            "graph/portable_workspace_graph_tests.rs",
             "graph/test_support.rs",
             "state/test_support.rs",
             "tools/search/cancel_tests.rs",
