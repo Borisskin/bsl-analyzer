@@ -671,6 +671,8 @@ const WAITS: &[(&str, &str, &str, Waiting)] = &[
     ("state/overlay_retry.rs", "run", ".wait_timeout(", Waiting::Owner),
     ("state/overlay_retry.rs", "run_pass", "acquire_for_owner(", Waiting::Owner),
     ("state/overlay_retry.rs", "should_run", "acquire_for_owner(", Waiting::Owner),
+    // The retry resolves saved graph keys against the current search roots under the owner's stop.
+    ("state/sync.rs", "apply_prepared_search_drift", "acquire_for_owner(", Waiting::Owner),
     ("state/sync.rs", "apply_prepared_search_drift", "acquire_for_owner(", Waiting::Owner),
     ("state/sync.rs", "materialize_search_drift", "acquire_for_owner(", Waiting::Owner),
     ("state/sync.rs", "prepare_search_drift", "acquire_for_owner(", Waiting::Owner),

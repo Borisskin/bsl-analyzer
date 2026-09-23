@@ -2931,8 +2931,16 @@ mod tests {
         let outcome = graph.try_incremental_reload(root, 2, 0);
         drop(held);
 
-        let PublishAttemptOutcome::Refused(failure) = outcome else {
-            panic!("an eligible incremental publication must retain the refusal")
+        let failure = match outcome {
+            PublishAttemptOutcome::Refused(failure) => failure,
+            PublishAttemptOutcome::Published => panic!(
+                "an eligible incremental publication ignored the refusal; decisions: {:?}",
+                lock_recover(&graph.incremental_decisions)
+            ),
+            PublishAttemptOutcome::FallBack => panic!(
+                "an eligible incremental publication fell back before the refusal; decisions: {:?}",
+                lock_recover(&graph.incremental_decisions)
+            ),
         };
         assert_eq!(failure.reason, LoadFailureReason::TransientRefusal);
         graph.record_load_failure(true, failure);
