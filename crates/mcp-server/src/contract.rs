@@ -1187,7 +1187,7 @@ mod tests {
                           }
                         ],
                         "name": "search",
-                        "output_schema_fingerprint": "blake3:99e8629d81299379996f8136f1bb930b987c12562fde5c6304f0d1b78b098f2c",
+                        "output_schema_fingerprint": "blake3:83be968d651582ab108be9737f34779e6b815bc67b5287a606b56fa495659d27",
                         "output_schema_version": "6",
                         "params": [
                           {

@@ -1637,6 +1637,7 @@ mod embed_exit_status {
         let terminal = ["SemanticRuntimeStatus::", "Ready"].concat();
         let failed = ["SemanticRuntimeStatus::", "Failed"].concat();
         let stopped = ["SemanticRuntimeStatus::", "Stopped"].concat();
+        let typed_failure = ["SemanticRuntimeStatus::", "from_search_error"].concat();
 
         let exits = production.match_indices(&finish).count();
         assert!(exits > 0, "the pass has no exits at all; the needle must have moved");
@@ -1648,6 +1649,7 @@ mod embed_exit_status {
                 window.contains(&writes)
                     && (window.contains(&terminal)
                         || window.contains(&failed)
+                        || window.contains(&typed_failure)
                         || window.contains(&stopped)),
                 "an exit of the embedding pass silences the guard without saying how it ended, \
                  which leaves the runtime reading `Indexing` for a pass that is over:\n{window}",

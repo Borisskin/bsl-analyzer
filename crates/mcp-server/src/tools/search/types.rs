@@ -403,6 +403,7 @@ mod tests {
                 None,
                 super::super::render::Envelope::No,
                 action,
+                None,
             )
             .structured_content
             .unwrap();
@@ -441,7 +442,7 @@ mod tests {
                     .unwrap_or(SemanticRuntimeStatus::Ready);
                 let result = super::super::status::search_status_with_cap(
                     profile,
-                    &Arc::new(std::sync::Mutex::new(None)),
+                    &crate::state::shared_engine(None),
                     &bsl_search::IndexProgress::new(),
                     &Arc::new(std::sync::Mutex::new(runtime)),
                     WorkspaceSearchMode::SqliteLocal,
