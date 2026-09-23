@@ -5374,7 +5374,7 @@ mod tests {
     /// two sides deadlock instead of serialising.
     #[test]
     fn the_publication_install_takes_the_gate_before_its_fence() {
-        let source = include_str!("snapshot.rs");
+        let source = crate::inventory::production_source(include_str!("snapshot.rs"));
         let install = source
             .split_once("fn install_prepared_snapshot(")
             .expect("the install is still there")
@@ -8393,7 +8393,7 @@ mod tests {
     /// of its own, or the same shortcut returns by another name.
     #[test]
     fn the_publication_gate_reads_no_metadata_of_its_own() {
-        let source = include_str!("snapshot.rs");
+        let source = crate::inventory::production_source(include_str!("snapshot.rs"));
         let install = source
             .split_once("pub(super) fn install_prepared_snapshot")
             .expect("the install is where a publication lands")
