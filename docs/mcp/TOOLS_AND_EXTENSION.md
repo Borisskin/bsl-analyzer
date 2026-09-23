@@ -59,7 +59,7 @@
 `list_platform` имеет версию `1`; `status` обоих профилей имеет точную форму
 `{action:"status",schema_version:"2",profile,state}` с необязательным
 `semantic_failure`, где `state` — `ready|loading|busy|failed`.
-Машинный контракт имеет версию `2.3`. `syntax_help` имеет версию `2`, а все успешные варианты
+Машинный контракт имеет версию `2.4`. `syntax_help` имеет версию `2`, а все успешные варианты
 `symbol_info`, включая transient `status="loading"`, — версию `1`.
 
 Справочный индекс проходит состояния `Uninitialized → Loading → Ready` либо `Failed`.

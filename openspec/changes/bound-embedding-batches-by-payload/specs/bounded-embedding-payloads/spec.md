@@ -77,7 +77,7 @@ R5. The affected existing MCP responses SHALL follow the scope, exact schema ver
 
 #### Scenario: Contract discovery and profile coverage
 - **WHEN** clients discover tools/list and the contract resource and use either workspace or reference docs routes
-- **THEN** machine 2.3, search 5/status 2 and fingerprints describe the actual safe failure fields while graph and list_platform remain unchanged
+- **THEN** machine 2.4, code search 6/documentation search 5/status 2 and fingerprints describe the actual safe failure fields while graph and list_platform remain unchanged
 - **AND** invalid codes/fields fail schema validation; verification uses S12/V9/V10.
 
 #### Scenario: Failure envelope budget

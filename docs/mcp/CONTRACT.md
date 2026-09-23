@@ -30,7 +30,7 @@ uri: bsl-analyzer://contract
 
 ```jsonc
 {
-  "contract_version": "2.3",
+  "contract_version": "2.4",
   "build_version": "0.2.79",
   "mcp": {
     "profiles": {
@@ -103,7 +103,7 @@ uri: bsl-analyzer://contract
 
 Пояснения к полям:
 
-- В контракте `2.3` `search` публикует `output_schema_version="6"` в workspace и `"5"` в reference,
+- В контракте `2.4` `search` публикует `output_schema_version="6"` в workspace и `"5"` в reference,
   `syntax_help` — `"2"`, `symbol_info` — `"1"`. `syntax_help` и справочные
   действия `search(action=find_docs|search_docs|list_platform|status)` доступны
   не только в `reference`, но и в `workspace`; отдельный профиль `reference`
@@ -213,7 +213,7 @@ assert major == "2" and int(minor) >= 3
 `build_version` остаётся в документе, но для feature-detection он не нужен —
 именно ради этого и введена отдельная версия.
 
-В контракте `2.3` инструмент `search` публикует `outputSchema` версии `6` в workspace и `5` в reference:
+В контракте `2.4` инструмент `search` публикует `outputSchema` версии `6` в workspace и `5` в reference:
 hits и `not_ready` используют `schema_version="6"` для `search_code` и `"5"` для справки, `status` обоих профилей —
 `"2"`, `list_platform` сохраняет `"1"`. Добавлен необязательный закрытый объект
 `semantic_failure` с кодом embedding-ошибки; отсутствие поля не доказывает
