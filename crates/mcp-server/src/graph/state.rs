@@ -4962,6 +4962,11 @@ mod tests {
                 "a timed-out wait must name {named:?}; it reported {reported:?}"
             );
         }
+        lock_recover(&graph.inner).published.as_mut().unwrap().reload =
+            ReloadState::Failed("snapshot replacement refused".to_owned());
+        let summary = super::super::test_support::graph_state_summary(&graph);
+        assert!(summary.contains("reload failed"));
+        assert!(summary.contains("snapshot replacement refused"));
     }
 
     /// Wait for the forced reload to publish AND discharge its obligation. Waiting on
