@@ -3850,15 +3850,16 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("search.db");
         seed_pending_embedding(&db_path);
-        let engine = Arc::new(Mutex::new(Some(
+        let engine = crate::state::shared_engine(Some(
             SearchEngine::new(&db_path, mock_semantic_config(&server)).unwrap(),
-        )));
+        ));
         let runtime = Arc::new(Mutex::new(crate::state::SemanticRuntimeStatus::Ready));
         let flight = super::EmbedFlight::new();
         let lease = crate::workspace_lease::WorkspaceLease::unmanaged();
         let start = |config| {
             SharedState::spawn_embed_pass(
                 Arc::clone(&engine),
+                crate::state::OwnerStop::default(),
                 Arc::clone(&runtime),
                 bsl_search::IndexProgress::new(),
                 Arc::clone(&flight),

@@ -101,6 +101,7 @@ pub(crate) fn payload_start_embed(
 ) {
     super::SharedState::spawn_embed_pass(
         state.search_engine.clone(),
+        state.owners.clone(),
         state.semantic_runtime.clone(),
         state.index_progress.clone(),
         state.embed_flight.clone(),

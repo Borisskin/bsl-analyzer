@@ -988,9 +988,9 @@ mod tests {
     fn payload_mcp_contract_status_preserves_lexical_state_and_selects_the_current_owner() {
         use bsl_search::{EmbeddingFailure, EmbeddingFailureCode};
         let dir = tempdir().unwrap();
-        let engine = Arc::new(Mutex::new(Some(
+        let engine = crate::state::shared_engine(Some(
             SearchEngine::fts_only(&dir.path().join("search.db")).unwrap(),
-        )));
+        ));
         let main_failure = EmbeddingFailure::new(EmbeddingFailureCode::EmbeddingTimeout);
         let overlay_failure = EmbeddingFailure {
             code: EmbeddingFailureCode::EmbeddingInputTooLarge,

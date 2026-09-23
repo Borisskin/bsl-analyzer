@@ -1252,11 +1252,11 @@ mod tests {
         let docs = no_hits_response(None, Envelope::No, "find_docs", None);
         let body = docs.structured_content.unwrap();
         assert!(body.get("freshness").is_none());
-        assert_eq!(body["schema_version"], "4");
+        assert_eq!(body["schema_version"], "5");
         let code = no_hits_response(None, Envelope::Yes, "search_code", None);
         let body = code.structured_content.unwrap();
         assert!(body["freshness"].get("drift_watch").is_none());
-        assert_eq!(body["schema_version"], "5");
+        assert_eq!(body["schema_version"], "6");
     }
 
     #[test]

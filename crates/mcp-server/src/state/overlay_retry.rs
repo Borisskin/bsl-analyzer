@@ -734,7 +734,7 @@ mod tests {
         let mut engine = SearchEngine::new(&dir.path().join("search.db"), config).unwrap();
         engine.set_workspace_root(dir.path());
         let retry = unstarted_driver_over(
-            Arc::new(crate::state::shared_engine(Some(engine))),
+            crate::state::shared_engine(Some(engine)),
             WorkspaceLease::unmanaged(),
         );
         let main_failure = bsl_search::EmbeddingFailure::new(

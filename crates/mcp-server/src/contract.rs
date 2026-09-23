@@ -156,7 +156,7 @@ const WORKSPACE_TOOLS: &[ToolDecl] = &[
         name: "search",
         actions: WORKSPACE_SEARCH_ACTIONS,
         note: None,
-        output_schema_version: Some("5"),
+        output_schema_version: Some("6"),
         default_enabled: true,
     },
     tool("query", QUERY_ACTIONS),
@@ -1188,7 +1188,7 @@ mod tests {
                         ],
                         "name": "search",
                         "output_schema_fingerprint": "blake3:99e8629d81299379996f8136f1bb930b987c12562fde5c6304f0d1b78b098f2c",
-                        "output_schema_version": "5",
+                        "output_schema_version": "6",
                         "params": [
                           {
                             "name": "action",

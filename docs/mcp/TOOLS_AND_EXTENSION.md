@@ -851,7 +851,7 @@ config reload.
 `structuredContent`. Машинный потребитель читает поля, а не разбирает колонки:
 
 ```json tool=search
-{"action":"search_code","schema_version":"5",
+{"action":"search_code","schema_version":"6",
  "hits":[{"rank":1,"modality":"L","root_id":"","path":"CommonModules/Утилиты/Ext/Module.bsl",
           "line_start":181,"line_end":201,"symbol":"ПроверитьИНН","kind":"procedure",
           "graph_id":"method/common/Утилиты/ПроверитьИНН",
@@ -988,7 +988,7 @@ overlay; состояние другого владельца не сбрасы�
 этот отказ не меняет состояние уже построенного индекса:
 
 ```json tool=search
-{"action":"search_code","schema_version":"5","hits":[],"shown":0,"total":0,
+{"action":"search_code","schema_version":"6","hits":[],"shown":0,"total":0,
  "degraded":"semantic skipped: embedding failed",
  "semantic_failure":{"code":"embedding_timeout"},
  "freshness":{"source":"search-index","revision":null,"topology_fingerprint":null,

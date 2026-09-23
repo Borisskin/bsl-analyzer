@@ -26,8 +26,8 @@ pub(super) const HYBRID_FETCH_MULTIPLIER: usize = 2;
 /// `line_start`/`line_end` are untouched.
 ///
 /// `5` — `search_code` only — adds `freshness.drift_watch` and the completeness reasons the
-/// overlay's own state gives. The `reference` profile's documentation actions changed nothing
-/// and stay on `4`: their number is theirs from here on, not a shared one.
+/// overlay's own state gives. `6` adds optional semantic failure diagnostics; the independent
+/// documentation schema advances from `4` to `5` for the same diagnostics.
 pub(super) const SEARCH_CODE_SCHEMA_VERSION: &str = "6";
 pub(super) const DOCS_SCHEMA_VERSION: &str = "5";
 // Schema-only mirrors keep the MCP dependency out of the native search crate.

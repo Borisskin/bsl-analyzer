@@ -103,7 +103,7 @@ uri: bsl-analyzer://contract
 
 Пояснения к полям:
 
-- В контракте `2.3` `search` публикует `output_schema_version="5"`,
+- В контракте `2.3` `search` публикует `output_schema_version="6"` в workspace и `"5"` в reference,
   `syntax_help` — `"2"`, `symbol_info` — `"1"`. `syntax_help` и справочные
   действия `search(action=find_docs|search_docs|list_platform|status)` доступны
   не только в `reference`, но и в `workspace`; отдельный профиль `reference`
@@ -213,8 +213,8 @@ assert major == "2" and int(minor) >= 3
 `build_version` остаётся в документе, но для feature-detection он не нужен —
 именно ради этого и введена отдельная версия.
 
-В контракте `2.3` инструмент `search` публикует `outputSchema` версии `5`:
-hits и `not_ready` используют `schema_version="5"`, `status` обоих профилей —
+В контракте `2.3` инструмент `search` публикует `outputSchema` версии `6` в workspace и `5` в reference:
+hits и `not_ready` используют `schema_version="6"` для `search_code` и `"5"` для справки, `status` обоих профилей —
 `"2"`, `list_platform` сохраняет `"1"`. Добавлен необязательный закрытый объект
 `semantic_failure` с кодом embedding-ошибки; отсутствие поля не доказывает
 готовность семантики. Версия и `output_schema_fingerprint` доступны через CLI и
