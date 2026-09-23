@@ -812,7 +812,7 @@ impl DiagnosticsState {
             universe.stats.iter().map(|s| (s.path.clone(), s.fingerprint())).collect();
         let config_fp = config_identity(config_files_fp, &snapshot.configs);
 
-        let topology = crate::graph::scan::topology_u64(&snapshot.configs);
+        let topology = snapshot.portable_topology;
         let diagnostics_baseline =
             ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot::load(&project);
         Ok(ResidentBuild {
@@ -851,7 +851,7 @@ impl DiagnosticsState {
         // A slow build finishing after a newer topology reload must not roll the
         // shared hub back onto its older root set (see the graph-side twin).
         let live = crate::graph::input::ProjectSnapshot::load_excluding(root, &self.excluded);
-        if crate::graph::scan::topology_u64(&live.configs) != built_topology {
+        if live.portable_topology != built_topology {
             tracing::info!("skipping hub re-arm: the built snapshot's topology is superseded");
             return;
         }

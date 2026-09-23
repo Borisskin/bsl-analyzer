@@ -1341,7 +1341,7 @@ impl<'e> FusedChunkWriter<'e> {
     }
 
     /// The store key of one emitted module, or `None` when it belongs to no registered root.
-    fn key_of(&self, abs: &str) -> Option<bsl_search::FileKey> {
+    fn key_of(&self, abs: &str, disk_path: &Path) -> Option<bsl_search::FileKey> {
         let Some(roots) = self.roots.as_ref() else {
             let prefix = self.source_prefix.trim_end_matches('/');
             let rel = abs
@@ -1350,9 +1350,8 @@ impl<'e> FusedChunkWriter<'e> {
                 .map(|s| s.trim_start_matches('/'))?;
             return (!rel.is_empty()).then(|| bsl_search::FileKey::configuration(rel));
         };
-        let walked = std::path::Path::new(abs);
-        let canonical = walked.canonicalize().ok()?;
-        roots.root_of(walked, &canonical)
+        let canonical = disk_path.canonicalize().ok()?;
+        roots.root_of(disk_path, &canonical)
     }
 }
 
@@ -1382,14 +1381,20 @@ impl ide::FusedChunkSink for FusedChunkWriter<'_> {
         }
 
         for (abs, chunks, ctxs) in &groups {
+            // Graph paths use `/` even on Windows. A canonical Windows path can start
+            // with `\\?\`; turning that prefix into `//?/` makes it unreadable there.
+            #[cfg(windows)]
+            let disk_path = std::path::PathBuf::from(abs.replace('/', "\\"));
+            #[cfg(not(windows))]
+            let disk_path = std::path::PathBuf::from(abs);
             // A module outside every registered root is not this index's business. With a table
             // configured that means "under no declared root"; without one it means "outside the
             // configuration", which is the prefix check this used to be — a separator boundary
             // included, so `…/cf_ext` is never mistaken for a file inside `…/cf`.
-            let Some(key) = self.key_of(abs) else {
+            let Some(key) = self.key_of(abs, &disk_path) else {
                 continue;
             };
-            let bytes = match std::fs::read(abs) {
+            let bytes = match std::fs::read(&disk_path) {
                 Ok(b) => b,
                 Err(_) => continue, // unreadable now → leave for the standalone indexer
             };
@@ -2276,9 +2281,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         sample_workspace(root);
-        // Watched, so the verdict rests on the reload and not on nobody watching.
+        // Keep a hub for the graph's observation boundary, but record this test's fact
+        // directly: this test measures failed-reload backoff, not filesystem delivery.
         let hub = crate::graph::test_support::workspace_hub(root);
-        assert!(hub.wait_until_watching(std::time::Duration::from_secs(5)));
         let graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
         graph.set_watch(super::super::watcher::WatchPhase::Running, None);
         graph.ensure_loading();
@@ -2289,11 +2294,7 @@ mod tests {
             "CommonModules/Сервер/Ext/Module.bsl",
             "Функция Считать() Экспорт Возврат 2; КонецФункции",
         );
-        // The nudge below records the hub position it reads, and a position the publication
-        // has already observed is not a change. Waited for, not assumed: under load the
-        // watcher's delivery is what arrives late, and the assertion would then be about the
-        // machine rather than about the backoff.
-        crate::graph::test_support::wait_for_hub_seq_above(&hub, graph.observation());
+        graph.record_change_quietly(graph.observation().saturating_add(1));
         let refused =
             || LoadFailure::new(LoadFailureReason::TransientRefusal, "the lease was busy");
         // The second refusal in a row is the one with a real delay.
@@ -3106,7 +3107,8 @@ mod tests {
         let src = root.join(".build/bsl-graph.db");
         fs::create_dir_all(src.parent().unwrap()).unwrap();
         build_whole_graph(root, &src, 1, &meta).expect("the whole graph builds");
-        let rows_before = node_rows_for(&src, &bystander);
+        let roots = crate::graph::ProjectSnapshot::load(root).search_roots.unwrap();
+        let rows_before = node_rows_for(&src, &bystander, &roots);
         assert!(rows_before > 0, "the neighbour is in the artefact to begin with");
 
         // The neighbour goes dark, and someone else is edited. The patch never touches
@@ -3119,7 +3121,7 @@ mod tests {
 
         let conn = Connection::open(&out).unwrap();
         assert_eq!(
-            node_rows_for(&out, &bystander),
+            node_rows_for(&out, &bystander, &roots),
             rows_before,
             "the patch left the neighbour's rows in place"
         );
@@ -3137,7 +3139,11 @@ mod tests {
         update_bodies_for_test(root, &out, &dark, std::slice::from_ref(&bystander), 1, &meta)
             .expect("the patch applies over an unreadable module");
         let conn = Connection::open(&dark).unwrap();
-        assert_eq!(node_rows_for(&dark, &bystander), 0, "its rows went with the patch");
+        assert_eq!(
+            node_rows_for(&dark, &bystander, &roots),
+            0,
+            "its rows went with the patch"
+        );
         assert!(
             crate::graph_db::read_unread_paths(&conn)
                 .iter()
@@ -3152,22 +3158,22 @@ mod tests {
         update_bodies_for_test(root, &dark, &healed, std::slice::from_ref(&bystander), 1, &meta)
             .expect("the patch applies over the restored module");
         let conn = Connection::open(&healed).unwrap();
-        assert!(node_rows_for(&healed, &bystander) > 0, "the rows are back");
+        assert!(node_rows_for(&healed, &bystander, &roots) > 0, "the rows are back");
         assert!(
             crate::graph_db::read_unread_paths(&conn).is_empty(),
             "so the record goes with them"
         );
     }
 
-    /// Node rows the artefact holds for one module. File identity is persisted as the
-    /// `(root_id, path)` pair, so the test matches the relative path suffix.
-    fn node_rows_for(db: &Path, module: &Path) -> i64 {
-        let name = module.file_name().and_then(|name| name.to_str()).unwrap_or_default();
-        let pattern = format!("%{name}");
+    /// Node rows the artefact holds for one module, keyed exactly as the builder stores it.
+    fn node_rows_for(db: &Path, module: &Path, roots: &bsl_search::WorkspaceRoots) -> i64 {
+        let key = roots.key_of_path(module).expect("the module belongs to the workspace");
         let conn = Connection::open(db).unwrap();
-        conn.query_row("SELECT COUNT(*) FROM nodes WHERE file_path LIKE ?1", [pattern], |r| {
-            r.get(0)
-        })
+        conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE file_root_id = ?1 AND file_path = ?2",
+            rusqlite::params![key.root_id, key.path],
+            |r| r.get(0),
+        )
         .unwrap()
     }
 

@@ -1659,11 +1659,8 @@ fn rewrite_invisibly(path: &Path, contents: &str) {
 /// Gate I2 — the preview is a slice of the text the OFFSETS were counted against, never of
 /// whatever is on disk when the answer is assembled.
 ///
-/// The input is a rewrite the server cannot see: same length, same timestamp. The resident
-/// keeps the old text and the disk holds the new one, so a preview read off disk shows the
-/// new comment and a correct one shows the old. The control is the second rewrite, which
-/// changes the length: drift picks it up, the resident moves, and both implementations show
-/// the new text — which is what proves this stand can deliver an edit at all.
+/// A same-length, same-timestamp rewrite must still move the content fingerprint. The preview
+/// and the revision in its envelope must describe the same observed text.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_preview_quotes_the_revision_the_answer_is_signed_with() {
     let ws = stage_fixture();
@@ -1696,20 +1693,18 @@ async fn a_preview_quotes_the_revision_the_answer_is_signed_with() {
     assert!(draft_snippet(&before).ends_with("// мет"), "the stand starts where it says: {before}");
 
     rewrite_invisibly(&module, &DRAFT_MODULE.replace("// мет", "// про"));
-    let unseen = ask(&client).await;
-    assert_eq!(
-        draft_snippet(&unseen),
-        draft_snippet(&before),
-        "the preview followed the disk past the revision the envelope names: {unseen}",
-    );
-    assert_eq!(
-        unseen["freshness"]["revision"], before["freshness"]["revision"],
-        "the control on the control: the server genuinely did not see this rewrite",
+    let updated = common::settled(
+        "the same-stat edit reaches the preview",
+        |answer| draft_snippet(answer).ends_with("// про"),
+        || ask(&client),
+    )
+    .await;
+    assert_ne!(
+        updated["freshness"]["revision"], before["freshness"]["revision"],
+        "the updated preview must name its new revision: {updated}",
     );
 
-    // The control: an edit the fingerprint DOES see. The resident moves, and so does the
-    // preview — so the stand does deliver edits, and the assertion above is about which
-    // text was read and not about a write that never landed.
+    // Control: a second edit also moves the text and its revision.
     std::fs::write(&module, DRAFT_MODULE.replace("// мет", "// метка")).expect("visible rewrite");
     common::settled(
         "the visible edit reaches the preview",

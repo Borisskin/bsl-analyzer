@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use project_model::SourceSet;
 
@@ -90,9 +91,23 @@ pub(crate) fn file_fingerprint(path: &Path) -> Option<u64> {
     if !meta.is_file() {
         return None;
     }
-    let bytes = std::fs::read(path).ok()?;
-    let hash = blake3::hash(&bytes);
-    Some(u64::from_le_bytes(hash.as_bytes()[..8].try_into().expect("blake3 yields >= 8 bytes")))
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Some(
+        FileStat {
+            path: String::new(),
+            canonical: PathBuf::new(),
+            walked: PathBuf::new(),
+            mtime,
+            len: meta.len(),
+            content_hash: std::fs::read(path).ok().map(|bytes| *blake3::hash(&bytes).as_bytes()),
+        }
+        .fingerprint(),
+    )
 }
 
 /// Enumerate every graph-relevant file (`.bsl` sources + `.xml` metadata descriptors)
