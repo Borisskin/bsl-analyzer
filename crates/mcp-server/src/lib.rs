@@ -3170,8 +3170,8 @@ mod surface_guards {
         assert_eq!(version_of_hits(&workspace, code), "#/$defs/SearchCodeSchemaVersion");
         assert_eq!(version_of_hits(&workspace, docs), "#/$defs/SearchSchemaVersion");
         assert_eq!(version_of_hits(&reference, code), "#/$defs/SearchSchemaVersion");
-        assert_eq!(workspace["$defs"]["SearchCodeSchemaVersion"]["enum"], serde_json::json!(["5"]));
-        assert_eq!(reference["$defs"]["SearchSchemaVersion"]["enum"], serde_json::json!(["4"]));
+        assert_eq!(workspace["$defs"]["SearchCodeSchemaVersion"]["enum"], serde_json::json!(["6"]));
+        assert_eq!(reference["$defs"]["SearchSchemaVersion"]["enum"], serde_json::json!(["5"]));
     }
 
     #[test]

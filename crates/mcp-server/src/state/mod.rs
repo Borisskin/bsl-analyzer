@@ -583,7 +583,7 @@ impl SharedState {
                 matches!(*runtime, SemanticRuntimeStatus::Failed(_)),
             )
         };
-        let Ok(engine) = self.search_engine.try_lock() else {
+        let Some(engine) = self.search_engine.try_snapshot() else {
             let semantic = match &sample {
                 Some(sample)
                     if sample.pass_id.is_some()
@@ -652,11 +652,13 @@ impl SharedState {
         } else if let Some(engine) = engine.as_ref() {
             match engine.try_workspace_overlay_retry_signals() {
                 None => Target::unknown(Kind::Semantic),
-                Some(signals) if signals.demands_a_pass() => Target::new(
-                    Kind::Semantic,
-                    State::Waiting,
-                    Some(if remote { Reason::OverlayPending } else { Reason::PendingWork }),
-                ),
+                Some(signals) if signals.demands_a_pass() || signals.pending_dirty_paths > 0 => {
+                    Target::new(
+                        Kind::Semantic,
+                        State::Waiting,
+                        Some(if remote { Reason::OverlayPending } else { Reason::PendingWork }),
+                    )
+                }
                 Some(_) => match self.workspace_search_mode {
                     WorkspaceSearchMode::SqliteLocal => {
                         let evidence = engine.semantic_index_qualification();

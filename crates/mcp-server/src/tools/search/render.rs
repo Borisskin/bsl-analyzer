@@ -994,13 +994,21 @@ mod tests {
             unread: 1,
             overlay_unknown: true,
         };
-        let code = no_hits_response(None, Envelope::Yes, "search_code", Some(&facts));
+        let mut code = no_hits_response(None, Envelope::Yes, "search_code", Some(&facts));
+        let indexing = crate::indexing::Indexing::single(crate::indexing::Target::unknown(
+            crate::indexing::Kind::Semantic,
+        ));
+        indexing.attach(&mut code);
         let code = code.structured_content.unwrap();
         assert!(valid(workspace(), &code), "{code}");
-        assert!(!valid(reference(), &code), "the reference schema admits a v5 answer: {code}");
+        assert!(!valid(reference(), &code), "the reference schema admits a v6 answer: {code}");
         for action in ["find_docs", "search_docs"] {
-            let docs =
-                no_hits_response(None, Envelope::No, action, None).structured_content.unwrap();
+            let mut docs = no_hits_response(None, Envelope::No, action, None);
+            crate::indexing::Indexing::single(crate::indexing::Target::unknown(
+                crate::indexing::Kind::Reference,
+            ))
+            .attach(&mut docs);
+            let docs = docs.structured_content.unwrap();
             assert!(valid(workspace(), &docs) && valid(reference(), &docs), "{docs}");
         }
     }

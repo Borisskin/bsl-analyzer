@@ -235,6 +235,15 @@ impl AdmittedEngine {
         guard
     }
 
+    /// Observe the engine without waiting or overtaking an admitted caller.
+    pub(crate) fn try_snapshot(&self) -> Option<MutexGuard<'_, Option<SearchEngine>>> {
+        let admission = self.admission.try_lock().ok()?;
+        if !admission.queue.is_empty() {
+            return None;
+        }
+        self.engine.try_lock().ok()
+    }
+
     /// Take the engine only if nobody is queued for it and nobody holds it.
     #[cfg(test)]
     pub(crate) fn try_lock(
@@ -379,6 +388,21 @@ pub(super) fn acquire_engine_within<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn telemetry_snapshot_never_waits_or_overtakes() {
+        let engine = super::AdmittedEngine::new(None);
+        let admission = engine.admission.lock().unwrap();
+        assert!(engine.try_snapshot().is_none());
+        drop(admission);
+        let ticket = engine.ticket();
+        assert!(engine.try_snapshot().is_none());
+        drop(ticket);
+        let held = engine.engine.lock().unwrap();
+        assert!(engine.try_snapshot().is_none());
+        drop(held);
+        assert!(engine.try_snapshot().is_some());
+    }
+
     use super::{acquire_engine_within, try_acquire_engine, AcquireFailure};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};

@@ -933,7 +933,7 @@ mod tests {
                         ],
                         "name": "search",
                         "output_schema_fingerprint": "blake3:4c0fc50e14df483065c4194c7b56af04c06d89afa424b8539ef0bf6b085acb61",
-                        "output_schema_version": "6",
+                        "output_schema_version": "5",
                         "params": [
                           {
                             "name": "action",
@@ -1250,8 +1250,8 @@ mod tests {
                           }
                         ],
                         "name": "search",
-                        "output_schema_fingerprint": "blake3:4c0fc50e14df483065c4194c7b56af04c06d89afa424b8539ef0bf6b085acb61",
-                        "output_schema_version": "5",
+                        "output_schema_fingerprint": "blake3:68d060048123447b5c90c02081e9a1e49557bf1e267e0790509b472b9537ec27",
+                        "output_schema_version": "6",
                         "params": [
                           {
                             "name": "action",

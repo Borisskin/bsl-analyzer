@@ -1018,6 +1018,7 @@ impl Store {
             mark_seq: Arc::new(AtomicI64::new(0)),
             observed_clears: Arc::new(AtomicU64::new(0)),
             clear_observer_enabled: AtomicBool::new(false),
+            startup_context_pending: AtomicBool::new(true),
         })
     }
 

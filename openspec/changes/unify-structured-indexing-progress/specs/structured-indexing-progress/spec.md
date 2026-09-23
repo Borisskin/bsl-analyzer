@@ -82,7 +82,7 @@ R5. The server SHALL publish the exact schema/machine versions and fingerprints 
 
 #### Scenario: Strict discovery
 - **WHEN** a client reads tools/list and the contract resource and validates actual responses
-- **THEN** machine 3.0, search 5/status 2, graph descriptor 34 and indexing 1 agree with advertised schemas/fingerprints; removing indexing from any affected response fails validation while unaffected graph data and list_platform remain valid.
+- **THEN** machine 3.0, search_code 6, find_docs/search_docs 5, search status 2, graph descriptor 34 and indexing 1 agree with advertised schemas/fingerprints; removing indexing from any affected response fails validation while unaffected graph data and list_platform remain valid.
 - **AND** verification uses S13 in verification.md.
 
 #### Scenario: Exact and undersized budgets

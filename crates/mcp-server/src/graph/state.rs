@@ -1776,6 +1776,8 @@ impl GraphState {
         inner: &Inner,
         superseded: bool,
         released: bool,
+        debt_stale: Option<bool>,
+        observed_stale: bool,
     ) -> crate::indexing::Target {
         use crate::indexing::{Kind, Reason, State, Target};
         if superseded {
@@ -1798,11 +1800,14 @@ impl GraphState {
                         let Some(unread) = inner.indexing_unread_files else {
                             return Target::unknown(Kind::Graph);
                         };
+                        let Some(debt_stale) = debt_stale else {
+                            return Target::unknown(Kind::Graph);
+                        };
                         if published.stale
                             || published.force_stale
                             || unread > 0
-                            || self.pending_nudge.load(Ordering::SeqCst)
-                            || self.project_reload_pending()
+                            || debt_stale
+                            || observed_stale
                         {
                             (State::Waiting, Some(Reason::StaleGeneration))
                         } else {
@@ -1898,7 +1903,32 @@ impl GraphState {
         &self,
     ) -> (GraphStatusReport, crate::indexing::Target) {
         use crate::indexing::{Kind, Target};
-        let drift_watch = self.workspace_root.is_some().then(|| self.drift_watch().as_str());
+        use crate::tools::location::DriftWatch;
+        let watch_sample = (|| {
+            let phase = self.watch.try_lock().ok()?.0;
+            let (polling, cycle, overdue) = match &self.change_hub {
+                Some(hub) => hub.try_poll_status()?,
+                None => (false, None, false),
+            };
+            let watch = match phase {
+                super::watcher::WatchPhase::Unwatched | super::watcher::WatchPhase::Stopped => {
+                    DriftWatch::Unobserved
+                }
+                super::watcher::WatchPhase::Starting => DriftWatch::Starting,
+                super::watcher::WatchPhase::Running if self.change_hub.is_none() => {
+                    DriftWatch::Unobserved
+                }
+                super::watcher::WatchPhase::Running if polling => DriftWatch::Polling,
+                super::watcher::WatchPhase::Running => DriftWatch::Watching,
+            };
+            let stale = matches!(watch, DriftWatch::Unobserved | DriftWatch::Starting) || overdue;
+            Some((watch, cycle, stale))
+        })();
+        let drift_watch = self
+            .workspace_root
+            .as_ref()
+            .and(watch_sample.as_ref())
+            .map(|(watch, _, _)| watch.as_str());
         let report = |state, superseded| GraphStatusReport {
             state,
             files: None,
@@ -1909,31 +1939,49 @@ impl GraphState {
             error: None,
             superseded,
             drift_watch,
-            poll_cycle_secs: self
-                .change_hub
-                .as_ref()
-                .and_then(|hub| hub.poll_report())
-                .map(|(_, cycle)| cycle.as_secs()),
+            poll_cycle_secs: watch_sample.and_then(|(_, cycle, _)| cycle),
+        };
+        let Some((_, _, watch_stale)) = watch_sample else {
+            return (report("loading", None), Target::unknown(Kind::Graph));
         };
         let Ok(inner) = self.inner.try_lock() else {
             return (report("loading", None), Target::unknown(Kind::Graph));
         };
         let superseded = self.lease.is_superseded();
-        let target = self.indexing_from_inner(&inner, superseded, self.lease.is_released());
+        let debt_stale = self.debt.try_lock().ok().map(|debt| debt.stale());
+        let snapshot_stale = inner.published.as_ref().and_then(|published| {
+            self.snapshot_pool.try_lock().ok().and_then(|pool| {
+                pool.iter()
+                    .find(|entry| entry.generation == published.generation)
+                    .map(|entry| entry.force_stale)
+            })
+        });
+        let target = self.indexing_from_inner(
+            &inner,
+            superseded,
+            self.lease.is_released(),
+            debt_stale,
+            snapshot_stale.unwrap_or(false) || (self.workspace_root.is_some() && watch_stale),
+        );
         if let GraphStatus::Ready { files } = &inner.status {
             if let (Some(published), Some(unread)) = (&inner.published, inner.indexing_unread_files)
             {
                 // Preserve legacy read availability without checking out a descriptor or doing I/O.
-                let available = self.snapshot_pool.try_lock().is_ok_and(|pool| {
-                    pool.iter().any(|entry| entry.generation == published.generation)
-                });
-                if available {
+                if let (Some(snapshot_stale), Some(debt_stale)) = (snapshot_stale, debt_stale) {
                     return (
                         GraphStatusReport {
                             files: Some(*files),
                             unread_files: Some(unread),
                             revision: Some(published.generation),
-                            stale: Some(published.stale || published.force_stale || unread > 0),
+                            stale: Some(
+                                published.stale
+                                    || published.force_stale
+                                    || snapshot_stale
+                                    || unread > 0
+                                    || matches!(published.reload, ReloadState::Running)
+                                    || debt_stale
+                                    || watch_stale,
+                            ),
                             reload: Some(published.reload.label()),
                             ..report("ready", superseded.then_some(true))
                         },
@@ -3993,8 +4041,12 @@ mod tests {
     #[test]
     fn indexing_owner_lifecycles_graph() {
         use crate::indexing::{Reason, State};
-        let graph = GraphState::with_status(GraphStatus::Idle, None);
+        let mut graph = GraphState::with_status(GraphStatus::Idle, None);
         assert_eq!(graph.indexing_snapshot().state, State::Waiting);
+        {
+            let _held = graph.watch.lock().unwrap();
+            assert_eq!(graph.indexing_snapshot().state, State::Unknown);
+        }
         {
             let _guard = graph.inner.lock().unwrap();
             let (report, target) = graph.status_report_with_indexing();
@@ -4009,6 +4061,7 @@ mod tests {
             inner.indexing_unread_files = Some(0);
             inner.published = Some(Published {
                 generation: 7,
+                observed_through: Some(0),
                 fingerprint: crate::graph_db::GraphFp::default(),
                 stale: false,
                 reload: ReloadState::Idle,
@@ -4018,6 +4071,14 @@ mod tests {
         }
         let (report, target) = graph.status_report_with_indexing();
         assert_eq!(target.state, State::Ready);
+        let workspace = tempfile::tempdir().unwrap();
+        graph.workspace_root = Some(workspace.path().to_path_buf());
+        assert_eq!(
+            graph.indexing_snapshot().state,
+            State::Waiting,
+            "an unwatched workspace cannot report a fresh graph"
+        );
+        graph.workspace_root = None;
         assert_eq!(report.revision, None); // no pre-opened descriptor in this owner-only fixture
         assert_eq!(report.stale, None);
         graph.inner.lock().unwrap().indexing_unread_files = Some(1);
