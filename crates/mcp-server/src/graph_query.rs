@@ -365,9 +365,22 @@ fn provenance(p: &str) -> &'static str {
     }
 }
 
+// Windows SQLite handles omit FILE_SHARE_DELETE. Keep the canonical publication path
+// free of long-lived readers while sharing one disk copy among all handles in a pool.
+// ponytail: one full copy per pool or provider; use a delete-sharing VFS only if copying is a measured bottleneck.
+#[cfg(windows)]
+pub(crate) fn detached_snapshot(path: &Path) -> anyhow::Result<std::sync::Arc<tempfile::TempPath>> {
+    let copy = tempfile::NamedTempFile::new()?.into_temp_path();
+    std::fs::copy(path, &copy)?;
+    Ok(std::sync::Arc::new(copy))
+}
+
 /// A read-only handle to a built graph database.
 pub struct GraphDb {
     conn: Connection,
+    // Close SQLite before the last owner removes its detached Windows file.
+    #[cfg(windows)]
+    _backing: Option<std::sync::Arc<tempfile::TempPath>>,
 }
 
 /// The graph-derived usage summary for a symbol: total inbound edges and the top calling
@@ -391,6 +404,19 @@ impl GraphDb {
         let db = Self::from_connection(conn);
         db.validate_meta()?;
         Ok(db)
+    }
+
+    /// Open a reader that may outlive replacement of the canonical graph file.
+    pub(crate) fn open_snapshot(path: &Path) -> anyhow::Result<Self> {
+        #[cfg(windows)]
+        {
+            let backing = detached_snapshot(path)?;
+            let mut db = Self::open(backing.as_ref())?;
+            db._backing = Some(backing);
+            Ok(db)
+        }
+        #[cfg(not(windows))]
+        Self::open(path)
     }
 
     fn meta(&self, key: &str) -> anyhow::Result<Option<String>> {
@@ -1039,7 +1065,11 @@ impl GraphDb {
 
     /// Wrap an open connection.
     fn from_connection(conn: Connection) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            #[cfg(windows)]
+            _backing: None,
+        }
     }
 
     /// Cold-start overview: node/edge tallies, the most-called nodes, and the

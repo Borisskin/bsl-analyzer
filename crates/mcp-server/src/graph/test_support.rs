@@ -60,7 +60,7 @@ pub(crate) const WAIT_CEILING: Duration = Duration::from_secs(30);
 
 /// Everything a timed-out wait needs to say to be diagnosable: which condition it
 /// waited on is the caller's half, the observed state is this one.
-pub(super) fn graph_state_summary(graph: &GraphState) -> String {
+pub(crate) fn graph_state_summary(graph: &GraphState) -> String {
     let inner = lock_recover(&graph.inner);
     let published = inner.published.as_ref().map(|published| {
         format!(

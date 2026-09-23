@@ -547,7 +547,7 @@ impl SharedState {
         topology: u64,
     ) -> Option<Arc<crate::graph_query::GraphDbContextProvider>> {
         let graph_path = cache.graph_db_path();
-        let graph_db = match crate::graph_query::GraphDb::open(&graph_path) {
+        let graph_db = match crate::graph_query::GraphDb::open_snapshot(&graph_path) {
             Ok(db) => db,
             Err(error) => {
                 tracing::debug!("graph unavailable for search root transition: {error}");
@@ -978,7 +978,7 @@ impl SharedState {
             return false;
         }
         let graph_path = cache.graph_db_path();
-        let graph_db = match crate::graph_query::GraphDb::open(&graph_path) {
+        let graph_db = match crate::graph_query::GraphDb::open_snapshot(&graph_path) {
             Ok(db) => db,
             Err(e) => {
                 tracing::debug!("graph unavailable for search context refresh: {e}");

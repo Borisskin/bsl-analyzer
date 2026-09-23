@@ -1669,7 +1669,7 @@ impl SharedState {
         // run and pick up context on a later reindex.
         if engine.has_semantic() {
             let graph_path = cache.graph_db_path();
-            match crate::graph_query::GraphDb::open(&graph_path) {
+            match crate::graph_query::GraphDb::open_snapshot(&graph_path) {
                 Ok(graph_db)
                     if !crate::graph::scan::graph_file_matches_live_topology(
                         workspace_root,
@@ -3952,9 +3952,10 @@ mod tests {
         let reloaded = eventually(&|| {
             state.graph().status_report().revision.is_some_and(|revision| revision > before)
         });
+        let graph_state = crate::graph::test_support::graph_state_summary(state.graph());
         state.shutdown();
         assert!(searched, "search never saw the polled edit");
-        assert!(reloaded, "the graph never saw the polled edit");
+        assert!(reloaded, "the graph never saw the polled edit: {graph_state}");
     }
 
     /// A quiet boot on a healthy hub: both workspace sources say they are watched, and the

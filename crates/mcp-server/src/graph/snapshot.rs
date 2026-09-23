@@ -5,6 +5,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, UNIX_EPOCH};
 
 use crate::change_hub::{ChangeEntry, ChangeKind};
+#[cfg(windows)]
+use crate::graph_query::detached_snapshot;
 use crate::graph_query::GraphDb;
 
 #[cfg(test)]
@@ -101,16 +103,6 @@ pub(super) struct PooledSnapshotEntry {
     // SQLite closes before the last owner removes the detached Windows file.
     #[cfg(windows)]
     _backing: Arc<tempfile::TempPath>,
-}
-
-// Windows SQLite handles omit FILE_SHARE_DELETE. Keep the canonical publication path
-// free of long-lived readers while sharing one disk copy among all handles in a pool.
-// ponytail: one full copy per pool; use a delete-sharing VFS only if copying is a measured bottleneck.
-#[cfg(windows)]
-fn detached_snapshot(path: &Path) -> anyhow::Result<Arc<tempfile::TempPath>> {
-    let copy = tempfile::NamedTempFile::new()?.into_temp_path();
-    std::fs::copy(path, &copy)?;
-    Ok(Arc::new(copy))
 }
 
 #[derive(Default)]
