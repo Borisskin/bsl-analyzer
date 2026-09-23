@@ -486,7 +486,7 @@ impl RecoveryScope {
 
     /// How many roots this descriptor names, for a cost measurement that has to say what it
     /// walked.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn roots_len(&self) -> usize {
         self.roots.len()
     }

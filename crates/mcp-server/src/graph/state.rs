@@ -1367,14 +1367,14 @@ impl GraphState {
     }
 
     /// Attach the barrier described by [`Self::probe_window_hook`].
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn with_probe_window_hook(mut self, hook: LatchWindowHook) -> Self {
         self.probe_window_hook = Some(hook);
         self
     }
 
     /// Attach the barrier described by [`Self::scan_receipt_hook`].
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn with_scan_receipt_hook(mut self, hook: LatchWindowHook) -> Self {
         self.scan_receipt_hook = Some(hook);
         self
@@ -2770,15 +2770,14 @@ mod tests {
                         return;
                     }
                     *barrier_ticket.lock().unwrap() = graph.claimed_ticket();
+                    let observed = barrier_hub.seq();
                     super::super::test_support::write(
                         &barrier_root,
                         "CommonModules/Поздний/Ext/Module.bsl",
                         "Функция Поздняя() Экспорт Возврат 9; КонецФункции",
                     );
-                    let seq = crate::graph::test_support::wait_for_hub_seq_above(
-                        &barrier_hub,
-                        graph.observation(),
-                    );
+                    let seq =
+                        crate::graph::test_support::wait_for_hub_seq_above(&barrier_hub, observed);
                     barrier_fact.store(seq as i64, Ordering::SeqCst);
                     match late {
                         "change" => graph.record_change_quietly(seq),
@@ -2795,13 +2794,13 @@ mod tests {
             *lock_recover(&window_graph) = Some(graph.clone());
             armed.store(true, Ordering::SeqCst);
 
+            let observed = hub.seq();
             super::super::test_support::write(
                 root,
                 "CommonModules/Сервер/Ext/Module.bsl",
                 "Функция Считать() Экспорт Возврат 2; КонецФункции",
             );
-            let admitted_fact =
-                crate::graph::test_support::wait_for_hub_seq_above(&hub, graph.observation());
+            let admitted_fact = crate::graph::test_support::wait_for_hub_seq_above(&hub, observed);
             match lane {
                 "change" => graph.record_change_quietly(admitted_fact),
                 _ => graph.record_forced_quietly(admitted_fact),
@@ -6296,6 +6295,11 @@ mod tests {
         let graph = GraphState::for_workspace(root.to_path_buf());
         graph.ensure_loading();
         wait_ready(&graph);
+        // A snapshot is visible before its builder releases the carried ticket. A probe
+        // offered in that window is correctly refused while a build is still in flight.
+        wait_until(&graph, "the initial builder to release its ticket", || {
+            !graph.build_in_flight()
+        });
         let observation = graph.observation();
         assert_eq!(
             graph.snapshot().map(|snapshot| snapshot.unread_files()),
@@ -6308,7 +6312,8 @@ mod tests {
         lock_recover(&graph.debt).probe_now(Instant::now());
         graph.probe_recovery();
         wait_until(&graph, "the first healed module to be read", || {
-            graph.snapshot().is_some_and(|snapshot| snapshot.unread_files() == 1)
+            !graph.build_in_flight()
+                && graph.snapshot().is_some_and(|snapshot| snapshot.unread_files() == 1)
         });
         assert!(
             !lock_recover(&graph.debt).owes_recovery_build(),
@@ -6321,7 +6326,8 @@ mod tests {
         lock_recover(&graph.debt).probe_now(Instant::now());
         graph.probe_recovery();
         wait_until(&graph, "the second healed module to be read", || {
-            graph.snapshot().is_some_and(|snapshot| snapshot.unread_files() == 0)
+            !graph.build_in_flight()
+                && graph.snapshot().is_some_and(|snapshot| snapshot.unread_files() == 0)
         });
         assert_eq!(graph.observation(), observation, "the fact stream moved");
         drop(restore);

@@ -2247,7 +2247,7 @@ impl WorkspaceChangeHub {
 
     /// Wait until the reconcile announcing the current blindness has been issued — it follows
     /// the first reading of every blind file.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn wait_until_blindness_announced(&self) {
         assert!(
             test_support::eventually(Duration::from_secs(10), || {
@@ -2547,10 +2547,8 @@ impl WorkspaceChangeHub {
         self.inner.lock_acc().cursors.len()
     }
 
-    /// Coverage ticks that ran on this hub.
-    #[cfg(test)]
     /// Whether a blind-root poller thread exists right now.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn blind_poll_running(&self) -> bool {
         self.inner.blind_poll.running.load(Ordering::SeqCst)
     }
@@ -3540,6 +3538,7 @@ pub(crate) struct BlindPollSeam {
 
 #[cfg(test)]
 impl BlindPollSeam {
+    #[cfg(unix)]
     pub(crate) fn refusing_to_start() -> Self {
         Self { cannot_start: true, gate: None, announce: None }
     }
@@ -3575,6 +3574,7 @@ impl PollGate {
     }
 
     /// Wait until the poll has reached the gate at least `arrivals` times.
+    #[cfg(unix)]
     pub(crate) fn wait_arrivals(&self, arrivals: usize) {
         let mut counts = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
         let deadline = Instant::now() + Self::BOUND;
@@ -3589,6 +3589,7 @@ impl PollGate {
     }
 
     /// Let `polls` more polls run, without waiting for any of them.
+    #[cfg(unix)]
     pub(crate) fn allow(&self, polls: usize) {
         let mut counts = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
         counts.0 += polls;
@@ -3596,6 +3597,7 @@ impl PollGate {
     }
 
     /// Let `polls` polls run, and return once each of them has come back to the gate.
+    #[cfg(unix)]
     pub(crate) fn run_polls(&self, polls: usize) {
         let target = {
             let mut counts = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
@@ -3631,6 +3633,7 @@ pub(crate) struct AnnounceBarrier {
 impl AnnounceBarrier {
     const BOUND: Duration = Duration::from_secs(10);
 
+    #[cfg(unix)]
     pub(crate) fn arm(&self, point: AnnouncePoint) {
         *self.state.lock().unwrap_or_else(PoisonError::into_inner) = (Some(point), false, false);
     }
@@ -3655,6 +3658,7 @@ impl AnnounceBarrier {
         self.moved.notify_all();
     }
 
+    #[cfg(unix)]
     pub(crate) fn wait_parked(&self) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let deadline = Instant::now() + Self::BOUND;
@@ -3668,6 +3672,7 @@ impl AnnounceBarrier {
         assert!(state.1, "the announcement never reached its barrier");
     }
 
+    #[cfg(unix)]
     pub(crate) fn release(&self) {
         self.state.lock().unwrap_or_else(PoisonError::into_inner).2 = true;
         self.moved.notify_all();
