@@ -8483,6 +8483,7 @@ mod tests {
     /// The reconcile announcing a blind root already tells every consumer to re-read that root
     /// whole. Reporting each of its files as changed on top of that is a second full re-index
     /// of work just done — and it is every file, not a file that changed.
+    #[cfg(unix)]
     #[test]
     fn a_root_turning_blind_does_not_report_its_untouched_files() {
         let dir = tempdir().unwrap();
