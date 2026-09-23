@@ -7430,9 +7430,10 @@ mod tests {
         // eligible, and this is what a real patch looks like.
         let before = generation(&graph);
         let passes = graph.publish_passes.load(Ordering::SeqCst);
+        let observed = hub.seq();
         lock_recover(&graph.incremental_decisions).clear();
         fs::write(&edited, "&НаСервере\nФункция Взять() Экспорт Возврат 2; КонецФункции").unwrap();
-        crate::graph::test_support::wait_for_hub_seq_above(&hub, graph.observation());
+        crate::graph::test_support::wait_for_hub_seq_above(&hub, observed);
         graph.nudge_rebuild();
         wait_until(&graph, "the body-only edit to be published", || generation(&graph) > before);
         wait_publish_pass_within(&graph, WAIT_CEILING, passes + 1);
@@ -7455,9 +7456,10 @@ mod tests {
         lock_recover(&graph.incremental_decisions).clear();
         let at = generation(&graph);
         let passes = graph.publish_passes.load(Ordering::SeqCst);
+        let observed = hub.seq();
         fs::set_permissions(&other, fs::Permissions::from_mode(0o755)).unwrap();
         fs::write(&other, "&НаСервере\nФункция Взять() Экспорт Возврат 3; КонецФункции").unwrap();
-        crate::graph::test_support::wait_for_hub_seq_above(&hub, graph.observation());
+        crate::graph::test_support::wait_for_hub_seq_above(&hub, observed);
         graph.nudge_rebuild();
         wait_until(&graph, "the rewritten module to be published", || generation(&graph) > at);
         wait_publish_pass_within(&graph, WAIT_CEILING, passes + 1);
