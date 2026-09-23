@@ -320,6 +320,7 @@ jobs:
           }
           run_nonempty -p bsl-search --lib lifecycle
           run_nonempty -p mcp-server --lib vector_lifecycle
+          run_nonempty -p mcp-server --lib graph::snapshot::tests::drift_marks_stale_and_async_reload_bumps_generation -- --exact
           run_nonempty -p bsl-analyzer --bin bsl-analyzer-app cli::logging
           run_nonempty -p bsl-analyzer --bin bsl-analyzer-app cli::logging::journal::windows::tests::private_dacl_and_unprivileged_junction_rejection -- --exact
       - name: Diagnostics baseline atomic create

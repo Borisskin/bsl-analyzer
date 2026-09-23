@@ -64,11 +64,8 @@ pub(super) fn graph_state_summary(graph: &GraphState) -> String {
     let inner = lock_recover(&graph.inner);
     let published = inner.published.as_ref().map(|published| {
         format!(
-            "generation {}, reload {}, stale {}, force_stale {}",
-            published.generation,
-            published.reload.label(),
-            published.stale,
-            published.force_stale
+            "generation {}, reload {:?}, stale {}, force_stale {}",
+            published.generation, published.reload, published.stale, published.force_stale
         )
     });
     format!(
