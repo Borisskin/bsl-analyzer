@@ -906,9 +906,9 @@ impl SharedState {
                     return super::WorkspaceSearchApply::Stopping;
                 }
                 Err(crate::tools::search::OwnerLockRefused::Poisoned) => {
-                    return super::WorkspaceSearchApply::OperationError(bsl_search::SearchError::Index(
-                        "search engine lock poisoned".to_owned(),
-                    ));
+                    return super::WorkspaceSearchApply::OperationError(
+                        bsl_search::SearchError::Index("search engine lock poisoned".to_owned()),
+                    );
                 }
             };
             match Self::resolve_referencing_module_files(

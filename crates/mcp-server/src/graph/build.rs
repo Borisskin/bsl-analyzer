@@ -1322,9 +1322,10 @@ struct FusedChunkWriter<'e> {
     /// attributing paths. Every registered root is indexed, and a file's key is decided by the
     /// same longest-prefix attribution the rest of the index uses.
     roots: Option<bsl_search::WorkspaceRoots>,
-    /// Canonical, `/`-normalised search source root. Only used when no root table is
-    /// configured — then the corpus is the configuration alone, as it always was.
-    source_prefix: String,
+    /// Both spellings are needed when no root table is configured: the scan can emit
+    /// the walked path while Windows canonicalization adds a verbatim-path prefix.
+    source_root: PathBuf,
+    canonical_source_root: Option<PathBuf>,
     failure: Option<LoadFailure>,
 }
 
@@ -1335,19 +1336,27 @@ impl<'e> FusedChunkWriter<'e> {
         lease: crate::workspace_lease::WorkspaceLease,
     ) -> Self {
         let roots = engine.workspace_roots().cloned();
-        let source_prefix =
-            source_path.canonicalize().unwrap_or(source_path).to_string_lossy().replace('\\', "/");
-        Self { engine, lease, roots, source_prefix, failure: None }
+        let canonical_source_root = source_path.canonicalize().ok();
+        Self {
+            engine,
+            lease,
+            roots,
+            source_root: source_path,
+            canonical_source_root,
+            failure: None,
+        }
     }
 
     /// The store key of one emitted module, or `None` when it belongs to no registered root.
-    fn key_of(&self, abs: &str, disk_path: &Path) -> Option<bsl_search::FileKey> {
+    fn key_of(&self, disk_path: &Path) -> Option<bsl_search::FileKey> {
         let Some(roots) = self.roots.as_ref() else {
-            let prefix = self.source_prefix.trim_end_matches('/');
-            let rel = abs
-                .strip_prefix(prefix)
-                .filter(|rest| rest.starts_with('/'))
-                .map(|s| s.trim_start_matches('/'))?;
+            let rel = if let Ok(rel) = disk_path.strip_prefix(&self.source_root) {
+                rel.to_path_buf()
+            } else {
+                let canonical_root = self.canonical_source_root.as_ref()?;
+                disk_path.canonicalize().ok()?.strip_prefix(canonical_root).ok()?.to_path_buf()
+            };
+            let rel = rel.to_string_lossy().replace('\\', "/");
             return (!rel.is_empty()).then(|| bsl_search::FileKey::configuration(rel));
         };
         let canonical = disk_path.canonicalize().ok()?;
@@ -1391,7 +1400,7 @@ impl ide::FusedChunkSink for FusedChunkWriter<'_> {
             // configured that means "under no declared root"; without one it means "outside the
             // configuration", which is the prefix check this used to be — a separator boundary
             // included, so `…/cf_ext` is never mistaken for a file inside `…/cf`.
-            let Some(key) = self.key_of(abs, &disk_path) else {
+            let Some(key) = self.key_of(&disk_path) else {
                 continue;
             };
             let bytes = match std::fs::read(&disk_path) {
@@ -3139,11 +3148,7 @@ mod tests {
         update_bodies_for_test(root, &out, &dark, std::slice::from_ref(&bystander), 1, &meta)
             .expect("the patch applies over an unreadable module");
         let conn = Connection::open(&dark).unwrap();
-        assert_eq!(
-            node_rows_for(&dark, &bystander, &roots),
-            0,
-            "its rows went with the patch"
-        );
+        assert_eq!(node_rows_for(&dark, &bystander, &roots), 0, "its rows went with the patch");
         assert!(
             crate::graph_db::read_unread_paths(&conn)
                 .iter()
