@@ -7376,6 +7376,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_point_patch_answers_what_it_rewrote_and_nothing_else() {
+        use super::super::test_support::{wait_publish_pass_within, WAIT_CEILING};
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -7409,6 +7410,7 @@ mod tests {
         graph.set_watch(super::super::watcher::WatchPhase::Running, None);
         graph.ensure_loading();
         wait_ready(&graph);
+        wait_publish_pass_within(&graph, WAIT_CEILING, 1);
         let outstanding = |graph: &GraphState| -> Vec<String> {
             let mut keys: Vec<String> = lock_recover(&graph.debt)
                 .outstanding_recovery()
@@ -7427,11 +7429,13 @@ mod tests {
         // A body-only edit of a module nobody is owed anything about: the point path is
         // eligible, and this is what a real patch looks like.
         let before = generation(&graph);
+        let passes = graph.publish_passes.load(Ordering::SeqCst);
         lock_recover(&graph.incremental_decisions).clear();
         fs::write(&edited, "&НаСервере\nФункция Взять() Экспорт Возврат 2; КонецФункции").unwrap();
         crate::graph::test_support::wait_for_hub_seq_above(&hub, graph.observation());
         graph.nudge_rebuild();
         wait_until(&graph, "the body-only edit to be published", || generation(&graph) > before);
+        wait_publish_pass_within(&graph, WAIT_CEILING, passes + 1);
         let decisions = lock_recover(&graph.incremental_decisions).clone();
         assert_eq!(
             decisions.last().copied(),
@@ -7450,11 +7454,13 @@ mod tests {
         // brings it into the patch's own rewritten set.
         lock_recover(&graph.incremental_decisions).clear();
         let at = generation(&graph);
+        let passes = graph.publish_passes.load(Ordering::SeqCst);
         fs::set_permissions(&other, fs::Permissions::from_mode(0o755)).unwrap();
         fs::write(&other, "&НаСервере\nФункция Взять() Экспорт Возврат 3; КонецФункции").unwrap();
         crate::graph::test_support::wait_for_hub_seq_above(&hub, graph.observation());
         graph.nudge_rebuild();
         wait_until(&graph, "the rewritten module to be published", || generation(&graph) > at);
+        wait_publish_pass_within(&graph, WAIT_CEILING, passes + 1);
         let decisions = lock_recover(&graph.incremental_decisions).clone();
         assert_eq!(
             decisions.last().copied(),
