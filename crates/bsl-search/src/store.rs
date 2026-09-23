@@ -1007,7 +1007,13 @@ impl Store {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         conn.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
-        Ok(Self { conn, path: path.to_path_buf(), mark_seq: Arc::new(AtomicI64::new(0)) })
+        Ok(Self {
+            conn,
+            path: path.to_path_buf(),
+            mark_seq: Arc::new(AtomicI64::new(0)),
+            observed_clears: Arc::new(AtomicU64::new(0)),
+            clear_observer_enabled: AtomicBool::new(false),
+        })
     }
 
     /// Whether a manifest header is persisted — the same validity rule

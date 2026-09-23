@@ -1624,7 +1624,7 @@ mod embed_exit_status {
             "the production/test cut moved; this gate scans only what it can prove it scanned",
         );
         let production = source.split(&cut).next().unwrap_or(source);
-        let finish = ["status_guard", ".finish();"].concat();
+        let finish = ["status_guard", ".finish("].concat();
         let writes = ["set_semantic_runtime_status", "("].concat();
         let terminal = ["SemanticRuntimeStatus::", "Ready"].concat();
         let failed = ["SemanticRuntimeStatus::", "Failed"].concat();
