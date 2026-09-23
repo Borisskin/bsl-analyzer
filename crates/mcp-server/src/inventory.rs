@@ -643,7 +643,7 @@ const WAITS: &[(&str, &str, &str, Waiting)] = &[
     // lease attempts is not held under it, which is why this wait is the owner's and bounded
     // by the attempt rather than by a foreign lease holder.
     ("state/bootstrap.rs", "publish_engine_with_retry", "acquire_for_owner(", Waiting::Owner),
-    ("state/bootstrap.rs", "ensure_loading_with_wait", "acquire_for_owner(", Waiting::Owner),
+    ("state/bootstrap.rs", "finish_initialization", "acquire_for_owner(", Waiting::Owner),
     // The one uncancellable hold, taken only by the reference profile's own shutdown.
     ("state/bootstrap.rs", "shutdown", "take_for_shutdown(", Waiting::OwnProtocol),
     ("state/embed.rs", "kick_context_reembed", "acquire_for_owner(", Waiting::Owner),
@@ -783,6 +783,7 @@ fn the_test_only_modules_are_the_ones_the_parent_gates() {
         [
             "diagnostics_state/test_support.rs",
             "graph/test_support.rs",
+            "payload_smoke_tests.rs",
             "state/test_support.rs",
             "tools/search/cancel_tests.rs",
             "tools/search/test_support.rs",
@@ -1038,6 +1039,9 @@ fn the_reason_codes_clients_see_are_the_frozen_set() {
     let needle = ["reason_code", ": \""].concat();
     let mut found: Vec<String> = Vec::new();
     for path in production_sources() {
+        if is_test_only_module(&path) {
+            continue;
+        }
         let source = production_source(&std::fs::read_to_string(&path).expect("source"));
         let mut rest = source.as_str();
         while let Some(at) = rest.find(&needle) {
