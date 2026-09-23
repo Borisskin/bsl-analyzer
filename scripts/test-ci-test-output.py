@@ -21,7 +21,7 @@ for block in wrappers:
         result = subprocess.run(
             ["bash", "-c", "set -euo pipefail\n"
              + f"cargo() {{ echo '{output}' >&2; return {status}; }}\n"
-             + textwrap.dedent(block) + f"\n{name} fixture"],
+             + textwrap.dedent(block) + f"\n{name} fixture test_name"],
             capture_output=True, text=True, check=False,
         )
         assert (result.returncode == 0) == (passed > 0 and status == 0), result
