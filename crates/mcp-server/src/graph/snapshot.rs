@@ -3,6 +3,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::change_hub::{ChangeEntry, ChangeKind};
+#[cfg(windows)]
+use crate::graph_query::detached_snapshot;
 use crate::graph_query::GraphDb;
 
 #[cfg(test)]
@@ -100,6 +102,9 @@ pub(super) struct PooledSnapshotEntry {
     pub(super) fingerprint: crate::graph_db::GraphFp,
     pub(super) force_stale: bool,
     db: GraphDb,
+    // SQLite closes before the last owner removes the detached Windows file.
+    #[cfg(windows)]
+    _backing: Arc<tempfile::TempPath>,
 }
 
 #[derive(Default)]
@@ -209,6 +214,9 @@ impl GraphPathIdentity {
 }
 
 pub(super) struct PreparedSnapshotPool {
+    // The final fence must still see canonical in-place changes, even with restored mtime.
+    #[cfg(windows)]
+    validation: GraphDb,
     entries: Vec<PooledSnapshotEntry>,
     /// The artefact's own unread set, read STRICTLY and bound to the generation validated
     /// above. `None` when the metadata would not read: that is a failure to look, and it says
@@ -433,6 +441,14 @@ impl GraphState {
             .graph_db_path()
             .ok_or_else(|| SnapshotPrepareError::Open(anyhow::anyhow!("graph path unavailable")))?;
         let before = prepare_path_identity(&path)?;
+        #[cfg(windows)]
+        let validation = GraphDb::open(&path).map_err(SnapshotPrepareError::Open)?;
+        #[cfg(windows)]
+        let backing = detached_snapshot(&path).map_err(SnapshotPrepareError::Open)?;
+        #[cfg(windows)]
+        let read_path: &Path = backing.as_ref();
+        #[cfg(not(windows))]
+        let read_path: &Path = &path;
         let mut entries = Vec::with_capacity(SNAPSHOT_POOL_CAP);
         for _index in 0..SNAPSHOT_POOL_CAP {
             #[cfg(test)]
@@ -441,7 +457,7 @@ impl GraphState {
             {
                 return Err(SnapshotPrepareError::Changed);
             }
-            let db = GraphDb::open(&path).map_err(SnapshotPrepareError::Open)?;
+            let db = GraphDb::open(read_path).map_err(SnapshotPrepareError::Open)?;
             let (generation, fingerprint, force_stale) =
                 db.freshness_token().map_err(SnapshotPrepareError::Open)?;
             if generation != expected_generation
@@ -450,7 +466,14 @@ impl GraphState {
             {
                 return Err(SnapshotPrepareError::Changed);
             }
-            entries.push(PooledSnapshotEntry { generation, fingerprint, force_stale, db });
+            entries.push(PooledSnapshotEntry {
+                generation,
+                fingerprint,
+                force_stale,
+                db,
+                #[cfg(windows)]
+                _backing: Arc::clone(&backing),
+            });
         }
         let after = prepare_path_identity(&path)?;
         if before != after {
@@ -464,6 +487,8 @@ impl GraphState {
             .map(|entry| entry.db.unread_keys_strict().map_err(SnapshotPrepareError::Open))
             .transpose()?;
         Ok(PreparedSnapshotPool {
+            #[cfg(windows)]
+            validation,
             entries,
             declared_unread,
             path_identity: after,
@@ -557,11 +582,15 @@ impl GraphState {
                 }
                 Err(error) => return Err(SnapshotInstallError::Operation(error.to_string())),
             }
-            let actual = prepared
+            #[cfg(windows)]
+            let validation = &prepared.validation;
+            #[cfg(not(windows))]
+            let validation = &prepared
                 .entries
                 .first()
                 .ok_or_else(|| SnapshotInstallError::Operation("empty snapshot pool".to_owned()))?
-                .db
+                .db;
+            let actual = validation
                 .freshness_token()
                 .map_err(|error| SnapshotInstallError::Operation(error.to_string()))?;
             if actual != expected
@@ -705,7 +734,13 @@ impl GraphState {
             let path =
                 self.graph_db_path().ok_or_else(|| anyhow::anyhow!("graph path unavailable"))?;
             let before = GraphPathIdentity::read(&path)?;
-            let db = GraphDb::open(&path)?;
+            #[cfg(windows)]
+            let backing = detached_snapshot(&path)?;
+            #[cfg(windows)]
+            let read_path: &Path = backing.as_ref();
+            #[cfg(not(windows))]
+            let read_path: &Path = &path;
+            let db = GraphDb::open(read_path)?;
             if db.freshness_token()? != (generation, fingerprint, force_stale) {
                 anyhow::bail!("graph changed while opening a background snapshot");
             }
@@ -713,7 +748,17 @@ impl GraphState {
             if before != after {
                 anyhow::bail!("graph path changed while opening a background snapshot");
             }
-            Ok((PooledSnapshotEntry { generation, fingerprint, force_stale, db }, after))
+            Ok((
+                PooledSnapshotEntry {
+                    generation,
+                    fingerprint,
+                    force_stale,
+                    db,
+                    #[cfg(windows)]
+                    _backing: backing,
+                },
+                after,
+            ))
         })();
         let (entry, identity) = match opened {
             Ok(opened) => opened,
@@ -1895,6 +1940,14 @@ mod tests {
         wait_ready(&graph);
 
         let snap1 = graph.snapshot().expect("ready graph snapshots");
+        let old_token = snap1.graph.freshness_token().unwrap();
+        #[cfg(windows)]
+        let old_copy = {
+            let entry = snap1.graph.entry.as_ref().unwrap();
+            let pool = lock_recover(&graph.snapshot_pool);
+            assert!(pool.iter().all(|other| Arc::ptr_eq(&entry._backing, &other._backing)));
+            entry._backing.to_path_buf()
+        };
         let fresh = graph.freshness(&snap1);
         assert_eq!(fresh.revision, 1);
         assert!(!fresh.stale);
@@ -1920,6 +1973,12 @@ mod tests {
         assert!(!settled.stale);
         assert_eq!(settled.revision, 2);
         assert_eq!(settled.reload, "none");
+        assert_eq!(snap1.graph.freshness_token().unwrap(), old_token);
+        #[cfg(windows)]
+        assert!(old_copy.exists(), "the checked-out old generation keeps its copy alive");
+        drop(snap1);
+        #[cfg(windows)]
+        assert!(!old_copy.exists(), "the last old reader removes its detached copy");
     }
 
     #[test]

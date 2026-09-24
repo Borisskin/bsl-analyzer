@@ -1667,7 +1667,7 @@ impl SharedState {
             // from the one that passed the check.
             let graph_project =
                 crate::graph::ProjectSnapshot::load_excluding(workspace_root, &excluded);
-            match crate::graph_query::GraphDb::open(&graph_path) {
+            match crate::graph_query::GraphDb::open_snapshot(&graph_path) {
                 Ok(graph_db)
                     if !crate::graph::scan::graph_matches_live_project_strict(
                         &graph_db,

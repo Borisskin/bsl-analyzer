@@ -227,11 +227,10 @@ fn seed_ready_search(cache: &WorkspaceCacheLayout, workspace_root: &Path, vector
 }
 
 /// Exercise the exact replacement used by the publisher with a closed-connection control first,
-/// then keep the old read handle open. A failure includes the OS error instead of collapsing into
-/// the graph's later reload timeout.
-#[ignore = "pre-existing SQLite replacement limitation; CI 35513229129; see verification journal"]
+/// then keep the old detached snapshot open. The old generation must remain readable while the
+/// canonical path is replaced by generation 8.
 #[test]
-fn replacing_an_open_graph_db_reports_the_windows_error() {
+fn replacing_graph_db_preserves_the_old_snapshot_generation() {
     let dir = tempfile::tempdir().expect("graph replacement probe tempdir");
     let root = dir.path();
     sample_workspace(root);
@@ -270,7 +269,8 @@ fn replacing_an_open_graph_db_reports_the_windows_error() {
     assert_eq!(control_db.freshness_token().expect("read closed control token").0, 8);
     drop(control_db);
 
-    let old = crate::graph_query::GraphDb::open(&canonical).expect("open old graph handle");
+    let old = crate::graph_query::GraphDb::open_snapshot(&canonical)
+        .expect("open old detached graph snapshot");
     let old_token = old.freshness_token().expect("read old graph token");
     let replacement = canonical.with_file_name("bsl-graph.db.open.replacement");
     fs::copy(&canonical, &replacement).expect("copy open-handle replacement graph");
@@ -284,7 +284,7 @@ fn replacing_an_open_graph_db_reports_the_windows_error() {
 
     fs::rename(&replacement, &canonical).unwrap_or_else(|error| {
         panic!(
-            "replacing an open GraphDb {} -> {} failed: kind={:?}, raw_os_error={:?}: {error}",
+            "replacing the canonical graph while an old snapshot is live {} -> {} failed: kind={:?}, raw_os_error={:?}: {error}",
             replacement.display(),
             canonical.display(),
             error.kind(),
@@ -786,23 +786,8 @@ fn content_change_with_same_size_and_mtime_invalidates_cached_graph() {
     assert_ne!(replacement.as_bytes(), original_bytes.as_slice());
 
     let fingerprint = super::scan::workspace_fingerprint(root);
-    #[cfg(not(windows))]
     let cache = WorkspaceCacheLayout::for_workspace(root);
     seed_cache(root, fingerprint);
-    #[cfg(windows)]
-    {
-        let control = crate::graph::GraphState::for_workspace(root.to_path_buf());
-        control.ensure_loading();
-        wait_ready(&control);
-        wait_until(&control, "unchanged cached graph publication to settle", || {
-            !control.build_in_flight()
-        });
-        let inner = super::state::lock_recover(&control.inner);
-        let published = inner.published.as_ref().expect("unchanged cache publication");
-        assert_eq!(published.generation, 7, "unchanged cache control generation");
-        assert!(!published.stale, "unchanged cache control must not be stale");
-        assert!(!published.force_stale, "unchanged cache control must be coherent");
-    }
     fs::write(&source, replacement.as_bytes()).expect("write same-stat replacement");
     set_file_modified(&source, original_mtime);
     let current = fs::metadata(&source).expect("source metadata after same-stat edit");
@@ -818,51 +803,31 @@ fn content_change_with_same_size_and_mtime_invalidates_cached_graph() {
     let graph = crate::graph::GraphState::for_workspace(root.to_path_buf());
     graph.ensure_loading();
     wait_ready(&graph);
-    #[cfg(not(windows))]
-    {
-        wait_until(&graph, "same-stat content rebuild", || {
-            graph.snapshot().is_some_and(|snapshot| snapshot.generation == 8)
-        });
-        assert_ne!(
-            meta_string(&cache.graph_db_path(), "built_at"),
-            "cached-build-sentinel",
-            "same-stat content change must replace the cached graph"
-        );
-        let full_builds = graph.full_builds_started.load(Ordering::SeqCst);
-        assert!(
-            full_builds <= 1,
-            "same-stat content change must publish after at most one full graph build; started {full_builds}"
-        );
+    wait_until(&graph, "same-stat content rebuild", || {
+        graph.snapshot().is_some_and(|snapshot| snapshot.generation == 8)
+    });
+    assert_ne!(
+        meta_string(&cache.graph_db_path(), "built_at"),
+        "cached-build-sentinel",
+        "same-stat content change must replace the cached graph"
+    );
+    let full_builds = graph.full_builds_started.load(Ordering::SeqCst);
+    assert!(
+        full_builds <= 1,
+        "same-stat content change must publish after at most one full graph build; started {full_builds}"
+    );
 
-        let snapshot = graph.snapshot().expect("rebuilt graph snapshot");
-        let roots = snapshot.workspace_roots().expect("roots paired with rebuilt graph");
-        let node = snapshot
-            .graph
-            .node("method/common/Клиент/Главная", ide::GraphDetail::Bodies, Some(roots))
-            .expect("read rebuilt graph method")
-            .expect("rebuilt graph method exists");
-        assert!(
-            node.node.source.as_deref().is_some_and(|source| source.contains("Сервер.Запросы")),
-            "the rebuilt graph must contain the replacement bytes"
-        );
-    }
-    #[cfg(windows)]
-    {
-        wait_until(&graph, "same-stat graph to become stale or rebuild", || {
-            super::state::lock_recover(&graph.inner).published.as_ref().is_some_and(|published| {
-                published.generation > 7 || published.stale || published.force_stale
-            })
-        });
-        let inner = super::state::lock_recover(&graph.inner);
-        let published = inner.published.as_ref().expect("same-stat graph publication");
-        assert!(
-            published.generation > 7 || published.stale || published.force_stale,
-            "same-stat content change must not remain a fresh generation 7 graph: generation={}, stale={}, force_stale={}",
-            published.generation,
-            published.stale,
-            published.force_stale
-        );
-    }
+    let snapshot = graph.snapshot().expect("rebuilt graph snapshot");
+    let roots = snapshot.workspace_roots().expect("roots paired with rebuilt graph");
+    let node = snapshot
+        .graph
+        .node("method/common/Клиент/Главная", ide::GraphDetail::Bodies, Some(roots))
+        .expect("read rebuilt graph method")
+        .expect("rebuilt graph method exists");
+    assert!(
+        node.node.source.as_deref().is_some_and(|source| source.contains("Сервер.Запросы")),
+        "the rebuilt graph must contain the replacement bytes"
+    );
 }
 
 #[test]
