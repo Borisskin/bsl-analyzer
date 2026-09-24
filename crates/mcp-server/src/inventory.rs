@@ -20,7 +20,7 @@ fn production_sources() -> Vec<PathBuf> {
 }
 
 /// The production half of a Rust source: every `#[cfg(test)]` element removed, everything
-/// else kept verbatim.
+/// else kept verbatim except that checkout CRLF line endings are normalized to LF.
 ///
 /// Cutting the file at the first `#[cfg(test)]` instead would read almost nothing: in
 /// `lib.rs` the first one is the module DECLARATION `#[cfg(test)] mod inventory;` on line 13,
@@ -48,7 +48,7 @@ pub(crate) fn production_source(source: &str) -> String {
         i += 1;
     }
     out.push_str(&source[kept_from..]);
-    out
+    out.replace("\r\n", "\n")
 }
 
 /// Advance past one comment or literal starting at `i`; `None` when `i` starts plain code.
@@ -275,8 +275,7 @@ fn skip_group(b: &[u8], i: usize, open: u8) -> usize {
 fn production_source_handles_checkout_line_endings() {
     for newline in ["\n", "\r\n"] {
         let source = format!("fn production() {{}}{newline}#[cfg(test)]{newline}mod tests {{}}");
-        assert!(production_source(&source).contains("fn production() {}"));
-        assert!(!production_source(&source).contains("mod tests"));
+        assert_eq!(production_source(&source), "fn production() {}\n");
     }
 }
 
@@ -387,6 +386,7 @@ fn production_source_keeps_what_follows_a_gated_enum_variant_of_a_real_source() 
     let source =
         std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/change_hub.rs"))
             .expect("source is readable");
+    let source = source.replace("\r\n", "\n");
     assert!(source.contains("    #[cfg(test)]\n    Tick,"), "the gated variant is still there");
     assert!(
         production_source(&source).contains("pub(crate) struct WorkspaceChangeHub"),

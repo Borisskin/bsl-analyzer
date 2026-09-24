@@ -7698,27 +7698,43 @@ mod tests {
     /// the budget itself.
     #[test]
     fn the_blind_poll_never_reads_a_whole_budget_under_the_poller_lock() {
-        let source = include_str!("change_hub.rs");
-        let production = crate::inventory::production_source(source);
-        let at = production.find("fn poll_until_stopped(").expect("the blind poll loop");
-        let body = &production[at..];
-        let end = body.find("\n    }\n").map_or(body.len(), |stop| stop + 6);
-        let body = &body[..end];
-        assert!(
-            body.contains("VERIFY_SLICE"),
-            "the blind poll spends its budget in slices, and this one does not",
-        );
-        for line in body.lines() {
-            let line = line.trim();
-            if line.starts_with("//") {
-                continue;
-            }
+        fn whole_budget_line(source: &str) -> Option<String> {
+            let production = crate::inventory::production_source(source);
+            let at = production.find("fn poll_until_stopped(").expect("the blind poll loop");
+            let body = &production[at..];
+            let end = body.find("\n    }\n").expect("the blind poll loop ends");
+            let body = &body[..end];
             assert!(
-                !(line.contains("poll.verify_bytes")
-                    && !line.contains("VERIFY_SLICE")
-                    && !line.contains("spent <")
-                    && !line.contains("- spent")),
-                "a whole verify budget is handed to one hold of the poller: {line}",
+                body.contains("VERIFY_SLICE"),
+                "the blind poll spends its budget in slices, and this one does not",
+            );
+            body.lines()
+                .map(str::trim)
+                .find(|line| {
+                    !line.starts_with("//")
+                        && line.contains("poll.verify_bytes")
+                        && !line.contains("VERIFY_SLICE")
+                        && !line.contains("spent <")
+                        && !line.contains("- spent")
+                })
+                .map(str::to_owned)
+        }
+        let source = include_str!("change_hub.rs").replace("\r\n", "\n");
+        let mutant = source.replacen(
+            "state.poller.take(now, VERIFY_SLICE.min(inner.poll.verify_bytes), false)",
+            "state.poller.take(now, inner.poll.verify_bytes, false)",
+            1,
+        );
+        assert_ne!(source, mutant, "the injected whole-budget call must replace a real call");
+        for newline in ["\n", "\r\n"] {
+            assert_eq!(
+                whole_budget_line(&source.replace('\n', newline)),
+                None,
+                "a whole verify budget is handed to one hold of the poller",
+            );
+            assert!(
+                whole_budget_line(&mutant.replace('\n', newline)).is_some(),
+                "the gate must reject an injected whole-budget call",
             );
         }
     }
