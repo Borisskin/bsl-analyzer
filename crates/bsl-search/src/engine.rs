@@ -5702,7 +5702,6 @@ mod tests {
         let semantic = SearchEngine::new_fenced(&refused_sidecar, config(8), |apply| {
             calls.set(calls.get() + 1);
             if calls.get() == 2 {
-                #[cfg(not(windows))]
                 assert_eq!(prepared_temps(&refused_sidecar).len(), 2);
                 FenceOutcome::TransientRefusal
             } else {
@@ -5721,11 +5720,10 @@ mod tests {
         let changed_baseline = dir.path().join("changed-baseline.db");
         seed(&changed_baseline, 8);
         let calls = Cell::new(0usize);
-        let sidecar_prepared = Cell::new(false);
         let changed = SearchEngine::new_fenced(&changed_baseline, config(8), |apply| {
             calls.set(calls.get() + 1);
             if calls.get() == 2 {
-                sidecar_prepared.set(!prepared_temps(&changed_baseline).is_empty());
+                assert_eq!(prepared_temps(&changed_baseline).len(), 2);
                 rusqlite::Connection::open(&changed_baseline)
                     .unwrap()
                     .execute(
@@ -5736,9 +5734,7 @@ mod tests {
             }
             run_apply(apply)
         });
-        if sidecar_prepared.get() {
-            assert!(changed.is_err());
-        }
+        assert!(changed.is_err());
         assert!(!sibling(&changed_baseline, ".usearch.json").exists());
 
         // All three modes admit successfully with the same callback contract.
@@ -6102,13 +6098,12 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(result, FenceOutcome::Applied(_)));
-        assert_eq!(retries, usize::from(!cfg!(windows)));
+        assert_eq!(retries, 1);
         assert_eq!(
             network_calls.load(std::sync::atomic::Ordering::SeqCst) - before,
             1,
             "retrying the prepared final bundle must not repeat network work"
         );
-        #[cfg(not(windows))]
         assert!(sidecar(&retried_sidecar).exists());
         assert!(prepared_temps(&retried_sidecar).is_empty());
 
@@ -6130,11 +6125,8 @@ mod tests {
             },
         )
         .unwrap();
-        #[cfg(not(windows))]
         assert!(matches!(result, FenceOutcome::Superseded));
-        #[cfg(windows)]
-        assert!(matches!(result, FenceOutcome::Applied(_)));
-        assert_eq!(calls, if cfg!(windows) { 4 } else { 5 });
+        assert_eq!(calls, 5);
         assert!(Store::open_existing(&refused_sidecar)
             .unwrap()
             .load_pending_embedding_documents("code")
