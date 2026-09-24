@@ -92,7 +92,7 @@ pub(crate) struct ScannedUniverse {
     pub(crate) files: Vec<(FileId, PathBuf)>,
     /// The `.bsl` + `.xml` stats rows — see [`file_stats_with_content_errors`].
     pub(crate) stats: Vec<FileStat>,
-    /// The first walked spelling for each canonical path in this exact scan. The
+    /// The walked spelling of each retained stat in this exact scan. The
     /// graph keeps canonical source paths for reading, but durable root attribution
     /// needs the walked alias when a symlink target lies outside the registered roots.
     walked_by_canonical: HashMap<PathBuf, PathBuf>,
@@ -112,12 +112,8 @@ impl ScannedUniverse {
     pub(crate) fn scan_excluding(roots: &[PathBuf], excluded: &[PathBuf]) -> ScannedUniverse {
         let set = SourceSet::scan_excluding(roots, excluded);
         let (stats, unreadable) = file_stats_with_content_errors(&set);
-        let mut walked_by_canonical = HashMap::new();
-        for file in &set.files {
-            walked_by_canonical
-                .entry(file.canonical.clone())
-                .or_insert_with(|| file.walked.clone());
-        }
+        let walked_by_canonical =
+            stats.iter().map(|stat| (stat.canonical.clone(), stat.walked.clone())).collect();
         // The content pass is part of the same walk's authority. A listed
         // file that could not be hashed must keep the snapshot dirty; it is
         // never equivalent to an empty or deleted input.

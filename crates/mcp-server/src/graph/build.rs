@@ -513,14 +513,17 @@ impl GraphState {
                     return self.note_incremental("profile recompute failed");
                 }
             };
-        let stored_sig = read_stored_sig_hashes(&db_path, project.search_roots.as_ref());
+        let stored_sig = read_stored_sig_hashes(&db_path);
         let mut sig_changed: Vec<(String, &crate::graph_db::ModuleProfile)> = Vec::new();
         for p in &modified_paths {
             let key = p.to_string_lossy().into_owned();
             let Some(profile) = profiles.get(&key) else {
                 return self.note_incremental("no recomputed profile");
             };
-            match stored_sig.get(&key) {
+            // The diff and this lookup use the same scan's walked alias and durable key.
+            let stored_key =
+                project.search_roots.as_ref().and_then(|roots| pre.key_for_path(roots, p));
+            match stored_key.as_ref().and_then(|key| stored_sig.get(key)) {
                 Some(Some(stored)) if *stored == profile.sig_hash => {} // body-only
                 Some(Some(_)) => sig_changed.push((key, profile)),      // signature changed
                 // A module the last full build could not READ has no stored signature, so a
@@ -1511,14 +1514,12 @@ pub(crate) fn read_stored_fingerprints_with_roots(
 /// Read the stored per-file signature hashes (`None` for `.xml`, and for `.bsl` built
 /// before signature persistence). Read-only open; an open/query failure yields an
 /// empty map → the body-only fast path treats every module as ineligible (full
-/// rebuild). The durable key is resolved through the current roots before the
-/// physical map used by the analyzer is returned.
+/// rebuild). Keep the durable key: resolving it to a declared path can differ
+/// from the canonical path used by the current scan, especially on Windows.
 pub(crate) fn read_stored_sig_hashes(
     db_path: &Path,
-    roots: Option<&bsl_search::WorkspaceRoots>,
-) -> std::collections::HashMap<String, Option<u64>> {
+) -> std::collections::HashMap<bsl_search::FileKey, Option<u64>> {
     let mut map = std::collections::HashMap::new();
-    let Some(roots) = roots else { return map };
     let Ok(conn) =
         rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
     else {
@@ -1535,10 +1536,7 @@ pub(crate) fn read_stored_sig_hashes(
     }) else {
         return map;
     };
-    for row in rows.flatten() {
-        let Some(path) = roots.resolve(&row.0) else { continue };
-        map.insert(path.to_string_lossy().into_owned(), row.1);
-    }
+    map.extend(rows.flatten());
     map
 }
 
