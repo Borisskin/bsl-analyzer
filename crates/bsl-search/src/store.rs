@@ -608,7 +608,11 @@ impl Store {
         if Self::read_embedding_generation(tx)? != Self::MISSING_GENERATION {
             return Ok(());
         }
-        crate::vector_persist::remove_artifacts(db_path)?;
+        // SQLite reports an empty filename for memory/temporary databases: they
+        // have no persisted vector artifacts, even if the Store has a display path.
+        if tx.path() != Some("") {
+            crate::vector_persist::remove_artifacts(db_path)?;
+        }
         tx.execute("INSERT INTO meta (key, value) VALUES ('embedding_generation', '0')", [])?;
         Ok(())
     }
@@ -5455,5 +5459,18 @@ mod tests {
         let store = Store::open(&path).unwrap();
         assert_eq!(store.file_count().unwrap(), 1);
         assert_eq!(Store::stored_schema_version(&store.conn).unwrap(), Some(SCHEMA_VERSION));
+    }
+
+    #[test]
+    fn in_memory_generation_initialization_does_not_remove_disk_artifacts() {
+        let store = Store::in_memory().unwrap();
+        store.conn.execute("DELETE FROM meta WHERE key = 'embedding_generation'", []).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("search.db");
+        let sidecar = dir.path().join("search.db.usearch.json");
+        std::fs::write(&sidecar, b"unrelated artifact").unwrap();
+        Store::ensure_embedding_generation(&store.conn, &path).unwrap();
+        assert_eq!(store.embedding_generation().unwrap(), 0);
+        assert_eq!(std::fs::read(sidecar).unwrap(), b"unrelated artifact");
     }
 }
