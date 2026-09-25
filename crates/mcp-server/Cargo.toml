@@ -74,6 +74,7 @@ interprocess = { version = "2.4.2", features = ["tokio"] }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
+tempfile.workspace = true
 widestring = "1.0"
 win-security-identifier = "0.1.1"
 # Safe introspection of a connected named-pipe server: lets us read the

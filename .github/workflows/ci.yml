@@ -20,6 +20,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
+      - run: python3 scripts/test-ci-test-output.py
       - run: cargo clippy --all-targets --all-features
       - name: Portable workspace lease profiles
         run: |
@@ -282,6 +283,19 @@ jobs:
           run_exact mcp-server graph::state::tests::a_walk_refuses_a_snapshot_of_another_publication
           run_exact mcp-server graph::state::tests::a_complete_build_answers_an_address_that_is_gone
           run_exact mcp-server graph::state::tests::a_point_patch_answers_what_it_rewrote_and_nothing_else
+      - name: Vector lifecycle and bounded journal regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_nonempty() {
+            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
+            printf '%s\n' "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+          }
+          run_nonempty -p bsl-search --lib lifecycle
+          run_nonempty -p mcp-server --lib vector_lifecycle
+          run_nonempty -p bsl-analyzer --bin bsl-analyzer-app cli::logging
+          run_nonempty -p bsl-analyzer --test vector_journal_cli
       - run: cargo test --all --no-fail-fast
 
   windows-mcp:
@@ -295,6 +309,21 @@ jobs:
         run: cargo build -p bsl-analyzer --bin bsl-analyzer-app
       - name: CLI MCP mode and lifecycle tests
         run: cargo test -p bsl-analyzer --bin bsl-analyzer-app cli::mcp
+      - name: Vector lifecycle and bounded journal regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_nonempty() {
+            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
+            printf '%s\n' "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+          }
+          run_nonempty -p bsl-search --lib lifecycle
+          run_nonempty -p mcp-server --lib vector_lifecycle
+          run_nonempty -p mcp-server --lib graph::snapshot::tests::drift_marks_stale_and_async_reload_bumps_generation -- --exact
+          run_nonempty -p mcp-server --lib state::bootstrap::tests::a_workspace_without_a_watch_follows_edits_through_the_poll -- --exact
+          run_nonempty -p bsl-analyzer --bin bsl-analyzer-app cli::logging
+          run_nonempty -p bsl-analyzer --bin bsl-analyzer-app cli::logging::journal::windows::tests::private_dacl_and_unprivileged_junction_rejection -- --exact
       - name: Diagnostics baseline atomic create
         run: cargo test -p bsl-analyzer diagnostics_baseline_create
       - name: Diagnostics baseline atomic update
@@ -417,7 +446,6 @@ jobs:
           run_exact mcp-server graph::watcher::tests::a_stalled_search_cursor_costs_the_hub_its_capacity_at_most_and_the_graph_nothing
           run_exact mcp-server state::bootstrap::tests::a_quiet_healthy_boot_asks_for_no_reconcile_mark_or_reload
           run_exact mcp-server state::bootstrap::tests::the_graph_follows_edits_after_search_init_failed
-          run_exact mcp-server state::bootstrap::tests::a_workspace_without_a_watch_follows_edits_through_the_poll
           run_exact mcp-server state::bootstrap::tests::a_superseded_daemon_applies_nothing_more_and_releases_its_cursors
           run_exact mcp-server state::bootstrap::tests::the_search_and_the_graph_say_who_watches_them
           run_exact mcp-server state::overlay_backlog::tests::a_large_backlog_drains_without_pauses_between_batches
@@ -511,7 +539,6 @@ jobs:
           run_exact mcp-server graph::state::tests::a_request_runs_a_retry_that_is_due_and_none_that_is_not
           run_exact mcp-server state::bootstrap::tests::the_engine_is_free_while_a_publication_waits_out_a_foreign_lease_hold
           run_exact mcp-server state::overlay_backlog::tests::a_discarded_batch_is_paced_because_it_settled_nothing
-          run_exact mcp-server change_hub::tests::a_root_turning_blind_does_not_report_its_untouched_files
           run_exact mcp-server change_hub::tests::a_large_file_resumes_across_ticks_with_other_files_beside_it
           run_exact mcp-server change_hub::tests::the_blind_poll_never_reads_a_whole_budget_under_the_poller_lock
           run_exact mcp-server inventory::the_reason_codes_clients_see_are_the_frozen_set

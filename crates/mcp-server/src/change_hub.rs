@@ -2247,7 +2247,7 @@ impl WorkspaceChangeHub {
 
     /// Wait until the reconcile announcing the current blindness has been issued — it follows
     /// the first reading of every blind file.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn wait_until_blindness_announced(&self) {
         assert!(
             test_support::eventually(Duration::from_secs(10), || {
@@ -2547,10 +2547,8 @@ impl WorkspaceChangeHub {
         self.inner.lock_acc().cursors.len()
     }
 
-    /// Coverage ticks that ran on this hub.
-    #[cfg(test)]
     /// Whether a blind-root poller thread exists right now.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn blind_poll_running(&self) -> bool {
         self.inner.blind_poll.running.load(Ordering::SeqCst)
     }
@@ -3540,6 +3538,7 @@ pub(crate) struct BlindPollSeam {
 
 #[cfg(test)]
 impl BlindPollSeam {
+    #[cfg(unix)]
     pub(crate) fn refusing_to_start() -> Self {
         Self { cannot_start: true, gate: None, announce: None }
     }
@@ -3575,6 +3574,7 @@ impl PollGate {
     }
 
     /// Wait until the poll has reached the gate at least `arrivals` times.
+    #[cfg(unix)]
     pub(crate) fn wait_arrivals(&self, arrivals: usize) {
         let mut counts = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
         let deadline = Instant::now() + Self::BOUND;
@@ -3589,6 +3589,7 @@ impl PollGate {
     }
 
     /// Let `polls` more polls run, without waiting for any of them.
+    #[cfg(unix)]
     pub(crate) fn allow(&self, polls: usize) {
         let mut counts = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
         counts.0 += polls;
@@ -3596,6 +3597,7 @@ impl PollGate {
     }
 
     /// Let `polls` polls run, and return once each of them has come back to the gate.
+    #[cfg(unix)]
     pub(crate) fn run_polls(&self, polls: usize) {
         let target = {
             let mut counts = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
@@ -3631,6 +3633,7 @@ pub(crate) struct AnnounceBarrier {
 impl AnnounceBarrier {
     const BOUND: Duration = Duration::from_secs(10);
 
+    #[cfg(unix)]
     pub(crate) fn arm(&self, point: AnnouncePoint) {
         *self.state.lock().unwrap_or_else(PoisonError::into_inner) = (Some(point), false, false);
     }
@@ -3655,6 +3658,7 @@ impl AnnounceBarrier {
         self.moved.notify_all();
     }
 
+    #[cfg(unix)]
     pub(crate) fn wait_parked(&self) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let deadline = Instant::now() + Self::BOUND;
@@ -3668,6 +3672,7 @@ impl AnnounceBarrier {
         assert!(state.1, "the announcement never reached its barrier");
     }
 
+    #[cfg(unix)]
     pub(crate) fn release(&self) {
         self.state.lock().unwrap_or_else(PoisonError::into_inner).2 = true;
         self.moved.notify_all();
@@ -5345,10 +5350,11 @@ mod tests {
 
         project.retarget(&project.second);
         assert!(
-            eventually(Duration::from_secs(10), || hub.self_rearm_count() > 0),
-            "a retarget after the first tick must still be noticed"
+            eventually(Duration::from_secs(10), || {
+                hub.self_rearm_count() > 0 && hub.tick_count() > after_first
+            }),
+            "a retarget after the first tick must still be noticed by a completed tick"
         );
-        assert!(hub.tick_count() > after_first);
     }
 
     /// A target that is simply not there costs nothing at all. It stays in the declared
@@ -7689,27 +7695,43 @@ mod tests {
     /// the budget itself.
     #[test]
     fn the_blind_poll_never_reads_a_whole_budget_under_the_poller_lock() {
-        let source = include_str!("change_hub.rs");
-        let production = crate::inventory::production_source(source);
-        let at = production.find("fn poll_until_stopped(").expect("the blind poll loop");
-        let body = &production[at..];
-        let end = body.find("\n    }\n").map_or(body.len(), |stop| stop + 6);
-        let body = &body[..end];
-        assert!(
-            body.contains("VERIFY_SLICE"),
-            "the blind poll spends its budget in slices, and this one does not",
-        );
-        for line in body.lines() {
-            let line = line.trim();
-            if line.starts_with("//") {
-                continue;
-            }
+        fn whole_budget_line(source: &str) -> Option<String> {
+            let production = crate::inventory::production_source(source);
+            let at = production.find("fn poll_until_stopped(").expect("the blind poll loop");
+            let body = &production[at..];
+            let end = body.find("\n    }\n").expect("the blind poll loop ends");
+            let body = &body[..end];
             assert!(
-                !(line.contains("poll.verify_bytes")
-                    && !line.contains("VERIFY_SLICE")
-                    && !line.contains("spent <")
-                    && !line.contains("- spent")),
-                "a whole verify budget is handed to one hold of the poller: {line}",
+                body.contains("VERIFY_SLICE"),
+                "the blind poll spends its budget in slices, and this one does not",
+            );
+            body.lines()
+                .map(str::trim)
+                .find(|line| {
+                    !line.starts_with("//")
+                        && line.contains("poll.verify_bytes")
+                        && !line.contains("VERIFY_SLICE")
+                        && !line.contains("spent <")
+                        && !line.contains("- spent")
+                })
+                .map(str::to_owned)
+        }
+        let source = include_str!("change_hub.rs").replace("\r\n", "\n");
+        let mutant = source.replacen(
+            "state.poller.take(now, VERIFY_SLICE.min(inner.poll.verify_bytes), false)",
+            "state.poller.take(now, inner.poll.verify_bytes, false)",
+            1,
+        );
+        assert_ne!(source, mutant, "the injected whole-budget call must replace a real call");
+        for newline in ["\n", "\r\n"] {
+            assert_eq!(
+                whole_budget_line(&source.replace('\n', newline)),
+                None,
+                "a whole verify budget is handed to one hold of the poller",
+            );
+            assert!(
+                whole_budget_line(&mutant.replace('\n', newline)).is_some(),
+                "the gate must reject an injected whole-budget call",
             );
         }
     }
@@ -8482,6 +8504,7 @@ mod tests {
     /// The reconcile announcing a blind root already tells every consumer to re-read that root
     /// whole. Reporting each of its files as changed on top of that is a second full re-index
     /// of work just done — and it is every file, not a file that changed.
+    #[cfg(unix)]
     #[test]
     fn a_root_turning_blind_does_not_report_its_untouched_files() {
         let dir = tempdir().unwrap();

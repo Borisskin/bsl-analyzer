@@ -1367,14 +1367,14 @@ impl GraphState {
     }
 
     /// Attach the barrier described by [`Self::probe_window_hook`].
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn with_probe_window_hook(mut self, hook: LatchWindowHook) -> Self {
         self.probe_window_hook = Some(hook);
         self
     }
 
     /// Attach the barrier described by [`Self::scan_receipt_hook`].
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn with_scan_receipt_hook(mut self, hook: LatchWindowHook) -> Self {
         self.scan_receipt_hook = Some(hook);
         self
@@ -2770,15 +2770,14 @@ mod tests {
                         return;
                     }
                     *barrier_ticket.lock().unwrap() = graph.claimed_ticket();
+                    let observed = barrier_hub.seq();
                     super::super::test_support::write(
                         &barrier_root,
                         "CommonModules/Поздний/Ext/Module.bsl",
                         "Функция Поздняя() Экспорт Возврат 9; КонецФункции",
                     );
-                    let seq = crate::graph::test_support::wait_for_hub_seq_above(
-                        &barrier_hub,
-                        graph.observation(),
-                    );
+                    let seq =
+                        crate::graph::test_support::wait_for_hub_seq_above(&barrier_hub, observed);
                     barrier_fact.store(seq as i64, Ordering::SeqCst);
                     match late {
                         "change" => graph.record_change_quietly(seq),
@@ -2795,13 +2794,13 @@ mod tests {
             *lock_recover(&window_graph) = Some(graph.clone());
             armed.store(true, Ordering::SeqCst);
 
+            let observed = hub.seq();
             super::super::test_support::write(
                 root,
                 "CommonModules/Сервер/Ext/Module.bsl",
                 "Функция Считать() Экспорт Возврат 2; КонецФункции",
             );
-            let admitted_fact =
-                crate::graph::test_support::wait_for_hub_seq_above(&hub, graph.observation());
+            let admitted_fact = crate::graph::test_support::wait_for_hub_seq_above(&hub, observed);
             match lane {
                 "change" => graph.record_change_quietly(admitted_fact),
                 _ => graph.record_forced_quietly(admitted_fact),
@@ -4963,6 +4962,11 @@ mod tests {
                 "a timed-out wait must name {named:?}; it reported {reported:?}"
             );
         }
+        lock_recover(&graph.inner).published.as_mut().unwrap().reload =
+            ReloadState::Failed("snapshot replacement refused".to_owned());
+        let summary = super::super::test_support::graph_state_summary(&graph);
+        assert!(summary.contains("reload failed"));
+        assert!(summary.contains("snapshot replacement refused"));
     }
 
     /// Wait for the forced reload to publish AND discharge its obligation. Waiting on
@@ -5370,7 +5374,7 @@ mod tests {
     /// two sides deadlock instead of serialising.
     #[test]
     fn the_publication_install_takes_the_gate_before_its_fence() {
-        let source = include_str!("snapshot.rs");
+        let source = crate::inventory::production_source(include_str!("snapshot.rs"));
         let install = source
             .split_once("fn install_prepared_snapshot(")
             .expect("the install is still there")
@@ -6296,6 +6300,11 @@ mod tests {
         let graph = GraphState::for_workspace(root.to_path_buf());
         graph.ensure_loading();
         wait_ready(&graph);
+        // A snapshot is visible before its builder releases the carried ticket. A probe
+        // offered in that window is correctly refused while a build is still in flight.
+        wait_until(&graph, "the initial builder to release its ticket", || {
+            !graph.build_in_flight()
+        });
         let observation = graph.observation();
         assert_eq!(
             graph.snapshot().map(|snapshot| snapshot.unread_files()),
@@ -6308,7 +6317,8 @@ mod tests {
         lock_recover(&graph.debt).probe_now(Instant::now());
         graph.probe_recovery();
         wait_until(&graph, "the first healed module to be read", || {
-            graph.snapshot().is_some_and(|snapshot| snapshot.unread_files() == 1)
+            !graph.build_in_flight()
+                && graph.snapshot().is_some_and(|snapshot| snapshot.unread_files() == 1)
         });
         assert!(
             !lock_recover(&graph.debt).owes_recovery_build(),
@@ -6321,7 +6331,8 @@ mod tests {
         lock_recover(&graph.debt).probe_now(Instant::now());
         graph.probe_recovery();
         wait_until(&graph, "the second healed module to be read", || {
-            graph.snapshot().is_some_and(|snapshot| snapshot.unread_files() == 0)
+            !graph.build_in_flight()
+                && graph.snapshot().is_some_and(|snapshot| snapshot.unread_files() == 0)
         });
         assert_eq!(graph.observation(), observation, "the fact stream moved");
         drop(restore);
@@ -7376,6 +7387,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_point_patch_answers_what_it_rewrote_and_nothing_else() {
+        use super::super::test_support::{wait_publish_pass_within, WAIT_CEILING};
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -7409,6 +7421,7 @@ mod tests {
         graph.set_watch(super::super::watcher::WatchPhase::Running, None);
         graph.ensure_loading();
         wait_ready(&graph);
+        wait_publish_pass_within(&graph, WAIT_CEILING, 1);
         let outstanding = |graph: &GraphState| -> Vec<String> {
             let mut keys: Vec<String> = lock_recover(&graph.debt)
                 .outstanding_recovery()
@@ -7427,11 +7440,14 @@ mod tests {
         // A body-only edit of a module nobody is owed anything about: the point path is
         // eligible, and this is what a real patch looks like.
         let before = generation(&graph);
+        let passes = graph.publish_passes.load(Ordering::SeqCst);
+        let observed = hub.seq();
         lock_recover(&graph.incremental_decisions).clear();
         fs::write(&edited, "&НаСервере\nФункция Взять() Экспорт Возврат 2; КонецФункции").unwrap();
-        crate::graph::test_support::wait_for_hub_seq_above(&hub, graph.observation());
+        crate::graph::test_support::wait_for_hub_seq_above(&hub, observed);
         graph.nudge_rebuild();
         wait_until(&graph, "the body-only edit to be published", || generation(&graph) > before);
+        wait_publish_pass_within(&graph, WAIT_CEILING, passes + 1);
         let decisions = lock_recover(&graph.incremental_decisions).clone();
         assert_eq!(
             decisions.last().copied(),
@@ -7450,11 +7466,14 @@ mod tests {
         // brings it into the patch's own rewritten set.
         lock_recover(&graph.incremental_decisions).clear();
         let at = generation(&graph);
+        let passes = graph.publish_passes.load(Ordering::SeqCst);
+        let observed = hub.seq();
         fs::set_permissions(&other, fs::Permissions::from_mode(0o755)).unwrap();
         fs::write(&other, "&НаСервере\nФункция Взять() Экспорт Возврат 3; КонецФункции").unwrap();
-        crate::graph::test_support::wait_for_hub_seq_above(&hub, graph.observation());
+        crate::graph::test_support::wait_for_hub_seq_above(&hub, observed);
         graph.nudge_rebuild();
         wait_until(&graph, "the rewritten module to be published", || generation(&graph) > at);
+        wait_publish_pass_within(&graph, WAIT_CEILING, passes + 1);
         let decisions = lock_recover(&graph.incremental_decisions).clone();
         assert_eq!(
             decisions.last().copied(),
@@ -8374,7 +8393,7 @@ mod tests {
     /// of its own, or the same shortcut returns by another name.
     #[test]
     fn the_publication_gate_reads_no_metadata_of_its_own() {
-        let source = include_str!("snapshot.rs");
+        let source = crate::inventory::production_source(include_str!("snapshot.rs"));
         let install = source
             .split_once("pub(super) fn install_prepared_snapshot")
             .expect("the install is where a publication lands")
