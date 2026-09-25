@@ -28,7 +28,7 @@ const DOC: &str = "../../docs/mcp/TOOLS_AND_EXTENSION.md";
 /// A list, not a silent skip: an example under one of these names is announced as unchecked,
 /// and the moment the tool starts publishing a schema the gate fails on its own exemption
 /// instead of quietly keeping it forever.
-const WITHOUT_SCHEMA: &[&str] = &["outline", "graph"];
+const WITHOUT_SCHEMA: &[&str] = &["outline"];
 
 /// One fenced block: the tool it claims to be an answer of, and its parsed body.
 struct Example {

@@ -994,13 +994,21 @@ mod tests {
             unread: 1,
             overlay_unknown: true,
         };
-        let code = no_hits_response(None, Envelope::Yes, "search_code", Some(&facts));
+        let mut code = no_hits_response(None, Envelope::Yes, "search_code", Some(&facts));
+        let indexing = crate::indexing::Indexing::single(crate::indexing::Target::unknown(
+            crate::indexing::Kind::Semantic,
+        ));
+        indexing.attach(&mut code);
         let code = code.structured_content.unwrap();
         assert!(valid(workspace(), &code), "{code}");
-        assert!(!valid(reference(), &code), "the reference schema admits a v5 answer: {code}");
+        assert!(!valid(reference(), &code), "the reference schema admits a v6 answer: {code}");
         for action in ["find_docs", "search_docs"] {
-            let docs =
-                no_hits_response(None, Envelope::No, action, None).structured_content.unwrap();
+            let mut docs = no_hits_response(None, Envelope::No, action, None);
+            crate::indexing::Indexing::single(crate::indexing::Target::unknown(
+                crate::indexing::Kind::Reference,
+            ))
+            .attach(&mut docs);
+            let docs = docs.structured_content.unwrap();
             assert!(valid(workspace(), &docs) && valid(reference(), &docs), "{docs}");
         }
     }
@@ -1044,11 +1052,11 @@ mod tests {
         let docs = no_hits_response(None, Envelope::No, "find_docs", None);
         let body = docs.structured_content.unwrap();
         assert!(body.get("freshness").is_none());
-        assert_eq!(body["schema_version"], "4");
+        assert_eq!(body["schema_version"], "5");
         let code = no_hits_response(None, Envelope::Yes, "search_code", None);
         let body = code.structured_content.unwrap();
         assert!(body["freshness"].get("drift_watch").is_none());
-        assert_eq!(body["schema_version"], "5");
+        assert_eq!(body["schema_version"], "6");
     }
 
     #[test]

@@ -100,6 +100,7 @@ pub(super) struct PooledSnapshotEntry {
     pub(super) fingerprint: crate::graph_db::GraphFp,
     pub(super) force_stale: bool,
     db: GraphDb,
+    unread_files: usize,
     // SQLite closes before the last owner removes the detached Windows file.
     #[cfg(windows)]
     _backing: Arc<tempfile::TempPath>,
@@ -421,6 +422,7 @@ impl GraphState {
             {
                 return Err(SnapshotPrepareError::Changed);
             }
+            let unread_files = db.unread_files();
             entries.push(PooledSnapshotEntry {
                 generation,
                 fingerprint,
@@ -428,6 +430,7 @@ impl GraphState {
                 db,
                 #[cfg(windows)]
                 _backing: Arc::clone(&backing),
+                unread_files,
             });
         }
         let after = prepare_path_identity(&path)?;
@@ -575,6 +578,7 @@ impl GraphState {
             let mut pool = lock_recover(&self.snapshot_pool);
             pool.generation = published.generation;
             pool.entries = std::mem::take(&mut prepared.entries);
+            inner.indexing_unread_files = pool.entries.first().map(|entry| entry.unread_files);
             inner.published = Some(published);
             inner.status = status;
             // Inside the publishing critical section, under `inner`: a reader holding it never
@@ -626,7 +630,7 @@ impl GraphState {
             if entry.generation == published_generation {
                 let (generation, fingerprint, force_stale) =
                     (entry.generation, entry.fingerprint, entry.force_stale);
-                let unread_files = entry.db.unread_files();
+                let unread_files = entry.unread_files;
                 return Some(GraphSnapshot {
                     graph: PooledGraphDb {
                         entry: Some(entry),
@@ -700,12 +704,14 @@ impl GraphState {
             if before != after {
                 anyhow::bail!("graph path changed while opening a background snapshot");
             }
+            let unread_files = db.unread_files();
             Ok((
                 PooledSnapshotEntry {
                     generation,
                     fingerprint,
                     force_stale,
                     db,
+                    unread_files,
                     #[cfg(windows)]
                     _backing: backing,
                 },
@@ -758,7 +764,7 @@ impl GraphState {
         }) {
             LeaseOperationOutcome::Applied(()) => {
                 let (entry, _) = prepared.take().expect("successful publication retains entry");
-                let unread_files = entry.db.unread_files();
+                let unread_files = entry.unread_files;
                 LeaseOperationOutcome::Applied(Some(GraphSnapshot {
                     graph: PooledGraphDb {
                         entry: Some(entry),

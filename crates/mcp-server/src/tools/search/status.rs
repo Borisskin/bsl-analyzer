@@ -12,21 +12,7 @@ use rmcp::ErrorData as McpError;
 use serde_json::json;
 use std::collections::HashSet;
 use std::fmt::Write;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-
-/// Append live indexing progress to a "still building" message so the failed `search_code`
-/// response carries the same signal as `search(status)`, instead of a flat "try again" that
-/// hides whether the build is progressing or stuck.
-pub(super) fn with_index_progress(message: String, progress: &IndexProgress) -> String {
-    if progress.is_active() {
-        let done_b = progress.done_batches.load(Ordering::Relaxed);
-        let total_b = progress.total_batches.load(Ordering::Relaxed);
-        format!("{message} (indexing {}% — {done_b}/{total_b} batches)", progress.percent())
-    } else {
-        message
-    }
-}
 
 /// Poll-back hint (ms) for a not-ready `search_code` response. Index build and overlay
 /// warmup advance on a multi-second cadence, so a sub-second retry just spins.
@@ -47,18 +33,8 @@ pub(crate) fn search_not_ready(
     progress: &IndexProgress,
     action: &str,
 ) -> CallToolResult {
-    let mut prog = json!({ "active": progress.is_active() });
-    if progress.is_active() {
-        prog["pct"] = json!(progress.percent());
-        prog["batches"] = json!({
-            "done": progress.done_batches.load(Ordering::Relaxed),
-            "total": progress.total_batches.load(Ordering::Relaxed),
-        });
-        prog["chunks"] = json!({
-            "done": progress.done_chunks.load(Ordering::Relaxed),
-            "total": progress.total_chunks.load(Ordering::Relaxed),
-        });
-    }
+    let snapshot = progress.snapshot();
+    let prog = crate::indexing::legacy_progress(snapshot.as_ref());
     structured(json!({
         "action": action,
         "schema_version": super::types::search_schema_version(action),
@@ -398,10 +374,9 @@ pub(super) fn search_status_with_cap(
                 }
                 WorkspaceSearchMode::SqliteLocal => "syncing local semantic index".to_owned(),
             },
-            SemanticRuntimeStatus::Indexing => with_index_progress(
-                "building local semantic index in background".to_owned(),
-                progress,
-            ),
+            SemanticRuntimeStatus::Indexing => {
+                "building local semantic index in background".to_owned()
+            }
             SemanticRuntimeStatus::Ready => match workspace_search_mode {
                 WorkspaceSearchMode::PostgresRemoteOverlay => {
                     if semantic {
@@ -671,27 +646,8 @@ pub(super) fn search_status_with_cap(
         }
     }
 
-    // Always surface a progress signal while the index is building (engine not yet ready)
-    // or an overlay re-index is active — never a bare "building" line with nothing to poll.
-    // Live counters are shown ONLY while `active` (a build is genuinely counting); an
-    // inactive build object can hold stale totals from a finished/failed attempt (it is
-    // never reset()), so we report a phase line instead of misleading numbers.
-    // Genuinely building = we held the lock but the engine was not yet published. A busy timeout
-    // (no guard) is reported separately above as "Local index: busy", not as initializing.
-    if progress.is_active() {
-        let total = progress.total_chunks.load(Ordering::Relaxed);
-        let done = progress.done_chunks.load(Ordering::Relaxed);
-        let total_b = progress.total_batches.load(Ordering::Relaxed);
-        let done_b = progress.done_batches.load(Ordering::Relaxed);
-        let pct = progress.percent();
-
-        let _ = writeln!(out);
-        let _ = writeln!(out, "Indexing in progress: {pct}%");
-        let _ = writeln!(out, "  Batches:  {done_b}/{total_b}");
-        let _ = writeln!(out, "  Chunks:   {done}/{total}");
-    } else if index_building {
-        let _ = writeln!(out);
-        let _ = writeln!(out, "Indexing pending: initializing (no live counters yet)");
+    if index_building && !progress.is_active() {
+        let _ = writeln!(out, "\nIndexing pending: initializing (no live counters yet)");
     }
 
     let _ = writeln!(out);
@@ -715,7 +671,7 @@ pub(super) fn search_status_with_cap(
         out,
         json!({
             "action": "status",
-            "schema_version": "1",
+            "schema_version": "2",
             "profile": profile.as_str(),
             "state": state,
         }),
@@ -958,9 +914,7 @@ mod workspace_changes_tests {
 #[cfg(test)]
 mod tests {
     use super::super::test_support::unreachable_workspace_service;
-    use super::{
-        baseline_warming_not_ready, search_status, search_status_with_cap, with_index_progress,
-    };
+    use super::{baseline_warming_not_ready, search_status, search_status_with_cap};
     use crate::baseline::{
         ConfiguredBaselineStatus, ExternalBaselineState, ExternalBaselineStatus,
     };
@@ -968,7 +922,6 @@ mod tests {
     use bsl_search::{Document, IndexProgress, SearchEngine};
     use rmcp::model::ErrorCode;
     use std::fs;
-    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Barrier, Mutex};
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
@@ -1052,21 +1005,6 @@ mod tests {
                 .pending_dirty_paths,
             1,
             "status is a pure snapshot even when a refresh could consume the mark"
-        );
-    }
-
-    #[test]
-    fn index_progress_suffix_appended_only_when_active() {
-        let progress = IndexProgress::new();
-        assert_eq!(with_index_progress("building".to_owned(), &progress), "building");
-        progress.active.store(true, Ordering::Relaxed);
-        progress.total_chunks.store(100, Ordering::Relaxed);
-        progress.done_chunks.store(77, Ordering::Relaxed);
-        progress.total_batches.store(10, Ordering::Relaxed);
-        progress.done_batches.store(7, Ordering::Relaxed);
-        assert_eq!(
-            with_index_progress("building".to_owned(), &progress),
-            "building (indexing 77% — 7/10 batches)",
         );
     }
 
@@ -1263,6 +1201,7 @@ mod tests {
                 selection: "branch main".to_owned(),
                 resolved: None,
                 state: ExternalBaselineState::Error("connection refused".to_owned()),
+                semantic_details: None,
             },
             Duration::from_secs(1),
         );
@@ -1396,11 +1335,10 @@ mod tests {
         engine.index_directory_fts(workspace).unwrap();
         engine.set_workspace_root(workspace);
         let progress = Arc::new(IndexProgress::default());
-        progress.active.store(true, Ordering::Relaxed);
-        progress.total_chunks.store(200, Ordering::Relaxed);
-        progress.done_chunks.store(50, Ordering::Relaxed);
-        progress.total_batches.store(20, Ordering::Relaxed);
-        progress.done_batches.store(5, Ordering::Relaxed);
+        let _pass = progress.begin_pass();
+        let token = _pass.token();
+        token.set_totals(0, 200, 20);
+        token.advance(50, 5);
         let result = search_status(
             crate::McpProfile::Workspace,
             &crate::state::shared_engine(Some(engine)),
@@ -1422,7 +1360,7 @@ mod tests {
         assert!(text.contains("Search index: ready"));
         assert!(text.contains("overlay syncing") && text.contains("queues behind the sync"));
         assert!(text.contains("Semantic: syncing local overlay embeddings against remote baseline"));
-        assert!(text.contains("Indexing in progress: 25%"));
+        assert!(!text.contains("Indexing in progress: 25%"), "boundary owns counter rendering");
     }
 
     #[test]

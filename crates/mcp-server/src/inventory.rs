@@ -658,6 +658,7 @@ const WAITS: &[(&str, &str, &str, Waiting)] = &[
     ("state/embed.rs", "run_overlay_warmup", "acquire_for_owner(", Waiting::Owner),
     ("state/embed.rs", "run_overlay_warmup", "acquire_for_owner(", Waiting::Owner),
     ("state/embed.rs", "spawn_embed_pass", "acquire_for_owner(", Waiting::Owner),
+    ("state/embed.rs", "spawn_embed_pass", "acquire_for_owner(", Waiting::Owner),
     ("state/mod.rs", "apply_workspace_search", "acquire_for_owner(", Waiting::Owner),
     ("state/mod.rs", "apply_workspace_search_checkpointed", "acquire_for_owner(", Waiting::Owner),
     // `OwnerStop::sleep` itself: the primitive every retry pause is built on.
@@ -783,6 +784,8 @@ fn the_test_only_modules_are_the_ones_the_parent_gates() {
         [
             "diagnostics_state/test_support.rs",
             "graph/test_support.rs",
+            "indexing_runtime_tests.rs",
+            "state/indexing_tests.rs",
             "state/test_support.rs",
             "tools/search/cancel_tests.rs",
             "tools/search/test_support.rs",
@@ -1038,6 +1041,9 @@ fn the_reason_codes_clients_see_are_the_frozen_set() {
     let needle = ["reason_code", ": \""].concat();
     let mut found: Vec<String> = Vec::new();
     for path in production_sources() {
+        if is_test_only_module(&path) {
+            continue;
+        }
         let source = production_source(&std::fs::read_to_string(&path).expect("source"));
         let mut rest = source.as_str();
         while let Some(at) = rest.find(&needle) {

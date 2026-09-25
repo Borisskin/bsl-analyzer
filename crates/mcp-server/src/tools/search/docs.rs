@@ -293,7 +293,7 @@ mod tests {
         assert!(text.starts_with("#1 ["), "text listing unchanged: {text}");
 
         let body = result.structured_content.as_ref().expect("structured listing");
-        assert_eq!(body["schema_version"], "4");
+        assert_eq!(body["schema_version"], "5");
         assert_eq!(body["action"], "find_docs");
         let hits = body["hits"].as_array().expect("hits array");
         assert_eq!(hits[0]["rank"], 1);

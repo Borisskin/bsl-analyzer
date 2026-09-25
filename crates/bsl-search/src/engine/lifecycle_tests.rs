@@ -44,7 +44,10 @@ fn capture_level(level: tracing::level_filters::LevelFilter, f: impl FnOnce()) -
 }
 
 /// Finite local fake: returns exactly the requests the test expects, with no model/provider.
-fn server(requests: usize) -> (Embedder, std::thread::JoinHandle<Vec<String>>) {
+fn server(
+    requests: usize,
+    mut observe: impl FnMut() + Send + 'static,
+) -> (Embedder, std::thread::JoinHandle<Vec<String>>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let thread = std::thread::spawn(move || {
@@ -71,6 +74,7 @@ fn server(requests: usize) -> (Embedder, std::thread::JoinHandle<Vec<String>>) {
                     break serde_json::from_slice::<Value>(&bytes[split + 4..]).unwrap();
                 }
             };
+            observe();
             let inputs = body["input"].as_array().unwrap();
             submitted.extend(inputs.iter().map(|text| text.as_str().unwrap().to_owned()));
             let data: Vec<_> = (0..inputs.len())
@@ -166,7 +170,7 @@ fn vector_lifecycle_partial_resume_only_submits_pending_then_warm_skip() {
     let store = seed(&path, 1, 2);
     let preserved = store.load_all_embeddings(3).unwrap()[0].clone();
     drop(store);
-    let (embedder, requests) = server(2);
+    let (embedder, requests) = server(2, || {});
     let records = capture(|| {
         let store = Store::open_existing(&path).unwrap();
         let (index, outcome) = SearchEngine::run_embedding_pass(
@@ -219,7 +223,7 @@ fn vector_lifecycle_refusal_and_failure_retain_earlier_committed_batch() {
     for failed in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let store = seed(&dir.path().join("search.db"), 0, 2);
-        let (embedder, requests) = server(2);
+        let (embedder, requests) = server(2, || {});
         let mut commits = 0;
         let records = capture(|| {
             let result = SearchEngine::run_embedding_pass(
@@ -414,4 +418,70 @@ fn vector_lifecycle_bulk_removal_bounds_info_and_retains_commits_before_refusal(
         assert_eq!(terminal["committed_totals"]["sqlite_vectors_removed"], removed);
         assert_eq!(engine.store().load_all_embeddings(3).unwrap().len(), 257 - removed);
     }
+}
+
+#[test]
+fn indexing_pass_lifecycle_sync_counts_batches_per_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let progress = IndexProgress::new();
+    let observer = Arc::clone(&progress);
+    let (embedder, requests) = server(3, move || {
+        let sample = observer.snapshot().unwrap();
+        let counters = sample.counters.expect("each file batch retains the coherent sample");
+        assert_eq!(counters.total_chunks, Some(3));
+        assert_eq!(counters.total_batches, Some(3));
+        assert_eq!(counters.done_chunks, counters.done_batches);
+    });
+    let mut engine = SearchEngine::fts_only(&dir.path().join("search.db")).unwrap();
+    engine.embedder = Some(embedder);
+    engine.dim = 3;
+    engine.batch_size = 8;
+    let documents: Vec<_> = (0..3)
+        .map(|i| crate::IndexedDocument {
+            collection: "code".into(),
+            root_id: "".into(),
+            path: format!("M{i}.bsl"),
+            symbol_name: format!("Method{i}"),
+            kind: "procedure".into(),
+            line_start: 1,
+            line_end: 2,
+            text: format!("Процедура Method{i}() КонецПроцедуры"),
+            content_hash: format!("hash{i}"),
+            graph_context: None,
+        })
+        .collect();
+    engine.sync_indexed_documents_in_collection("code", &documents, Some(&progress)).unwrap();
+    assert_eq!(requests.join().unwrap().len(), 3);
+    assert_eq!(progress.snapshot().unwrap().state, IndexPassState::Ready);
+}
+
+#[test]
+fn indexing_pass_lifecycle_directory_and_documents_own_complete_attempts() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("M.bsl"), "Процедура One()\nКонецПроцедуры").unwrap();
+    let progress = IndexProgress::new();
+    let observer = Arc::clone(&progress);
+    let (embedder, requests) = server(2, move || {
+        let sample = observer.snapshot().unwrap();
+        assert!(sample.active);
+        assert_eq!(sample.state, IndexPassState::Running);
+        assert_eq!(sample.phase, Some(IndexPhase::Embedding));
+        assert_eq!(sample.counters.unwrap().total_chunks, Some(1));
+    });
+    let mut engine = SearchEngine::fts_only(&dir.path().join("search.db")).unwrap();
+    engine.embedder = Some(embedder);
+    engine.dim = 3;
+    engine.concurrency = 1;
+    engine.index_directory(dir.path(), Some(&progress)).unwrap();
+    let first = progress.snapshot().unwrap();
+    assert_eq!(first.state, IndexPassState::Ready);
+    assert!(!first.active);
+    let docs =
+        [Document { title: "One".into(), body: "Reference text".into(), kind: "type".into() }];
+    engine.index_documents("platform", "docs", b"v1", &docs, Some(&progress)).unwrap();
+    let second = progress.snapshot().unwrap();
+    assert_eq!(second.state, IndexPassState::Ready);
+    assert!(!second.active);
+    assert_ne!(first.pass_id, second.pass_id);
+    assert_eq!(requests.join().unwrap().len(), 2);
 }
