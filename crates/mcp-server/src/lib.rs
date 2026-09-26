@@ -1833,7 +1833,10 @@ impl McpServer {
         let outcome = resident_call(diag, ct, move |session| {
             let source = match (&snapshot, graph_state) {
                 (Some(snapshot), ide::ProviderState::Answered) => {
-                    crate::graph_query::GraphNameSource::answering(&snapshot.graph)
+                    crate::graph_query::GraphNameSource::answering(
+                        &snapshot.graph,
+                        snapshot.workspace_roots(),
+                    )
                 }
                 (_, state) => crate::graph_query::GraphNameSource::absent(state),
             };
@@ -2023,7 +2026,7 @@ impl McpServer {
                         ));
                     }
                     let budget = p.max_output_tokens.unwrap_or(4000);
-                    tools::graph::source(gdb, &p.ids, budget)
+                    tools::graph::source(gdb, &p.ids, budget, roots)
                 }
                 action @ ("neighbors" | "callers" | "callees") => {
                     let id = require(p.id, "id", action)?;
@@ -2243,7 +2246,10 @@ impl McpServer {
                         let symbol = symbol.as_deref().unwrap_or_default();
                         let source = match (&snapshot, graph_state) {
                             (Some(snapshot), ide::ProviderState::Answered) => {
-                                crate::graph_query::GraphNameSource::answering(&snapshot.graph)
+                                crate::graph_query::GraphNameSource::answering(
+                                    &snapshot.graph,
+                                    snapshot.workspace_roots(),
+                                )
                             }
                             (_, state) => crate::graph_query::GraphNameSource::absent(state),
                         };
@@ -2351,7 +2357,10 @@ impl McpServer {
                 let graph_state = graph_provider_state(&graph.status(), snapshot.is_some());
                 let graph_source = match (&snapshot, graph_state) {
                     (Some(snapshot), ide::ProviderState::Answered) => {
-                        crate::graph_query::GraphNameSource::answering(&snapshot.graph)
+                        crate::graph_query::GraphNameSource::answering(
+                            &snapshot.graph,
+                            snapshot.workspace_roots(),
+                        )
                     }
                     (_, state) => crate::graph_query::GraphNameSource::absent(state),
                 };

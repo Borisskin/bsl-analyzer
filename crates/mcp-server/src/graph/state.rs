@@ -444,6 +444,9 @@ pub(crate) struct GraphState {
     /// read the same either way.
     #[cfg(test)]
     pub(super) builders_started: Arc<AtomicUsize>,
+    /// Whole graph builders actually entered, independently of their loader thread.
+    #[cfg(test)]
+    pub(super) full_builds_started: Arc<AtomicUsize>,
     /// Reconciles delivered to this ledger by a consumer that records without deciding — the
     /// watcher. A stand waits on this to know a delivery has happened at all, which a ledger
     /// that correctly recognises the loss as one it already acted on cannot show by itself.
@@ -557,6 +560,8 @@ impl GraphState {
             loader_cannot_spawn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             builders_started: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            full_builds_started: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             quiet_losses: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
@@ -1695,17 +1700,19 @@ impl GraphState {
         topology_changed: bool,
         roots_refresh_requested: bool,
     ) -> GraphPublishOutcome {
-        let (topology, workspace_roots) = lock_recover(&self.inner)
+        let (revision, fingerprint, workspace_roots) = lock_recover(&self.inner)
             .published
             .as_ref()
-            .map(|p| (p.fingerprint.topology, p.search_roots.clone()))
-            .unwrap_or_default();
+            .map(|p| (p.generation, p.fingerprint, p.search_roots.clone()))
+            .unwrap_or((0, crate::graph_db::GraphFp::default(), None));
         match &self.on_published {
             Some(hook) => hook(GraphPublishSignal {
                 drift_pending: self.drift_pending(),
                 mark_bound,
                 topology_changed,
-                topology,
+                topology: fingerprint.topology,
+                revision,
+                fingerprint,
                 roots_refresh_requested,
                 workspace_roots,
             }),
@@ -2800,7 +2807,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
             sample_workspace(root);
-            let hub = crate::change_hub::WorkspaceChangeHub::start(vec![root.to_path_buf()]);
+            let hub = crate::graph::test_support::workspace_hub(root);
             assert!(hub.wait_until_watching(Duration::from_secs(5)));
 
             let late_fact = Arc::new(AtomicI64::new(-1));
@@ -3301,7 +3308,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         sample_workspace(root);
-        let hub = crate::change_hub::WorkspaceChangeHub::start(vec![root.to_path_buf()]);
+        let hub = crate::graph::test_support::workspace_hub(root);
         assert!(hub.wait_until_watching(Duration::from_secs(5)));
         let graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
         graph.set_watch(super::super::watcher::WatchPhase::Running, None);
@@ -3344,7 +3351,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         sample_workspace(root);
-        let hub = crate::change_hub::WorkspaceChangeHub::start(vec![root.to_path_buf()]);
+        let hub = crate::graph::test_support::workspace_hub(root);
         assert!(hub.wait_until_watching(Duration::from_secs(5)));
 
         let delivered = Arc::new(AtomicI64::new(-1));
@@ -3392,8 +3399,16 @@ mod tests {
         graph.ensure_loading();
         wait_ready(&graph);
 
-        // A comparison is owed, and running it is what opens the window above.
-        graph.record_change_quietly(graph.observation());
+        // A real post-publication fact makes a comparison owed, and running it is what opens
+        // the window above. The file is outside the scan universe: it changes the hub frontier
+        // without changing the build fingerprint.
+        let watermark = graph
+            .consuming_observation()
+            .expect("the fixture needs a publication that observed the fact stream");
+        let issued_after = hub.seq().max(watermark);
+        std::fs::write(root.join("unscanned.txt"), "a change no scan reads").unwrap();
+        let fact = super::super::test_support::wait_for_hub_seq_above(&hub, issued_after);
+        graph.record_change_quietly(fact);
         graph.drive();
 
         let late = delivered.load(Ordering::SeqCst);
@@ -3438,7 +3453,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         sample_workspace(root);
-        let hub = crate::change_hub::WorkspaceChangeHub::start(vec![root.to_path_buf()]);
+        let hub = crate::graph::test_support::workspace_hub(root);
         assert!(hub.wait_until_watching(Duration::from_secs(5)));
 
         let delivered = Arc::new(AtomicI64::new(-1));
@@ -4196,7 +4211,7 @@ mod tests {
         wait_until(&graph, "the watcher's boot nudge to settle", || !graph.drift_pending());
         assert_eq!(graph.status_report().stale, Some(false), "a fresh build is not stale");
 
-        graph.record_change_quietly(graph.observation());
+        graph.record_change_quietly(graph.observation() + 1);
 
         assert_eq!(
             graph.status_report().stale,
@@ -6628,7 +6643,7 @@ mod tests {
             .prepare_snapshot_pool(published.0, published.1, published.2)
             .expect("the published artefact prepares");
         assert_eq!(
-            prepared.declared_unread().map(<[String]>::len),
+            prepared.declared_unread().map(|keys| keys.len()),
             Some(1),
             "the strict reader returns what the build actually could not read",
         );
@@ -6656,7 +6671,7 @@ mod tests {
             corrupt(sql);
             let prepared = graph.prepare_snapshot_pool(published.0, published.1, published.2);
             let declared = match &prepared {
-                Ok(prepared) => prepared.declared_unread().map(<[String]>::to_vec),
+                Ok(prepared) => prepared.declared_unread().map(|keys| keys.to_vec()),
                 // A pool that will not prepare at all is the same answer: nothing known.
                 Err(_) => None,
             };
@@ -6962,11 +6977,11 @@ mod tests {
 
     /// A module reached through a real symlink is required by the walk that listed it.
     ///
-    /// The database records canonical addresses, and a descendant reached through a link
-    /// canonicalises OUTSIDE the declared roots. Asked only whether the roots still cover that
-    /// address, a validated declaration answers "no" — and the obligation the very same
-    /// artefact declares unread would be retired as a root that had gone away, re-registered
-    /// from the same list, and paid for again on the next pass.
+    /// The durable recovery key keeps the walked spelling from the same traversal. A descendant
+    /// reached through a link therefore remains under the declared source root even when its
+    /// canonical target is outside that root. Recovery must ask coverage about that walked key,
+    /// or the obligation the very same artefact declares unread would be retired as a root that
+    /// had gone away, re-registered from the same list, and paid for again on the next pass.
     #[cfg(unix)]
     #[test]
     fn a_module_reached_through_a_symlink_is_not_a_root_that_went_away() {
@@ -7005,9 +7020,14 @@ mod tests {
         let declared = super::super::snapshot::recovery_scope_of(
             &super::super::input::ProjectSnapshot::load(&root),
         );
+        let expected = root.join("src/CommonModules/Связь/Ext/Module.bsl");
         assert!(
-            !declared.requires(&key),
-            "the fixture needs an address the declared roots do not cover: {key}",
+            std::path::Path::new(&key) == expected.as_path(),
+            "the recovery key must keep the walked alias: {key}",
+        );
+        assert!(
+            declared.requires(&key),
+            "the declared source root must cover the walked alias: {key}",
         );
 
         // A real rebuild: the walk lists it, the artefact declares it unread, and it is
@@ -7541,16 +7561,14 @@ mod tests {
     /// same obligations and prove nothing about the patch.
     ///
     /// The eligibility gates are production's own and are not bent here. What the run below
-    /// actually shows: a module the last full build could not read becomes readable AND is
-    /// edited, and that edit does take the point path — the patch rewrites it and answers its
-    /// obligation. What does NOT reach this path is a healing measured by a probe: that makes
-    /// the reload forced, and a forced reload never looks at the point path at all. Which
-    /// branch ran is recorded rather than assumed.
-    #[cfg(unix)]
+    /// actually shows: the ledger starts with two synthetic unread obligations after a fully
+    /// readable initial publication, and a body edit of one of them takes the point path — the
+    /// patch rewrites it and answers its obligation. What does NOT reach this path is a healing
+    /// measured by a probe: that makes the reload forced, and a forced reload never looks at the
+    /// point path at all. Which branch ran is recorded rather than assumed.
     #[test]
     fn a_point_patch_answers_what_it_rewrote_and_nothing_else() {
         use super::super::test_support::{wait_publish_pass_within, WAIT_CEILING};
-        use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -7568,22 +7586,32 @@ mod tests {
         let hidden = root.join("CommonModules").join("Клиент").join("Ext").join("Module.bsl");
         let other = root.join("CommonModules").join("Полный0").join("Ext").join("Module.bsl");
         let edited = root.join("CommonModules").join("Полный1").join("Ext").join("Module.bsl");
-        let restore = RestoredModes::of(&[&hidden, &other]);
-        for module in [&hidden, &other] {
-            fs::set_permissions(module, fs::Permissions::from_mode(0o000)).unwrap();
-        }
-        if fs::read(&hidden).is_ok() {
-            eprintln!("skipping: mode 0o000 is not an obstacle for this user");
-            return;
-        }
 
-        let hub = crate::change_hub::WorkspaceChangeHub::start(vec![root.to_path_buf()]);
+        let hub = crate::graph::test_support::workspace_hub(root);
         assert!(hub.wait_until_watching(Duration::from_secs(5)));
         let graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
         graph.set_watch(super::super::watcher::WatchPhase::Running, None);
         graph.ensure_loading();
         wait_ready(&graph);
         wait_publish_pass_within(&graph, WAIT_CEILING, 1);
+        let generation = |graph: &GraphState| {
+            lock_recover(&graph.inner).published.as_ref().map(|p| p.generation).unwrap_or(0)
+        };
+        let initial_generation = generation(&graph);
+        lock_recover(&graph.debt).record_publication(
+            Instant::now(),
+            Some(graph.observation()),
+            false,
+            None,
+            super::super::debt::RecoveryPublicationProof {
+                generation: initial_generation,
+                declared_unread: Some(vec![
+                    hidden.to_string_lossy().into_owned(),
+                    other.to_string_lossy().into_owned(),
+                ]),
+                ..Default::default()
+            },
+        );
         let outstanding = |graph: &GraphState| -> Vec<String> {
             let mut keys: Vec<String> = lock_recover(&graph.debt)
                 .outstanding_recovery()
@@ -7594,10 +7622,7 @@ mod tests {
             keys.sort();
             keys
         };
-        assert_eq!(outstanding(&graph).len(), 2, "two unreadable modules, two obligations");
-        let generation = |graph: &GraphState| {
-            lock_recover(&graph.inner).published.as_ref().map(|p| p.generation).unwrap_or(0)
-        };
+        assert_eq!(outstanding(&graph).len(), 2, "two synthetic unread obligations");
 
         // A body-only edit of a module nobody is owed anything about: the point path is
         // eligible, and this is what a real patch looks like.
@@ -7623,14 +7648,12 @@ mod tests {
             "a patch that rewrote something else answered an obligation it never looked at",
         );
 
-        // And what it CAN answer: an address it actually rewrote. The unreadable module
-        // becomes readable and is edited, so an ordinary drift — not a measured healing —
-        // brings it into the patch's own rewritten set.
+        // And what it CAN answer: an obligated address it actually rewrote. An ordinary drift
+        // — not a measured healing — brings it into the patch's own rewritten set.
         lock_recover(&graph.incremental_decisions).clear();
         let at = generation(&graph);
         let passes = graph.publish_passes.load(Ordering::SeqCst);
         let observed = hub.seq();
-        fs::set_permissions(&other, fs::Permissions::from_mode(0o755)).unwrap();
         fs::write(&other, "&НаСервере\nФункция Взять() Экспорт Возврат 3; КонецФункции").unwrap();
         crate::graph::test_support::wait_for_hub_seq_above(&hub, observed);
         graph.nudge_rebuild();
@@ -7657,7 +7680,6 @@ mod tests {
             graph.owes_recovery(),
             "the chain stands while an address nobody has read is still outstanding",
         );
-        drop(restore);
     }
 
     /// The marks' cap and the recovery workload are two different bounds, and retirement
@@ -7677,7 +7699,7 @@ mod tests {
         sample_workspace(root);
         // A real hub, so the facts the marks are placed for are real positions rather than
         // the no-stream sentinel a workspace without one reports.
-        let hub = crate::change_hub::WorkspaceChangeHub::start(vec![root.to_path_buf()]);
+        let hub = crate::graph::test_support::workspace_hub(root);
         assert!(hub.wait_until_watching(Duration::from_secs(5)));
         let graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
         graph.set_watch(super::super::watcher::WatchPhase::Running, None);

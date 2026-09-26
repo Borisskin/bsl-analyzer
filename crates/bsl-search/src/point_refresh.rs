@@ -562,6 +562,7 @@ mod tests {
         engine.initialize_workspace_overlay_clean().unwrap();
         edit_and_mark(&engine, &cf, "Module.bsl", "Процедура Корни() Экспорт\nКонецПроцедуры\n");
         let mut batch = prepare(&engine);
+        fs::write(cf.join("Module.bsl"), "Процедура Текущие() Экспорт\nКонецПроцедуры\n").unwrap();
 
         let epoch = engine.workspace_roots_epoch();
         engine.set_workspace_roots(crate::WorkspaceRoots::build(workspace, &cf, &[ext]).0);
@@ -569,6 +570,7 @@ mod tests {
 
         assert_eq!(engine.publish_point_refresh(&mut batch).unwrap(), PointPublish::Discarded);
         assert!(!found(&engine, "Корни"), "a batch from the old roots published");
+        assert!(found(&engine, "Текущие"), "the roots transition indexed the current body");
     }
 
     /// A store fault while phase B reads the baseline leaves every mark, and every failure

@@ -741,7 +741,7 @@ impl SharedState {
             }
             let snapshot_paths: Vec<_> =
                 class.xml_paths.iter().map(|path| path.raw.clone()).collect();
-            match Self::resolve_referencing_module_files(graph, &snapshot_paths) {
+            match Self::resolve_referencing_module_files(graph, &snapshot_paths, roots.as_ref()) {
                 ReferencingFilesOutcome::Applied(paths) => plan.context_paths.extend(paths),
                 ReferencingFilesOutcome::OperationError(error) => {
                     plan.snapshot_outcome = Some(SnapshotPreparationOutcome::OperationError(error));
@@ -900,7 +900,22 @@ impl SharedState {
         _graph: &GraphState,
     ) -> super::WorkspaceSearchApply<bool, bsl_search::SearchError> {
         if matches!(plan.snapshot_outcome, Some(SnapshotPreparationOutcome::TransientRefusal)) {
-            match Self::resolve_referencing_module_files(_graph, &plan.snapshot_paths) {
+            let roots = match shared.acquire_for_owner(stop) {
+                Ok(guard) => guard.as_ref().and_then(|engine| engine.workspace_roots().cloned()),
+                Err(crate::tools::search::OwnerLockRefused::Closing) => {
+                    return super::WorkspaceSearchApply::Stopping;
+                }
+                Err(crate::tools::search::OwnerLockRefused::Poisoned) => {
+                    return super::WorkspaceSearchApply::OperationError(
+                        bsl_search::SearchError::Index("search engine lock poisoned".to_owned()),
+                    );
+                }
+            };
+            match Self::resolve_referencing_module_files(
+                _graph,
+                &plan.snapshot_paths,
+                roots.as_ref(),
+            ) {
                 ReferencingFilesOutcome::Applied(paths) => {
                     plan.context_paths.extend(paths);
                     // The readers only became known now, so the arming decision that was made
@@ -1058,6 +1073,7 @@ impl SharedState {
     fn resolve_referencing_module_files(
         graph: &GraphState,
         xml_paths: &[PathBuf],
+        fallback_roots: Option<&bsl_search::WorkspaceRoots>,
     ) -> ReferencingFilesOutcome {
         use crate::workspace_lease::{LeaseOperationError, LeaseOperationOutcome};
 
@@ -1095,8 +1111,11 @@ impl SharedState {
             LeaseOperationOutcome::Superseded => return ReferencingFilesOutcome::Superseded,
             LeaseOperationOutcome::Released => return ReferencingFilesOutcome::Released,
         };
+        let Some(roots) = snapshot.workspace_roots().or(fallback_roots) else {
+            return ReferencingFilesOutcome::TransientRefusal;
+        };
         for mdo_id in mdo_ids {
-            match snapshot.graph.referencing_files(&mdo_id) {
+            match snapshot.graph.referencing_files(&mdo_id, Some(roots)) {
                 Ok(found) => files.extend(found.into_iter().map(PathBuf::from)),
                 Err(error) => {
                     return ReferencingFilesOutcome::OperationError(format!(
@@ -3583,6 +3602,8 @@ mod tests {
         )
         .expect("graph builds");
         let graph = crate::graph::GraphState::for_workspace(workspace.clone());
+        // A cached graph can publish before its root table. The search table must resolve
+        // its stored keys in this case, rather than losing every referencing module.
         graph.adopt_prebuilt(1, crate::graph_db::GraphFp::default(), summary.modules, None);
 
         let mut engine = SearchEngine::fts_only(&db_path).unwrap();
@@ -4338,7 +4359,12 @@ mod tests {
             )
             .expect("graph builds");
             let graph = crate::graph::GraphState::for_workspace(workspace.to_path_buf());
-            graph.adopt_prebuilt(1, crate::graph_db::GraphFp::default(), summary.modules, None);
+            graph.adopt_prebuilt(
+                1,
+                crate::graph_db::GraphFp::default(),
+                summary.modules,
+                project.search_roots.clone(),
+            );
 
             let engine = engine_over(&dir.join("search.db"), workspace, &configuration, &extension);
             drift(&engine, &xml, &graph);

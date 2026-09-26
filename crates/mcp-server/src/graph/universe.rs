@@ -7,9 +7,8 @@
 //! lossy string, and both filter BEFORE de-duplicating — the order the old code
 //! used, which decides who survives when several spellings collapse into one key.
 
-use std::collections::HashSet;
-use std::path::PathBuf;
-use std::time::UNIX_EPOCH;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use project_model::{file_role::FileRole, SourceSet};
 use vfs::FileId;
@@ -40,23 +39,33 @@ use super::scan::FileStat;
 pub(crate) struct ScanVerdict {
     unreadable: usize,
     canonical_fallbacks: usize,
+    content_unreadable: usize,
 }
 
 impl ScanVerdict {
     /// The only way a verdict comes into being: read off a walk that produced it.
     pub(crate) fn of(set: &SourceSet) -> ScanVerdict {
-        ScanVerdict { unreadable: set.unreadable, canonical_fallbacks: set.canonical_fallbacks }
+        ScanVerdict {
+            unreadable: set.unreadable,
+            canonical_fallbacks: set.canonical_fallbacks,
+            content_unreadable: 0,
+        }
+    }
+
+    pub(crate) fn with_content_unreadable(mut self, count: usize) -> ScanVerdict {
+        self.content_unreadable = count;
+        self
     }
 
     /// A verdict stated outright, for tests about what a consumer DOES with one.
     #[cfg(test)]
     pub(crate) fn for_test(unreadable: usize, canonical_fallbacks: usize) -> ScanVerdict {
-        ScanVerdict { unreadable, canonical_fallbacks }
+        ScanVerdict { unreadable, canonical_fallbacks, content_unreadable: 0 }
     }
 
     /// Whether this walk may speak for the whole tree — see [`SourceSet::clean`].
     pub(crate) fn clean(&self) -> bool {
-        self.coverage_complete() && self.identity_exact()
+        self.coverage_complete() && self.identity_exact() && self.content_unreadable == 0
     }
 
     /// Nothing was hidden from the walk, so a file it did not list is genuinely
@@ -80,9 +89,15 @@ impl ScanVerdict {
 pub(crate) struct ScannedUniverse {
     /// The `.bsl` enumeration — see [`bsl_files_from`].
     pub(crate) files: Vec<(FileId, PathBuf)>,
-    /// The `.bsl` + `.xml` stats rows — see [`file_stats_from`].
+    /// The `.bsl` + `.xml` stats rows — see [`file_stats_with_content_errors`].
     pub(crate) stats: Vec<FileStat>,
+    /// The walked spelling of each retained stat in this exact scan. The
+    /// graph keeps canonical source paths for reading, but durable root attribution
+    /// needs the walked alias when a symlink target lies outside the registered roots.
+    walked_by_canonical: HashMap<PathBuf, PathBuf>,
     verdict: ScanVerdict,
+    /// How many files this walk read rather than reusing a remembered hash.
+    pub(crate) hashed_files: usize,
 }
 
 impl ScannedUniverse {
@@ -97,11 +112,26 @@ impl ScannedUniverse {
     /// [`Self::scan`] without descending into `excluded`.
     pub(crate) fn scan_excluding(roots: &[PathBuf], excluded: &[PathBuf]) -> ScannedUniverse {
         let set = SourceSet::scan_excluding(roots, excluded);
-        ScannedUniverse {
+        let ContentScan { stats, content_unreadable: unreadable, hashed } =
+            file_stats_with_content_errors(&set, roots);
+        let walked_by_canonical =
+            stats.iter().map(|stat| (stat.canonical.clone(), stat.walked.clone())).collect();
+        // The content pass is part of the same walk's authority. A listed
+        // file that could not be hashed must keep the snapshot dirty; it is
+        // never equivalent to an empty or deleted input.
+        let universe = ScannedUniverse {
             files: bsl_files_from(&set),
-            stats: file_stats_from(&set),
-            verdict: ScanVerdict::of(&set),
-        }
+            stats,
+            walked_by_canonical,
+            verdict: ScanVerdict::of(&set).with_content_unreadable(unreadable),
+            hashed_files: hashed,
+        };
+        tracing::debug!(
+            files = universe.stats.len(),
+            hashed = universe.hashed_files,
+            "graph scan read file contents"
+        );
+        universe
     }
 
     /// Whether the walk behind these projections may speak for the whole tree —
@@ -110,6 +140,40 @@ impl ScannedUniverse {
     /// against one.
     pub(crate) fn clean(&self) -> bool {
         self.verdict.clean()
+    }
+
+    /// The walked spelling paired with a canonical path in this scan, if the path
+    /// was present in the universe.
+    pub(crate) fn walked_path_for(&self, canonical: &Path) -> Option<&Path> {
+        self.walked_by_canonical.get(canonical).map(PathBuf::as_path)
+    }
+
+    /// Resolve every graph-relevant row through the roots and expose aliases under
+    /// both canonical and walked spellings. Node rows use the walked spelling, while
+    /// unread reports and file rows may still carry the canonical one.
+    pub(crate) fn file_key_aliases(
+        &self,
+        roots: &bsl_search::WorkspaceRoots,
+    ) -> Option<rustc_hash::FxHashMap<String, bsl_search::FileKey>> {
+        let mut aliases = rustc_hash::FxHashMap::default();
+        for stat in &self.stats {
+            let key = stat.key(roots)?;
+            aliases.insert(stat.path.replace('\\', "/"), key.clone());
+            aliases.insert(stat.path.clone(), key.clone());
+            aliases.insert(stat.walked.to_string_lossy().replace('\\', "/"), key);
+        }
+        Some(aliases)
+    }
+
+    /// Resolve a canonical path from this scan using the walked spelling retained
+    /// for it. This is used for unread files whose loader reports the canonical path.
+    pub(crate) fn key_for_path(
+        &self,
+        roots: &bsl_search::WorkspaceRoots,
+        canonical: &Path,
+    ) -> Option<bsl_search::FileKey> {
+        let walked = self.walked_path_for(canonical)?;
+        roots.root_of(walked, canonical)
     }
 }
 
@@ -135,12 +199,19 @@ pub(crate) fn bsl_files_from(set: &SourceSet) -> Vec<(FileId, PathBuf)> {
 }
 
 /// The `.bsl` + `.xml` universe in stats shape: `(canonical lossy string, mtime,
-/// len)` rows, first occurrence of each STRING winning — the stats scan has always
-/// keyed by the converted string, so two canonical paths that collapse into one
-/// lossy spelling still yield one row.
+/// len, complete content hash)` rows, first occurrence of each STRING winning —
+/// the stats scan has always keyed by the converted string, so two canonical paths
+/// that collapse into one lossy spelling still yield one row.
+#[cfg(test)]
 pub(crate) fn file_stats_from(set: &SourceSet) -> Vec<FileStat> {
+    file_stats_with_content_errors(set, &[]).stats
+}
+
+pub(crate) fn file_stats_with_content_errors(set: &SourceSet, roots: &[PathBuf]) -> ContentScan {
     let mut stats: Vec<FileStat> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
+    let mut content_unreadable = 0;
+    let mut hashed = 0;
     for file in &set.files {
         if file.role == FileRole::Ignored {
             continue;
@@ -149,16 +220,38 @@ pub(crate) fn file_stats_from(set: &SourceSet) -> Vec<FileStat> {
         if !seen.insert(path.clone()) {
             continue;
         }
-        let mtime = file
-            .metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        stats.push(FileStat { path, mtime, len: file.metadata.len() });
+        let stat = super::content_hash::StatIdentity::of(&file.metadata);
+        let content = super::content_hash::content_of(&file.canonical, stat);
+        hashed += usize::from(content.read);
+        if content.hash.is_none() {
+            content_unreadable += 1;
+        }
+        stats.push(FileStat {
+            path,
+            canonical: file.canonical.clone(),
+            walked: file.walked.clone(),
+            mtime: stat.mtime_ns,
+            len: stat.len,
+            content_hash: content.hash,
+            stat,
+            observed_at_ns: content.observed_at_ns,
+        });
     }
-    stats
+    // Only a walk that listed everything can tell a deleted file from one it could not see.
+    if set.unreadable == 0 {
+        let listed: HashSet<&Path> = stats.iter().map(|stat| stat.canonical.as_path()).collect();
+        super::content_hash::retain_listed(roots, &listed);
+    }
+    ContentScan { stats, content_unreadable, hashed }
+}
+
+/// The stats rows of one walk and what reading their contents cost.
+pub(crate) struct ContentScan {
+    pub(crate) stats: Vec<FileStat>,
+    /// Listed files whose bytes could not be read.
+    pub(crate) content_unreadable: usize,
+    /// Files this walk read, as opposed to reusing a hash remembered for an unchanged stat.
+    pub(crate) hashed: usize,
 }
 
 #[cfg(test)]
@@ -172,6 +265,101 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(path, text).unwrap();
+    }
+
+    /// A tree whose files are an hour old, so no remembered hash falls inside the racy window.
+    fn aged_tree(root: &Path) -> Vec<PathBuf> {
+        let files = vec![
+            root.join("CommonModules/Первый/Ext/Module.bsl"),
+            root.join("CommonModules/Второй/Ext/Module.bsl"),
+            root.join("CommonModules/Первый.xml"),
+        ];
+        for (index, file) in files.iter().enumerate() {
+            write(file, &format!("Процедура П{index}() Экспорт КонецПроцедуры"));
+            age(file);
+        }
+        files
+    }
+
+    fn age(file: &Path) {
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        fs::OpenOptions::new().write(true).open(file).unwrap().set_modified(hour_ago).unwrap();
+    }
+
+    fn hash_of(universe: &ScannedUniverse, file: &Path) -> Option<[u8; 32]> {
+        let file = file.canonicalize().unwrap();
+        universe.stats.iter().find(|stat| stat.canonical == file).and_then(|stat| stat.content_hash)
+    }
+
+    #[test]
+    fn an_unchanged_file_is_not_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let files = aged_tree(&root);
+        let roots = vec![root.clone()];
+
+        let first = ScannedUniverse::scan_excluding(&roots, &[]);
+        assert_eq!(first.hashed_files, files.len(), "the first walk reads every file");
+        let second = ScannedUniverse::scan_excluding(&roots, &[]);
+        assert_eq!(second.hashed_files, 0, "an unchanged tree is not read again");
+        assert_eq!(hash_of(&second, &files[0]), hash_of(&first, &files[0]));
+
+        write(&files[0], "Процедура Другая() Экспорт КонецПроцедуры");
+        age(&files[0]);
+        let third = ScannedUniverse::scan_excluding(&roots, &[]);
+        assert_eq!(third.hashed_files, 1, "only the edited file is read");
+        assert_ne!(hash_of(&third, &files[0]), hash_of(&first, &files[0]));
+    }
+
+    /// A write that restores both the size and the modification time still moves the change
+    /// time, which a write cannot set back.
+    #[cfg(unix)]
+    #[test]
+    fn a_same_size_edit_with_a_restored_mtime_is_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let files = aged_tree(&root);
+        let roots = vec![root.clone()];
+        let first = ScannedUniverse::scan_excluding(&roots, &[]);
+        let before = fs::metadata(&files[0]).unwrap();
+
+        let original = fs::read_to_string(&files[0]).unwrap();
+        let replacement = original.replace("П0", "Я0");
+        assert_eq!(replacement.len(), original.len());
+        fs::write(&files[0], &replacement).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&files[0])
+            .unwrap()
+            .set_modified(before.modified().unwrap())
+            .unwrap();
+        let after = fs::metadata(&files[0]).unwrap();
+        assert_eq!(
+            (after.len(), after.modified().unwrap()),
+            (before.len(), before.modified().unwrap())
+        );
+
+        let second = ScannedUniverse::scan_excluding(&roots, &[]);
+        assert_eq!(second.hashed_files, 1, "the edited file is read again");
+        assert_ne!(hash_of(&second, &files[0]), hash_of(&first, &files[0]));
+    }
+
+    #[test]
+    fn a_deleted_file_is_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let files = aged_tree(&root);
+        let roots = vec![root.clone()];
+        ScannedUniverse::scan_excluding(&roots, &[]);
+        assert!(super::super::content_hash::remembers(&files[1]));
+
+        fs::remove_file(&files[1]).unwrap();
+        ScannedUniverse::scan_excluding(&roots, &[]);
+        assert!(
+            !super::super::content_hash::remembers(&files[1]),
+            "a walk that no longer lists a file forgets its hash",
+        );
+        assert!(super::super::content_hash::remembers(&files[0]));
     }
 
     fn scan(root: &Path) -> SourceSet {

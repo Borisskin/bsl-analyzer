@@ -3053,7 +3053,18 @@ impl SearchEngine {
         known.extend(cache.root_keyed_keys());
         drop(cache);
 
-        let changed_ids = plan.old_roots.changed_root_ids(&plan.next_roots);
+        // A root id is the durable identity. Its declared/canonical directory may move while
+        // the `(root_id,path)` key space and its content remain unchanged; that move must not
+        // evict chunks or vectors. Only ids entering or leaving the table change a key space.
+        let old_ids: HashSet<String> = plan.old_roots.ids().map(str::to_owned).collect();
+        let next_ids: HashSet<String> = plan.next_roots.ids().map(str::to_owned).collect();
+        let changed_ids: HashSet<String> =
+            old_ids.symmetric_difference(&next_ids).cloned().collect();
+        // A rebound id keeps rows only for keys whose new bytes were compared with the stored
+        // ones. An unread key has no bytes to compare, and under an external baseline the stored
+        // hash is the baseline's while a local edit lives in the overlay, so neither may inherit
+        // what the old directory put there.
+        let rebound_ids = plan.old_roots.rebound_root_ids(&plan.next_roots);
         let readable_keys: HashSet<FileKey> =
             plan.files.iter().map(|file| file.key.clone()).collect();
         let unread_keys: HashSet<FileKey> =
@@ -3064,16 +3075,19 @@ impl SearchEngine {
             .iter()
             .filter(|key| changed_ids.contains(&key.root_id) || !present_keys.contains(*key))
             .cloned()
+            .chain(unread_keys.iter().filter(|key| rebound_ids.contains(&key.root_id)).cloned())
             .collect();
         let mut affected_files = Vec::new();
         let mut rebuilt = 0;
         let mut added = 0;
         for file in &plan.files {
-            let old_owner =
-                plan.old_roots.root_of(&file.identity.abs_path, &file.identity.canonical);
+            let stored_hash = self.store.file_hash(&file.key.root_id, &file.key.path)?;
+            let content_same =
+                stored_hash.as_deref().is_some_and(|hash| hash == file.content_hash.as_slice())
+                    && !(plan.serves_external_baseline && rebound_ids.contains(&file.key.root_id));
             if changed_ids.contains(&file.key.root_id)
-                || old_owner.as_ref() != Some(&file.key)
                 || !known.contains(&file.key)
+                || !content_same
             {
                 cleanup.insert(file.key.clone());
                 affected_files.push(file);
@@ -9732,6 +9746,152 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].root_id, CONFIGURATION_ROOT_ID);
         assert_eq!(engine.configuration_root(), Some(new_configuration.as_path()));
+    }
+
+    #[test]
+    fn moving_workspace_roots_preserves_matching_chunks_and_vectors() {
+        let dir = tempdir().unwrap();
+        let old_workspace = dir.path().join("old");
+        let new_workspace = dir.path().join("new");
+        let old_configuration = old_workspace.join("cf");
+        let new_configuration = new_workspace.join("cf");
+        write_transition_module(&old_configuration, "Перенесена");
+        write_transition_module(&new_configuration, "Перенесена");
+
+        let mut engine = SearchEngine::fts_only(&dir.path().join("search.db")).unwrap();
+        let old_roots = crate::WorkspaceRoots::build(&old_workspace, &old_configuration, &[]).0;
+        engine.initialize_workspace_roots(old_roots).unwrap();
+        engine.index_directory_fts(&old_configuration).unwrap();
+
+        let key = FileKey::configuration("CommonModules/Один/Ext/Module.bsl");
+        let chunk_ids = engine.store().chunk_ids_for_file("code", &key.root_id, &key.path).unwrap();
+        assert_eq!(chunk_ids.len(), 1);
+        let embedding = vec![0.25_f32; 1024];
+        engine.store().set_chunk_embeddings(&[(chunk_ids[0], embedding)]).unwrap();
+        let (_, before) = engine.store().load_all_embeddings_with_generation(1024).unwrap();
+
+        let new_roots = crate::WorkspaceRoots::build(&new_workspace, &new_configuration, &[]).0;
+        let plan = engine.workspace_roots_transition_seed(new_roots).unwrap().plan().unwrap();
+        let outcome = engine
+            .apply_validated_workspace_roots_transition(plan.revalidate().unwrap().unwrap())
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            super::WorkspaceRootsTransitionOutcome::Applied {
+                removed: 0,
+                rebuilt: 0,
+                added: 0,
+                pending_collection_embeddings: false,
+                ..
+            }
+        ));
+        let (_, after) = engine.store().load_all_embeddings_with_generation(1024).unwrap();
+        assert_eq!(after, before, "a physical move must keep the stored vectors");
+        assert_eq!(engine.vector_count(), 1, "the live vector index keeps the matching vector");
+        assert_eq!(engine.configuration_root(), Some(new_configuration.as_path()));
+        assert_eq!(engine.text_search("Перенесена", 10, Some("code")).unwrap().len(), 1);
+    }
+
+    /// Rebinding a root id to another directory keeps a readable file whose bytes match, but a
+    /// file the new directory cannot read has no bytes to match: the old directory's rows for
+    /// that key must not survive as its content.
+    #[test]
+    fn an_unreadable_file_in_a_rebound_root_drops_the_old_directory_rows() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("ws");
+        let old_configuration = workspace.join("old-cf");
+        let new_configuration = workspace.join("new-cf");
+        write_transition_module(&old_configuration, "СтараяВерсия");
+        let relative = "CommonModules/Один/Ext/Module.bsl";
+        fs::create_dir_all(new_configuration.join(relative).parent().unwrap()).unwrap();
+        fs::write(new_configuration.join(relative), [0xcf, 0xf0, 0xee, 0xf6]).unwrap();
+
+        let mut engine = SearchEngine::fts_only(&dir.path().join("search.db")).unwrap();
+        let old = crate::WorkspaceRoots::build(&workspace, &old_configuration, &[]).0;
+        engine.initialize_workspace_roots(old).unwrap();
+        engine.index_directory_fts(&old_configuration).unwrap();
+        assert_eq!(engine.text_search("СтараяВерсия", 10, Some("code")).unwrap().len(), 1);
+
+        let next = crate::WorkspaceRoots::build(&workspace, &new_configuration, &[]).0;
+        let plan = engine.workspace_roots_transition_seed(next).unwrap().plan().unwrap();
+        engine
+            .apply_validated_workspace_roots_transition(plan.revalidate().unwrap().unwrap())
+            .unwrap();
+
+        assert!(
+            engine.text_search("СтараяВерсия", 10, Some("code")).unwrap().is_empty(),
+            "the old directory's text must not stand in for an unreadable file",
+        );
+        assert_eq!(engine.configuration_root(), Some(new_configuration.as_path()));
+    }
+
+    /// Under an external baseline the stored file hash is the baseline's, not the overlay's. A
+    /// local edit carried from the old directory must not survive a rebind to a directory whose
+    /// file equals the baseline just because the bytes match the baseline hash.
+    #[test]
+    fn a_rebound_root_does_not_keep_an_overlay_edit_from_the_old_directory() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("ws");
+        let edited_configuration = workspace.join("edited-cf");
+        let baseline_configuration = workspace.join("baseline-cf");
+        write_transition_module(&edited_configuration, "ЛокальнаяПравка");
+        write_transition_module(&baseline_configuration, "Базовая");
+        let relative = "CommonModules/Один/Ext/Module.bsl";
+        let baseline_bytes = fs::read(baseline_configuration.join(relative)).unwrap();
+        let baseline_text = String::from_utf8(baseline_bytes.clone()).unwrap();
+
+        let db = dir.path().join("search.db");
+        let mut engine = SearchEngine::fts_only(&db).unwrap();
+        engine.set_serves_external_baseline(true).unwrap();
+        engine
+            .store()
+            .save_baseline_manifest(&crate::WorkspaceBaselineManifest {
+                snapshot_id: "snap-1".to_owned(),
+                snapshot_fingerprint: Some("fp".to_owned()),
+                files: vec![crate::BaselineManifestFile {
+                    root_id: CONFIGURATION_ROOT_ID.to_owned(),
+                    collection: "code".to_owned(),
+                    path: relative.to_owned(),
+                    file_fingerprint: crate::workspace_overlay::fingerprint_content(
+                        &baseline_text,
+                        relative,
+                    ),
+                    document_count: 1,
+                    file_object_id: "obj-cf".to_owned(),
+                }],
+            })
+            .unwrap();
+        crate::Store::open(&db)
+            .unwrap()
+            .reindex_file_with_context(
+                CONFIGURATION_ROOT_ID,
+                relative,
+                &crate::content_blake3(&baseline_bytes),
+                &crate::Chunker::chunk(&baseline_text),
+                None,
+                None,
+            )
+            .unwrap();
+        let edited = crate::WorkspaceRoots::build(&workspace, &edited_configuration, &[]).0;
+        engine.initialize_workspace_roots(edited).unwrap();
+        engine.prime_workspace_overlay().unwrap();
+        let stats = engine.workspace_overlay_stats().unwrap().unwrap();
+        assert_eq!(stats.overlay_files, 1, "the edit is carried by the overlay");
+        assert_eq!(stats.hidden_paths, 1, "the edit hides its baseline twin");
+        assert!(
+            engine.store().file_hash(CONFIGURATION_ROOT_ID, relative).unwrap().is_some(),
+            "the stored hash is still the baseline's",
+        );
+
+        let next = crate::WorkspaceRoots::build(&workspace, &baseline_configuration, &[]).0;
+        let plan = engine.workspace_roots_transition_seed(next).unwrap().plan().unwrap();
+        engine
+            .apply_validated_workspace_roots_transition(plan.revalidate().unwrap().unwrap())
+            .unwrap();
+        let stats = engine.workspace_overlay_stats().unwrap().unwrap();
+        assert_eq!(stats.overlay_files, 0, "the new directory's file equals the baseline");
+        assert_eq!(stats.hidden_paths, 0, "the baseline is visible again");
     }
 
     #[test]

@@ -478,7 +478,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     fn watched_graph(root: &std::path::Path) -> (GraphState, WorkspaceChangeHub, OwnerStop) {
-        let hub = WorkspaceChangeHub::start(vec![root.to_path_buf()]);
+        let hub = super::super::test_support::workspace_hub(root);
         assert!(hub.wait_until_watching(Duration::from_secs(5)));
         let graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
         (graph, hub, OwnerStop::default())
@@ -706,7 +706,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         sample_workspace(root);
-        let hub = WorkspaceChangeHub::start(vec![root.to_path_buf()]);
+        let hub = super::super::test_support::workspace_hub(root);
         assert!(hub.wait_until_watching(Duration::from_secs(5)));
         let stop = OwnerStop::default();
 
@@ -904,7 +904,7 @@ mod tests {
     fn recording_watched_graph(
         root: &std::path::Path,
     ) -> (GraphState, WorkspaceChangeHub, OwnerStop, Arc<Mutex<Vec<i64>>>) {
-        let hub = WorkspaceChangeHub::start(vec![root.to_path_buf()]);
+        let hub = super::super::test_support::workspace_hub(root);
         assert!(hub.wait_until_watching(Duration::from_secs(5)));
         let bounds = Arc::new(Mutex::new(Vec::new()));
         let hook = {
@@ -1003,7 +1003,7 @@ mod tests {
         change: &str,
         after_watch: impl FnOnce(),
     ) -> bool {
-        let hub = WorkspaceChangeHub::start(vec![root.to_path_buf()]);
+        let hub = super::super::test_support::workspace_hub(root);
         assert!(hub.wait_until_watching(Duration::from_secs(5)));
         let graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
         let stop = OwnerStop::default();

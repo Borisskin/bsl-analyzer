@@ -1735,21 +1735,30 @@ impl SharedState {
         // run and pick up context on a later reindex.
         if engine.has_semantic() {
             let graph_path = cache.graph_db_path();
+            // Load the project snapshot once and keep its roots paired with the graph
+            // validation below. Loading topology and roots separately leaves a window in
+            // which a config/root move can make the provider read a different generation
+            // from the one that passed the check.
+            let graph_project =
+                crate::graph::ProjectSnapshot::load_excluding(workspace_root, &excluded);
             match crate::graph_query::GraphDb::open_snapshot(&graph_path) {
                 Ok(graph_db)
-                    if !crate::graph::scan::graph_file_matches_live_topology(
-                        workspace_root,
+                    if !crate::graph::scan::graph_matches_live_project_strict(
                         &graph_db,
+                        &graph_project,
                     ) =>
                 {
                     tracing::warn!(
-                        "graph database was built for another extension topology; \
+                        "graph database is not current for the live project; \
                          embeddings without graph context"
                     );
                 }
                 Ok(graph_db) => {
                     engine.set_graph_context_provider(Arc::new(
-                        crate::graph_query::GraphDbContextProvider::new(graph_db),
+                        crate::graph_query::GraphDbContextProvider::new(
+                            graph_db,
+                            graph_project.search_roots.as_ref(),
+                        ),
                     ));
                     tracing::info!("graph-enriched embeddings enabled");
                 }

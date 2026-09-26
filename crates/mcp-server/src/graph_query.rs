@@ -22,6 +22,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::graph_db::SCHEMA_VERSION;
 use crate::tools::location as loc;
+use bsl_search::FileKey;
 
 /// A node as stored, before projection to a [`NodeRef`].
 struct StoredNode {
@@ -30,7 +31,7 @@ struct StoredNode {
     name: String,
     qualified: String,
     module: Option<String>,
-    file: Option<String>,
+    file: Option<FileKey>,
     name_offset: Option<u32>,
     sig_end: Option<u32>,
     src_start: Option<u32>,
@@ -114,23 +115,26 @@ fn declaration_end_confirmed(text: &str, src_start: u32, src_end: u32) -> bool {
 /// files, so a text remembered across nodes would make the staleness check in
 /// [`GraphDb::node_location`] compare the artefact against itself.
 struct NodeText<'a> {
-    file: Option<&'a str>,
+    file: Option<&'a FileKey>,
+    roots: Option<&'a bsl_search::WorkspaceRoots>,
     read: Option<Option<String>>,
 }
 
 impl<'a> NodeText<'a> {
-    fn new(file: Option<&'a str>) -> Self {
-        Self { file, read: None }
+    fn new(file: Option<&'a FileKey>, roots: Option<&'a bsl_search::WorkspaceRoots>) -> Self {
+        Self { file, roots, read: None }
     }
 
     fn get(&mut self) -> Option<&str> {
         let file = self.file?;
-        self.read.get_or_insert_with(|| std::fs::read_to_string(file).ok()).as_deref()
+        let roots = self.roots?;
+        let path = roots.resolve(file)?;
+        self.read.get_or_insert_with(|| std::fs::read_to_string(path).ok()).as_deref()
     }
 }
 
 const NODE_COLUMNS: &str =
-    "id, kind, name, qualified, module, file, name_offset, sig_end, src_start, src_end, dispatch, is_export, addressable";
+    "id, kind, name, qualified, module, file_root_id, file_path, name_offset, sig_end, src_start, src_end, dispatch, is_export, addressable";
 
 /// Reverse lookup of the files whose methods read a given object or its attributes. A
 /// `UNION` of two single-predicate arms so each rides the `edges_to` index (see
@@ -146,11 +150,11 @@ const NODE_COLUMNS: &str =
 /// carried one; an object carries its own file now, and a `contains` edge would
 /// otherwise report an object's XML as a file that references it.
 const REFERENCING_FILES_SQL: &str = "\
-    SELECT n.file FROM edges e INDEXED BY edges_to JOIN nodes n ON e.from_id = n.id \
-     WHERE n.kind IN ('method','module') AND n.file IS NOT NULL AND e.to_id = ?1 \
+    SELECT n.file_root_id, n.file_path FROM edges e INDEXED BY edges_to JOIN nodes n ON e.from_id = n.id \
+     WHERE n.kind IN ('method','module') AND n.file_path IS NOT NULL AND e.to_id = ?1 \
     UNION \
-    SELECT n.file FROM edges e INDEXED BY edges_to JOIN nodes n ON e.from_id = n.id \
-     WHERE n.kind IN ('method','module') AND n.file IS NOT NULL \
+    SELECT n.file_root_id, n.file_path FROM edges e INDEXED BY edges_to JOIN nodes n ON e.from_id = n.id \
+     WHERE n.kind IN ('method','module') AND n.file_path IS NOT NULL \
        AND e.to_id >= ?2 AND e.to_id < ?3";
 
 fn row_to_stored(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredNode> {
@@ -160,14 +164,17 @@ fn row_to_stored(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredNode> {
         name: row.get(2)?,
         qualified: row.get(3)?,
         module: row.get(4)?,
-        file: row.get(5)?,
-        name_offset: row.get::<_, Option<i64>>(6)?.map(|v| v as u32),
-        sig_end: row.get::<_, Option<i64>>(7)?.map(|v| v as u32),
-        src_start: row.get::<_, Option<i64>>(8)?.map(|v| v as u32),
-        src_end: row.get::<_, Option<i64>>(9)?.map(|v| v as u32),
-        dispatch: row.get(10)?,
-        is_export: row.get::<_, Option<i64>>(11)?.map(|v| v != 0),
-        addressable: row.get::<_, i64>(12)? != 0,
+        file: match (row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?) {
+            (Some(root_id), Some(path)) => Some(FileKey::new(root_id, path)),
+            _ => None,
+        },
+        name_offset: row.get::<_, Option<i64>>(7)?.map(|v| v as u32),
+        sig_end: row.get::<_, Option<i64>>(8)?.map(|v| v as u32),
+        src_start: row.get::<_, Option<i64>>(9)?.map(|v| v as u32),
+        src_end: row.get::<_, Option<i64>>(10)?.map(|v| v as u32),
+        dispatch: row.get(11)?,
+        is_export: row.get::<_, Option<i64>>(12)?.map(|v| v != 0),
+        addressable: row.get::<_, i64>(13)? != 0,
     })
 }
 
@@ -197,12 +204,13 @@ fn method_id_range(module_id: &str) -> Option<(String, String)> {
 /// verdict rather than silently contributing nothing.
 pub struct GraphNameSource<'a> {
     graph: Option<&'a GraphDb>,
+    roots: Option<&'a bsl_search::WorkspaceRoots>,
     state: ide::ProviderState,
 }
 
 impl<'a> GraphNameSource<'a> {
-    pub fn answering(graph: &'a GraphDb) -> Self {
-        Self { graph: Some(graph), state: ide::ProviderState::Answered }
+    pub fn answering(graph: &'a GraphDb, roots: Option<&'a bsl_search::WorkspaceRoots>) -> Self {
+        Self { graph: Some(graph), roots, state: ide::ProviderState::Answered }
     }
 
     /// The graph cannot answer, and the reason travels into the report.
@@ -212,7 +220,7 @@ impl<'a> GraphNameSource<'a> {
             ide::ProviderState::Answered,
             "an absent graph cannot be reported as having answered",
         );
-        Self { graph: None, state }
+        Self { graph: None, roots: None, state }
     }
 }
 
@@ -291,7 +299,7 @@ impl ide::ExternalNameSource for GraphNameSource<'_> {
                 // Looked up per DELIVERED candidate, never per match: the ranker
                 // has already cut the list to `limit`, and the file of a node
                 // nobody will see is a query for nothing.
-                match graph.node_file(&c.id) {
+                match graph.node_file(&c.id, self.roots) {
                     Ok(Some(file)) => candidate.with_source_path(file),
                     // A node whose file the store does not know is still an
                     // answer, addressed by its id alone.
@@ -484,13 +492,12 @@ impl GraphDb {
         crate::graph_db::read_unread_paths(&self.conn).len()
     }
 
-    /// The modules themselves, for the probe that asks whether any of them can be read again.
-    /// A count cannot answer that question: the probe has to open the very paths the build
-    /// could not — and read strictly — an error is an error, not an empty set. See
-    /// [`crate::graph_db::read_unread_paths_strict`]: only this form may speak for what a
-    /// publication still owes.
-    pub fn unread_paths_strict(&self) -> anyhow::Result<Vec<String>> {
-        crate::graph_db::read_unread_paths_strict(&self.conn)
+    /// The structured modules themselves, for the probe that asks whether any of them can be
+    /// read again. A count cannot answer that question: the probe has to resolve each key
+    /// through the roots of the candidate publication and read strictly — an error is an error,
+    /// not an empty set. Only this form may speak for what a publication still owes.
+    pub fn unread_keys_strict(&self) -> anyhow::Result<Vec<bsl_search::FileKey>> {
+        crate::graph_db::read_unread_keys_strict(&self.conn)
     }
 
     fn count(&self, sql: &str) -> anyhow::Result<usize> {
@@ -633,17 +640,21 @@ impl GraphDb {
     /// name. `None` when the module has no methods (then `node` reports `not_found`).
     fn synthesize_module_node(&self, id: &str) -> anyhow::Result<Option<StoredNode>> {
         let Some((lo, hi)) = method_id_range(id) else { return Ok(None) };
-        let first: Option<(Option<String>, Option<String>)> = self
+        let first: Option<(Option<String>, Option<String>, Option<String>)> = self
             .conn
             .query_row(
-                "SELECT file, module FROM nodes WHERE kind = 'method' AND id >= ?1 AND id < ?2 \
+                "SELECT file_root_id, file_path, module FROM nodes WHERE kind = 'method' AND id >= ?1 AND id < ?2 \
                  ORDER BY id LIMIT 1",
                 params![lo, hi],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()
             .context("probing module members")?;
-        let Some((file, module_display)) = first else { return Ok(None) };
+        let Some((file_root_id, file_path, module_display)) = first else { return Ok(None) };
+        let file = match (file_root_id, file_path) {
+            (Some(root_id), Some(path)) => Some(FileKey::new(root_id, path)),
+            _ => None,
+        };
         let name = module_display.clone().unwrap_or_else(|| id.to_string());
         Ok(Some(StoredNode {
             id: id.to_string(),
@@ -752,11 +763,25 @@ impl GraphDb {
     /// A module node is usually absent from the table — it is persisted only
     /// when it happens to be an edge endpoint — so the synthesized form answers
     /// for it, deriving the file from the module's own method rows.
-    pub(crate) fn node_file(&self, id: &str) -> anyhow::Result<Option<String>> {
+    pub(crate) fn node_file(
+        &self,
+        id: &str,
+        roots: Option<&bsl_search::WorkspaceRoots>,
+    ) -> anyhow::Result<Option<String>> {
+        let resolve = |file: Option<FileKey>| {
+            roots
+                // The graph's public file reads use the declared spelling, but this path is
+                // only the identity handed to the resident name dictionary.  Its VFS stores
+                // the canonical spelling of the source root, so use the frozen walk spelling
+                // from the same root snapshot here.  Do not canonicalize through the live
+                // filesystem: that would follow a retargeted link and mix generations.
+                .and_then(|roots| file.as_ref().and_then(|key| roots.resolve_walked(key)))
+                .map(|path| path.to_string_lossy().into_owned())
+        };
         if let Some(node) = self.fetch_node(id)? {
-            return Ok(node.file);
+            return Ok(resolve(node.file));
         }
-        Ok(self.synthesize_module_node(id)?.and_then(|node| node.file))
+        Ok(self.synthesize_module_node(id)?.and_then(|node| resolve(node.file)))
     }
 
     /// Usage summary for a durable node id: the inbound-edge count plus the top calling
@@ -813,10 +838,17 @@ impl GraphDb {
         Ok(d.unwrap_or(0) as usize)
     }
 
-    /// A source slice read from `file`, for the callers that hold a path rather than text.
-    /// The node projection reads its file once and calls [`slice_in`] directly.
-    fn slice(&self, file: &str, start: u32, end: u32) -> Option<String> {
-        slice_in(&std::fs::read_to_string(file).ok()?, start, end)
+    fn slice_checked(
+        &self,
+        file: &FileKey,
+        roots: Option<&bsl_search::WorkspaceRoots>,
+        start: u32,
+        end: u32,
+    ) -> Result<String, &'static str> {
+        let roots = roots.ok_or("roots_unavailable")?;
+        let path = roots.resolve(file).ok_or("source_path_unavailable")?;
+        let text = std::fs::read_to_string(path).map_err(|_| "source_drifted")?;
+        slice_in(&text, start, end).ok_or("source_drifted")
     }
 
     /// Project a stored node to its agent-facing [`NodeRef`] at `detail`.
@@ -855,7 +887,7 @@ impl GraphDb {
         // The file is read at most once per node and only where a consumer actually reaches
         // for it: the place, the signature and the body all describe the same bytes, and
         // reading them twice invites two answers.
-        let mut text = NodeText::new(n.file.as_deref());
+        let mut text = NodeText::new(n.file.as_ref(), roots);
 
         match self.node_location(n, roots, &mut text) {
             Ok(location) => node.location = Some(location),
@@ -892,7 +924,7 @@ impl GraphDb {
         if !matches!(n.kind.as_str(), "method" | "module") {
             return Err(loc::LocationUnavailable::NoSourceLocation.code());
         }
-        let (Some(file), Some(roots)) = (n.file.as_deref(), roots) else {
+        let (Some(file), Some(roots)) = (n.file.as_ref(), roots) else {
             // A method whose row has no file is a path-fallback node seen only as an edge
             // endpoint; a missing table is the boot window. Neither may answer "no place".
             // Two different facts, two different codes: a method whose row carries no path
@@ -906,8 +938,10 @@ impl GraphDb {
                 loc::LocationUnavailable::RootsUnavailable.code()
             });
         };
-        let location = loc::Location::from_path(roots, std::path::Path::new(file))
-            .map_err(|reason| reason.code())?;
+        let Some(path) = roots.resolve(file) else {
+            return Err(loc::LocationUnavailable::SourcePathUnavailable.code());
+        };
+        let location = loc::Location::from_path(roots, &path).map_err(|reason| reason.code())?;
 
         // The pair costs no I/O; only the ranges do, and everything above this line is
         // decided without touching the disk. A node with no offsets — a synthesized `module`
@@ -1004,16 +1038,21 @@ impl GraphDb {
         let Some(roots) = roots else {
             return CallSitePlaces::unavailable(loc::LocationUnavailable::RootsUnavailable.code());
         };
-        let (Some(from), Some(file)) = (from, from.and_then(|n| n.file.as_deref())) else {
+        let (Some(from), Some(file)) = (from, from.and_then(|n| n.file.as_ref())) else {
             return CallSitePlaces::unavailable(
                 loc::LocationUnavailable::SourcePathUnavailable.code(),
             );
         };
-        let location = match loc::Location::from_path(roots, std::path::Path::new(file)) {
+        let Some(path) = roots.resolve(file) else {
+            return CallSitePlaces::unavailable(
+                loc::LocationUnavailable::SourcePathUnavailable.code(),
+            );
+        };
+        let location = match loc::Location::from_path(roots, &path) {
             Ok(location) => location,
             Err(reason) => return CallSitePlaces::unavailable(reason.code()),
         };
-        let Some(text) = texts.get(file) else {
+        let Some(text) = texts.get(file, roots) else {
             // The offsets describe a file we cannot read now, so nothing confirms them.
             return CallSitePlaces::unavailable(ide::SOURCE_DRIFTED);
         };
@@ -1395,14 +1434,18 @@ impl GraphDb {
     /// in-memory renderer (guarded by a parity test), so a chunk enriched from either
     /// source keys the same embedding. `None` for a non-method id or one absent from
     /// the graph.
-    pub fn graph_context(&self, id: &str) -> anyhow::Result<Option<String>> {
+    pub fn graph_context(
+        &self,
+        id: &str,
+        roots: Option<&bsl_search::WorkspaceRoots>,
+    ) -> anyhow::Result<Option<String>> {
         let node = match self.fetch_node(id)? {
             Some(n) if n.kind == "method" => n,
             _ => return Ok(None),
         };
         // Not serialized as a node: this projection feeds a text renderer for embedding
         // enrichment, so it needs no place and takes no table.
-        let nref = self.node_ref(&node, GraphDetail::Signatures, None);
+        let nref = self.node_ref(&node, GraphDetail::Signatures, roots);
 
         // Mirror the in-memory renderer's facts exactly by EDGE kind, not just target
         // kind: calls come only from `call` edges, reads only from a method's
@@ -1440,7 +1483,7 @@ impl GraphDb {
         Ok(Some(ctx.render()))
     }
 
-    /// The distinct source files (`nodes.file`) of every method whose stored outbound
+    /// The distinct source files (`nodes.file_root_id`, `nodes.file_path`) of every method whose stored outbound
     /// read edges target `mdo_id` or any of its attributes — i.e. the modules whose
     /// rendered `graph_context` embeds a metadata read of this object (see
     /// [`Self::graph_context`], which renders `mdo/…` and `attribute/…` reads). Those
@@ -1457,7 +1500,11 @@ impl GraphDb {
     /// `nodes` instead.) The half-open upper bound bumps the trailing `/` (0x2F) to `0`
     /// (0x30), the same trick [`method_id_range`] uses. `mdo_id` without the `mdo/` prefix
     /// yields an empty set.
-    pub fn referencing_files(&self, mdo_id: &str) -> anyhow::Result<Vec<String>> {
+    pub fn referencing_files(
+        &self,
+        mdo_id: &str,
+        roots: Option<&bsl_search::WorkspaceRoots>,
+    ) -> anyhow::Result<Vec<String>> {
         let Some(object) = mdo_id.strip_prefix("mdo/") else { return Ok(Vec::new()) };
         let attr_lo = format!("attribute/{object}/");
         let mut attr_hi = attr_lo.clone();
@@ -1465,15 +1512,30 @@ impl GraphDb {
         attr_hi.push(((last as u8) + 1) as char);
         let mut stmt = self.conn.prepare(REFERENCING_FILES_SQL)?;
         let rows = stmt
-            .query_map(params![mdo_id, attr_lo, attr_hi], |r| r.get::<_, String>(0))?
+            .query_map(params![mdo_id, attr_lo, attr_hi], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()
             .context("collecting referencing files")?;
-        Ok(rows)
+        Ok(rows
+            .into_iter()
+            .filter_map(|(root_id, path)| match roots {
+                Some(roots) => roots
+                    .resolve(&FileKey::new(root_id, path))
+                    .map(|path| path.to_string_lossy().into_owned()),
+                None => None,
+            })
+            .collect())
     }
 
     /// Fetch method source for a set of ids, stopping once the rough output budget
     /// (`max_output_tokens`, ~4 chars/token) is reached.
-    pub fn source(&self, ids: &[String], max_output_tokens: usize) -> anyhow::Result<SourceResult> {
+    pub fn source(
+        &self,
+        ids: &[String],
+        max_output_tokens: usize,
+        roots: Option<&bsl_search::WorkspaceRoots>,
+    ) -> anyhow::Result<SourceResult> {
         let budget_chars = max_output_tokens.saturating_mul(4).max(1);
         let mut used = 0usize;
         let mut budget_exhausted = false;
@@ -1505,9 +1567,9 @@ impl GraphDb {
                         skipped_budget_exhausted: false,
                     }
                 }
-                Ok(n) => match (n.file.as_deref(), n.src_start, n.src_end) {
-                    (Some(file), Some(s), Some(e)) => match self.slice(file, s, e) {
-                        Some(_) if used >= budget_chars => {
+                Ok(n) => match (n.file.as_ref(), n.src_start, n.src_end) {
+                    (Some(file), Some(s), Some(e)) => match self.slice_checked(file, roots, s, e) {
+                        Ok(_) if used >= budget_chars => {
                             budget_exhausted = true;
                             SourceItem {
                                 id: id.clone(),
@@ -1517,7 +1579,7 @@ impl GraphDb {
                                 skipped_budget_exhausted: true,
                             }
                         }
-                        Some(src) => {
+                        Ok(src) => {
                             let remaining = budget_chars - used;
                             let (text, truncated) = clamp_source(src, remaining);
                             used += text.len();
@@ -1530,10 +1592,13 @@ impl GraphDb {
                                 skipped_budget_exhausted: false,
                             }
                         }
-                        None => SourceItem {
+                        Err(reason) => SourceItem {
                             id: id.clone(),
                             source: None,
-                            error: Some(GraphError::NotFound { id: id.clone() }),
+                            error: Some(GraphError::Unsupported {
+                                id: id.clone(),
+                                reason: reason.into(),
+                            }),
                             truncated: false,
                             skipped_budget_exhausted: false,
                         },
@@ -1564,11 +1629,12 @@ impl GraphDb {
 /// is nil.
 pub struct GraphDbContextProvider {
     db: std::sync::Mutex<GraphDb>,
+    roots: Option<bsl_search::WorkspaceRoots>,
 }
 
 impl GraphDbContextProvider {
-    pub fn new(db: GraphDb) -> Self {
-        Self { db: std::sync::Mutex::new(db) }
+    pub fn new(db: GraphDb, roots: Option<&bsl_search::WorkspaceRoots>) -> Self {
+        Self { db: std::sync::Mutex::new(db), roots: roots.cloned() }
     }
 }
 
@@ -1596,7 +1662,8 @@ impl bsl_search::GraphContextProvider for GraphDbContextProvider {
             .db
             .lock()
             .map_err(|e| bsl_search::GraphContextError(format!("graph db lock poisoned: {e}")))?;
-        db.graph_context(&id).map_err(|e| bsl_search::GraphContextError(e.to_string()))
+        db.graph_context(&id, self.roots.as_ref())
+            .map_err(|e| bsl_search::GraphContextError(e.to_string()))
     }
 }
 
@@ -1649,13 +1716,14 @@ fn absence_code(stored: &str) -> &'static str {
 /// of nodes it kept.
 #[derive(Default)]
 struct AnswerTexts {
-    read: std::collections::HashMap<String, Option<String>>,
+    read: std::collections::HashMap<FileKey, Option<String>>,
 }
 
 impl AnswerTexts {
-    fn get(&mut self, file: &str) -> Option<&str> {
+    fn get(&mut self, file: &FileKey, roots: &bsl_search::WorkspaceRoots) -> Option<&str> {
         if !self.read.contains_key(file) {
-            self.read.insert(file.to_string(), std::fs::read_to_string(file).ok());
+            let text = roots.resolve(file).and_then(|path| std::fs::read_to_string(path).ok());
+            self.read.insert(file.clone(), text);
         }
         self.read.get(file).and_then(|text| text.as_deref())
     }
@@ -1796,9 +1864,18 @@ mod tests {
             .unwrap();
 
         let db = GraphDb::open(&path).unwrap();
+        let roots = bsl_search::WorkspaceRoots::build(dir.path(), dir.path(), &[]).0;
+        assert!(
+            db.referencing_files("mdo/Catalog/Товары", None).unwrap().is_empty(),
+            "without roots a relative stored path must fail closed"
+        );
         assert_eq!(
-            db.referencing_files("mdo/Catalog/Товары").unwrap(),
-            vec!["CommonModules/Вызов/Ext/Module.bsl".to_string()],
+            db.referencing_files("mdo/Catalog/Товары", Some(&roots)).unwrap(),
+            vec![dir
+                .path()
+                .join("CommonModules/Вызов/Ext/Module.bsl")
+                .to_string_lossy()
+                .into_owned()],
         );
     }
 
@@ -1834,7 +1911,7 @@ mod tests {
     fn referencing_files_query_uses_the_edges_to_index() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE nodes (id TEXT NOT NULL, kind TEXT NOT NULL, file TEXT);\
+            "CREATE TABLE nodes (id TEXT NOT NULL, kind TEXT NOT NULL, file_root_id TEXT, file_path TEXT);\
              CREATE TABLE edges (from_id TEXT NOT NULL, to_id TEXT NOT NULL, kind TEXT NOT NULL);\
              CREATE INDEX edges_to ON edges(to_id);\
              CREATE INDEX edges_from ON edges(from_id);",
@@ -1873,16 +1950,17 @@ mod tests {
     /// object's `attribute/…` ids is included, and an unrelated object's edges are excluded.
     #[test]
     fn referencing_files_returns_readers_of_mdo_and_its_attributes() {
+        let dir = tempfile::tempdir().unwrap();
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE nodes (id TEXT NOT NULL, kind TEXT NOT NULL, file TEXT);\
+            "CREATE TABLE nodes (id TEXT NOT NULL, kind TEXT NOT NULL, file_root_id TEXT, file_path TEXT);\
              CREATE TABLE edges (from_id TEXT NOT NULL, to_id TEXT NOT NULL, kind TEXT NOT NULL);\
              CREATE INDEX edges_to ON edges(to_id);",
         )
         .unwrap();
         let node = |id: &str, file: &str| {
             conn.execute(
-                "INSERT INTO nodes (id, kind, file) VALUES (?1, 'method', ?2)",
+                "INSERT INTO nodes (id, kind, file_root_id, file_path) VALUES (?1, 'method', '', ?2)",
                 params![id, file],
             )
             .unwrap();
@@ -1904,18 +1982,29 @@ mod tests {
         edge("method/common/В/Н", "mdo/Catalog/Другой", "manager_access");
 
         let db = GraphDb::from_connection(conn);
-        let mut files = db.referencing_files("mdo/Catalog/Товары").unwrap();
+        let roots = bsl_search::WorkspaceRoots::build(dir.path(), dir.path(), &[]).0;
+        assert!(
+            db.referencing_files("mdo/Catalog/Товары", None).unwrap().is_empty(),
+            "without roots a relative stored path must fail closed"
+        );
+        let mut files = db.referencing_files("mdo/Catalog/Товары", Some(&roots)).unwrap();
         files.sort();
         assert_eq!(
             files,
             vec![
-                "CommonModules/Б/Ext/Module.bsl".to_owned(),
-                "CommonModules/Г/Ext/Module.bsl".to_owned(),
+                dir.path()
+                    .join("CommonModules/Б/Ext/Module.bsl")
+                    .to_string_lossy()
+                    .into_owned(),
+                dir.path()
+                    .join("CommonModules/Г/Ext/Module.bsl")
+                    .to_string_lossy()
+                    .into_owned(),
             ],
             "readers of the object and its attributes are returned; an unrelated object's reader is not"
         );
         assert!(
-            db.referencing_files("method/common/Б/Ч").unwrap().is_empty(),
+            db.referencing_files("method/common/Б/Ч", Some(&roots)).unwrap().is_empty(),
             "a non-mdo id yields nothing"
         );
     }
@@ -1965,7 +2054,7 @@ mod tests {
             "method/common/СтроковыеФункцииКлиентСервер/ПодставитьПараметрыВСтроку",
             "method",
         )]);
-        let source = GraphNameSource::answering(&db);
+        let source = GraphNameSource::answering(&db, None);
 
         let tier_of = |query: &str| {
             source
@@ -2025,7 +2114,7 @@ mod tests {
         let borrowed: Vec<(&str, &str)> =
             rows.iter().map(|(id, kind)| (id.as_str(), *kind)).collect();
         let db = graph_db_with_nodes(&borrowed);
-        let source = GraphNameSource::answering(&db);
+        let source = GraphNameSource::answering(&db, None);
 
         let hits = source.candidates("ПриСозданииНаСервере", 3).unwrap();
         assert_eq!(hits.candidates.len(), 3);

@@ -672,6 +672,8 @@ const WAITS: &[(&str, &str, &str, Waiting)] = &[
     ("state/overlay_retry.rs", "run", ".wait_timeout(", Waiting::Owner),
     ("state/overlay_retry.rs", "run_pass", "acquire_for_owner(", Waiting::Owner),
     ("state/overlay_retry.rs", "should_run", "acquire_for_owner(", Waiting::Owner),
+    // The retry resolves saved graph keys against the current search roots under the owner's stop.
+    ("state/sync.rs", "apply_prepared_search_drift", "acquire_for_owner(", Waiting::Owner),
     ("state/sync.rs", "apply_prepared_search_drift", "acquire_for_owner(", Waiting::Owner),
     ("state/sync.rs", "materialize_search_drift", "acquire_for_owner(", Waiting::Owner),
     ("state/sync.rs", "prepare_search_drift", "acquire_for_owner(", Waiting::Owner),
@@ -767,7 +769,7 @@ fn production_waits() -> Vec<(String, String, String)> {
     found
 }
 
-/// The module-level exemption above is real: these four are built only for tests, and the
+/// The module-level exemption above is real: these modules are built only for tests, and the
 /// gate would otherwise have to classify every wait their helpers make.
 #[test]
 fn the_test_only_modules_are_the_ones_the_parent_gates() {
@@ -783,6 +785,7 @@ fn the_test_only_modules_are_the_ones_the_parent_gates() {
         exempt,
         [
             "diagnostics_state/test_support.rs",
+            "graph/portable_workspace_graph_tests.rs",
             "graph/test_support.rs",
             "indexing_runtime_tests.rs",
             "payload_smoke_tests.rs",

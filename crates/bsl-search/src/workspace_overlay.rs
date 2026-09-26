@@ -474,12 +474,13 @@ impl WorkspaceOverlayCache {
         // A stable local overlay entry may already be hiding its remote baseline twin. If its
         // bytes become unreadable during an otherwise unrelated root transition, the entry and
         // its hiding are one coherent carrier pair: keeping the entry but lifting the hiding
-        // would expose both local and baseline versions. New/rebound unread keys have no trusted
-        // entry and therefore inherit no hiding.
+        // would expose both local and baseline versions. New, rebound or cleaned-up unread keys
+        // have no trusted entry and therefore inherit no hiding.
         let unread_hidings_to_preserve: HashSet<FileKey> = unread_present
             .iter()
             .filter(|key| {
                 !changed_root_ids.contains(&key.root_id)
+                    && !cleanup.contains(*key)
                     && self.entries.contains_key(*key)
                     && self.hidden_paths.contains(*key)
             })

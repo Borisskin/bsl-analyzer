@@ -532,6 +532,28 @@ impl ExtensionTopology {
         self.fingerprint
     }
 
+    /// The same versioned topology encoding used by [`Self::fingerprint`], with
+    /// paths represented in the workspace's durable address space. Roots inside
+    /// the workspace become relative; external roots retain their absolute
+    /// identity. Keeping this method on the topology makes the graph cache use
+    /// exactly the dependency, declaration-order, visibility and node encoding
+    /// that the project model uses for its physical fingerprint.
+    pub fn portable_fingerprint(
+        &self,
+        base_path: &Path,
+        workspace_root: &Path,
+    ) -> TopologyFingerprint {
+        let workspace =
+            std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+        let portable = |path: &Path| {
+            let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            path.strip_prefix(&workspace)
+                .map(|relative| relative.as_os_str().as_encoded_bytes().to_vec())
+                .unwrap_or_else(|_| path.as_os_str().as_encoded_bytes().to_vec())
+        };
+        fingerprint_with_paths(&portable(base_path), &self.nodes, portable)
+    }
+
     pub fn has_dependencies(&self) -> bool {
         self.nodes.iter().any(|node| !node.depends_on.is_empty())
     }
@@ -617,13 +639,26 @@ fn topological_order(
 /// differently. Extension nodes hash exactly as before the mode existed, so
 /// the digest of a project without external objects is unchanged.
 fn fingerprint(base_path: &Path, nodes: &[ExtensionNode]) -> TopologyFingerprint {
+    fingerprint_with_paths(base_path.as_os_str().as_encoded_bytes(), nodes, |path| {
+        path.as_os_str().as_encoded_bytes().to_vec()
+    })
+}
+
+fn fingerprint_with_paths<F>(
+    base_path: &[u8],
+    nodes: &[ExtensionNode],
+    mut path: F,
+) -> TopologyFingerprint
+where
+    F: FnMut(&Path) -> Vec<u8>,
+{
     let mut hasher = blake3::Hasher::new_derive_key("bsl-analyzer/extension-topology/v1");
     let field = |hasher: &mut blake3::Hasher, bytes: &[u8]| {
         hasher.update(&(bytes.len() as u64).to_le_bytes());
         hasher.update(bytes);
     };
     hasher.update(&TOPOLOGY_FORMAT_VERSION.to_le_bytes());
-    field(&mut hasher, base_path.as_os_str().as_encoded_bytes());
+    field(&mut hasher, base_path);
     hasher.update(&(nodes.len() as u64).to_le_bytes());
     for node in nodes {
         hasher.update(&[node.kind.fingerprint_tag()]);
@@ -631,7 +666,7 @@ fn fingerprint(base_path: &Path, nodes: &[ExtensionNode]) -> TopologyFingerprint
             hasher.update(&[u8::from(!node.sees_every_extension)]);
         }
         field(&mut hasher, fold_lower_per_char(&node.name).as_bytes());
-        field(&mut hasher, node.canonical_path.as_os_str().as_encoded_bytes());
+        field(&mut hasher, &path(&node.canonical_path));
         let mut deps: Vec<String> = node
             .depends_on
             .iter()
@@ -680,6 +715,40 @@ mod tests {
 
     fn names(topology: &ExtensionTopology, ids: &[NodeId]) -> Vec<String> {
         ids.iter().map(|id| topology.node(*id).name().to_string()).collect()
+    }
+
+    /// A workspace moved as a whole keeps its portable topology — external objects included,
+    /// since discovery finds them under the workspace — while an external object that moves
+    /// inside the workspace still changes it.
+    #[test]
+    fn portable_fingerprint_survives_moving_the_workspace_with_external_objects() {
+        let topology_at = |workspace: &str, external: &str| {
+            let at = |relative: &str| PathBuf::from(format!("{workspace}/{relative}"));
+            let specs = vec![
+                ExtensionNodeSpec {
+                    path: at("cfe/one"),
+                    canonical_path: at("cfe/one"),
+                    ..spec("one", &[])
+                },
+                ExtensionNodeSpec {
+                    path: at(external),
+                    canonical_path: at(external),
+                    ..external_spec("Обработка", None)
+                },
+            ];
+            let base = at("cf");
+            let topology = ExtensionTopology::build(&base, specs).unwrap();
+            topology.portable_fingerprint(&base, Path::new(workspace))
+        };
+
+        assert_eq!(
+            topology_at("/old-ws", "src/epf/Обработка"),
+            topology_at("/new-ws", "src/epf/Обработка"),
+        );
+        assert_ne!(
+            topology_at("/old-ws", "src/epf/Обработка"),
+            topology_at("/old-ws", "epf/Обработка"),
+        );
     }
 
     #[test]

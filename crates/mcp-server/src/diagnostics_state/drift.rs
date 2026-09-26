@@ -119,8 +119,8 @@ impl DiagnosticsState {
 
         // Holes are retried on EVERY window, ahead of every classifier — including the
         // forced-scan escape hatch below, which returns early. Neither classifier can
-        // find them: the drift fingerprint is `(mtime, len)` only, so a file that came
-        // back readable under the same stat is no drift at all, and with a healthy hub
+        // find them: the regular drift fingerprint tracks the observed file bytes, so a file that came
+        // back readable without a delivered event is still handled by its hole list, and with a healthy hub
         // there is no scan to re-add it either. Their own list is the only mechanism
         // that heals them, so skipping it in the window that asked for the MOST
         // thorough disk reconciliation would be exactly backwards.
@@ -939,8 +939,9 @@ impl DiagnosticsState {
         }
 
         // 0. Retry the holes, ahead of every classifier, exactly as `poll_drift` does.
-        //    A hole is invisible to both of them — the fingerprint is `(mtime, len)`,
-        //    so a file that came back readable under the same stat is no drift — and
+        //    A hole is invisible to both of them — the regular fingerprint only records
+        //    bytes for files that were readable, so a file that came back readable without
+        //    an event is still handled by its hole list — and
         //    this is the only path a daemon nobody queries ever walks. Without it a
         //    client that polls `diagnostics status` alone (which reads the state
         //    directly and never drifts) would watch `unread_files` stay at 1 forever.

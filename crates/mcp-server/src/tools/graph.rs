@@ -308,8 +308,9 @@ pub fn source(
     graph: &GraphDb,
     ids: &[String],
     max_output_tokens: usize,
+    roots: Option<&bsl_search::WorkspaceRoots>,
 ) -> (Value, loc::Completeness) {
-    match graph.source(ids, max_output_tokens) {
+    match graph.source(ids, max_output_tokens, roots) {
         Ok(mut result) => {
             for item in &mut result.items {
                 redact_opt(&mut item.source);

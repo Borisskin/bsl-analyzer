@@ -1,8 +1,6 @@
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::Instant;
 
 use crate::change_hub::{ChangeEntry, ChangeKind};
 #[cfg(windows)]
@@ -29,7 +27,11 @@ pub(super) const WALK_VERIFY_INTERVAL: std::time::Duration = std::time::Duration
 /// stale topology under fresh file stats.
 #[derive(Default)]
 pub(super) struct FpMapState {
-    pub(super) map: Option<std::collections::BTreeMap<String, (u128, u64)>>,
+    /// The same durable file identity and complete byte hash used by the graph database.
+    /// Physical paths and metadata are deliberately absent: a moved tree must reuse this map,
+    /// while a same-stat byte edit must invalidate it.
+    pub(super) map: Option<std::collections::BTreeMap<bsl_search::FileKey, [u8; 32]>>,
+    pub(super) roots: Option<bsl_search::WorkspaceRoots>,
     pub(super) walked_at: Option<Instant>,
     pub(super) topology: u64,
     /// Verdict of the walk that anchored `map`: hub deliveries patch stats but
@@ -220,7 +222,7 @@ pub(super) struct PreparedSnapshotPool {
     /// The artefact's own unread set, read STRICTLY and bound to the generation validated
     /// above. `None` when the metadata would not read: that is a failure to look, and it says
     /// nothing at all about what this publication owes.
-    declared_unread: Option<Vec<String>>,
+    declared_unread: Option<Vec<bsl_search::FileKey>>,
     path_identity: GraphPathIdentity,
     expected_generation: u64,
     expected_fingerprint: crate::graph_db::GraphFp,
@@ -229,7 +231,7 @@ pub(super) struct PreparedSnapshotPool {
 
 impl PreparedSnapshotPool {
     /// What the artefact this pool holds declares unread, read strictly at prepare time.
-    pub(super) fn declared_unread(&self) -> Option<&[String]> {
+    pub(super) fn declared_unread(&self) -> Option<&[bsl_search::FileKey]> {
         self.declared_unread.as_deref()
     }
 }
@@ -322,6 +324,7 @@ impl Drop for PooledGraphDb {
 pub(super) enum RecoveryCoverage<'a> {
     /// A build that enumerated the scope itself: every required address is either in its
     /// universe or absent from it, and the walk says whether it may speak for the whole tree.
+    #[cfg(test)]
     Walked {
         scope: super::debt::RecoveryScope,
         /// Every address the walk listed, borrowed from the walk — the universe is not cloned
@@ -332,11 +335,53 @@ pub(super) enum RecoveryCoverage<'a> {
         /// no longer stands, so what it did not list is not thereby gone.
         straddled: bool,
     },
+    /// The production form. Membership is compared by the same durable `(root_id, path)`
+    /// identity used by the graph; physical spellings are obtained only through the roots of
+    /// the candidate publication. The string form above remains a test adapter for synthetic
+    /// recovery traces that predate the portable key contract.
+    WalkedKeys {
+        scope: super::debt::RecoveryScope,
+        enumerated: &'a std::collections::HashSet<bsl_search::FileKey>,
+        complete: bool,
+        straddled: bool,
+    },
     /// A patch that re-projected exactly these addresses. It proves nothing about absence:
     /// a point rewrite never looked at what it did not touch.
+    #[cfg(test)]
     Patched { rewritten: &'a std::collections::HashSet<&'a str> },
+    /// A patch's production coverage, expressed in durable file keys.
+    PatchedKeys { rewritten: &'a std::collections::HashSet<bsl_search::FileKey> },
     /// No fresh coverage authority at all — a cache served as it stands, or a test adapter.
     None,
+}
+
+/// Input address accepted by the test-only compatibility wrapper and by the production
+/// `FileKey` path. Production metadata always supplies the structured form; the legacy physical
+/// spelling exists only for old in-process recovery traces.
+pub(super) trait RecoveryDeclaredKey {
+    fn file_key(&self) -> bsl_search::FileKey;
+    fn legacy_physical_path(&self) -> Option<String>;
+}
+
+impl RecoveryDeclaredKey for bsl_search::FileKey {
+    fn file_key(&self) -> bsl_search::FileKey {
+        self.clone()
+    }
+
+    fn legacy_physical_path(&self) -> Option<String> {
+        None
+    }
+}
+
+#[cfg(test)]
+impl RecoveryDeclaredKey for String {
+    fn file_key(&self) -> bsl_search::FileKey {
+        bsl_search::FileKey::configuration(self.clone())
+    }
+
+    fn legacy_physical_path(&self) -> Option<String> {
+        Some(self.clone())
+    }
 }
 
 /// The scope descriptor of one actually loaded project, carried with whatever that project
@@ -440,7 +485,10 @@ impl GraphState {
         // Read here, where the generation has just been checked against the expectation and
         // the path identity brackets the read: a list taken later could belong to another
         // artefact at the same name.
-        let declared_unread = entries.first().and_then(|entry| entry.db.unread_paths_strict().ok());
+        let declared_unread = entries
+            .first()
+            .map(|entry| entry.db.unread_keys_strict().map_err(SnapshotPrepareError::Open))
+            .transpose()?;
         Ok(PreparedSnapshotPool {
             #[cfg(windows)]
             validation,
@@ -923,77 +971,137 @@ impl GraphState {
         ProbeOutcome::Looked { levels, scope: walked.map(|(scope, _)| scope) }
     }
 
-    /// Pair what this publication did with what is outstanding. Called BEFORE the publication
-    /// gate and outside every lock: reading what is outstanding and matching it against what
-    /// this build covered is O(P + U) of comparisons, and the critical section is for the
-    /// swap, not for that.
-    ///
-    /// Only three things retire an obligation, and each is something the installed result
-    /// actually shows: it read the address, a complete identity-exact walk of the scope that
-    /// required it did not find it, or a validated declaration no longer asks for it. A
-    /// shorter unread list is none of those — an enumeration that came up short has answered
-    /// nothing.
-    pub(super) fn recovery_proof(
+    /// Pair what this publication did with what is outstanding. The short wrapper is retained
+    /// for synthetic recovery tests that use physical strings; production callers use
+    /// [`Self::recovery_proof_with_roots`] and pass the candidate generation's roots.
+    #[cfg(test)]
+    pub(super) fn recovery_proof<K: RecoveryDeclaredKey>(
         &self,
         generation: u64,
-        declared_unread: Option<&[String]>,
+        declared_unread: Option<&[K]>,
         coverage: RecoveryCoverage<'_>,
     ) -> super::debt::RecoveryPublicationProof {
-        let outstanding = lock_recover(&self.debt).outstanding_recovery();
+        self.recovery_proof_with_roots(generation, declared_unread, coverage, None)
+    }
+
+    /// Build recovery authority from structured unread keys. A key is resolved with
+    /// `resolve_walked`, because the scan and its coverage enumerate canonical paths. An
+    /// unknown root, malformed path, or unavailable roots yields no physical declaration and
+    /// therefore no recovery authority.
+    pub(super) fn recovery_proof_with_roots<K: RecoveryDeclaredKey>(
+        &self,
+        generation: u64,
+        declared_unread: Option<&[K]>,
+        coverage: RecoveryCoverage<'_>,
+        roots: Option<&bsl_search::WorkspaceRoots>,
+    ) -> super::debt::RecoveryPublicationProof {
+        let super::debt::OutstandingRecovery { keys: outstanding_keys, captured_seq } =
+            lock_recover(&self.debt).outstanding_recovery();
+        let declared_unread_paths = declared_unread.map(|unread| {
+            unread
+                .iter()
+                .map(|item| {
+                    roots
+                        .and_then(|roots| roots.resolve_walked(&item.file_key()))
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .or_else(|| {
+                            roots.is_none().then_some(()).and_then(|_| item.legacy_physical_path())
+                        })
+                })
+                .collect::<Option<Vec<_>>>()
+        });
+        let resolved_unread = declared_unread_paths.flatten();
+        let still_unread: Option<std::collections::HashSet<&str>> =
+            resolved_unread.as_ref().map(|unread| unread.iter().map(String::as_str).collect());
         let mut proof = super::debt::RecoveryPublicationProof {
             generation,
-            captured_seq: outstanding.captured_seq,
-            declared_unread: declared_unread.map(<[String]>::to_vec),
+            captured_seq,
+            declared_unread: resolved_unread.clone(),
             ..Default::default()
         };
-        // Without a strict unread list this publication cannot say what it managed to read:
-        // the lenient reader turns a broken database into "everything was read", and that
-        // would retire every outstanding address on the strength of an error.
-        let still_unread: Option<std::collections::HashSet<&str>> =
-            declared_unread.map(|unread| unread.iter().map(String::as_str).collect());
-        match coverage {
-            RecoveryCoverage::Walked { scope, enumerated, complete, straddled } => {
-                for (key, occurrence) in outstanding.keys {
-                    // Whatever else is true of this address, an artefact that names it unread
-                    // requires it. Both halves come from the same installed database, and the
-                    // unread list is the half with authority.
-                    let Some(unread) = still_unread.as_ref() else { continue };
-                    if unread.contains(key.as_str()) {
-                        continue;
-                    }
-                    let listed = enumerated.contains(key.as_str());
-                    if listed {
-                        proof.read_covered.push((key, occurrence));
-                    } else if scope.speaks_for_removal() && !scope.requires(&key) {
-                        // A validated declaration whose roots all resolved no longer asks for
-                        // this address. Not a choice to forget it — a measured change of what
-                        // is required. A walk that LISTED the address says the opposite,
-                        // whatever spelling it arrives under, so it is answered above.
-                        proof.out_of_scope_covered.push((key, occurrence));
-                    } else if complete
-                        && !straddled
-                        && scope.speaks_for_removal()
-                        && scope.requires(&key)
-                    {
-                        // The walk could speak for the whole of the scope that required it,
-                        // and did not list it: it is gone, not merely unlisted. A restricted
-                        // fallback may not say that — it is what the loader does when it
-                        // cannot read the project, and a path it never looked for is not a
-                        // path that went away.
-                        proof.absent_covered.push((key, occurrence));
-                    }
+        // Without a strict unread list, or when any structured key cannot resolve through the
+        // current roots, this publication cannot say what it managed to read.
+
+        let process_walk = |scope: super::debt::RecoveryScope,
+                            enumerated: &dyn Fn(&str) -> bool,
+                            complete: bool,
+                            straddled: bool| {
+            let mut read_covered = Vec::new();
+            let mut absent_covered = Vec::new();
+            let mut out_of_scope_covered = Vec::new();
+            for (key, occurrence) in outstanding_keys.iter().cloned() {
+                let Some(unread) = still_unread.as_ref() else { continue };
+                if unread.contains(key.as_str()) {
+                    continue;
                 }
+                let listed = enumerated(&key);
+                if listed {
+                    read_covered.push((key, occurrence));
+                } else if scope.speaks_for_removal() && !scope.requires(&key) {
+                    out_of_scope_covered.push((key, occurrence));
+                } else if complete
+                    && !straddled
+                    && scope.speaks_for_removal()
+                    && scope.requires(&key)
+                {
+                    absent_covered.push((key, occurrence));
+                }
+            }
+            (scope, complete, straddled, read_covered, absent_covered, out_of_scope_covered)
+        };
+
+        match coverage {
+            #[cfg(test)]
+            RecoveryCoverage::Walked { scope, enumerated, complete, straddled } => {
+                let (scope, complete, straddled, read, absent, out_of_scope) =
+                    process_walk(scope, &|path| enumerated.contains(path), complete, straddled);
+                proof.read_covered.extend(read);
+                proof.absent_covered.extend(absent);
+                proof.out_of_scope_covered.extend(out_of_scope);
                 proof.scan_complete = Some(complete);
                 proof.straddled = straddled;
                 proof.scope = Some(scope);
             }
+            RecoveryCoverage::WalkedKeys { scope, enumerated, complete, straddled } => {
+                let (scope, complete, straddled, read, absent, out_of_scope) = process_walk(
+                    scope,
+                    &|path| {
+                        roots
+                            .and_then(|roots| roots.key_of_path(Path::new(path)))
+                            .is_some_and(|key| enumerated.contains(&key))
+                    },
+                    complete,
+                    straddled,
+                );
+                proof.read_covered.extend(read);
+                proof.absent_covered.extend(absent);
+                proof.out_of_scope_covered.extend(out_of_scope);
+                proof.scan_complete = Some(complete);
+                proof.straddled = straddled;
+                proof.scope = Some(scope);
+            }
+            #[cfg(test)]
             RecoveryCoverage::Patched { rewritten } => {
-                for (key, occurrence) in outstanding.keys {
-                    let read = rewritten.contains(key.as_str())
+                for (key, occurrence) in outstanding_keys.iter().cloned() {
+                    if rewritten.contains(key.as_str())
                         && still_unread
                             .as_ref()
-                            .is_some_and(|unread| !unread.contains(key.as_str()));
-                    if read {
+                            .is_some_and(|unread| !unread.contains(key.as_str()))
+                    {
+                        proof.read_covered.push((key, occurrence));
+                    }
+                }
+            }
+            RecoveryCoverage::PatchedKeys { rewritten } => {
+                for (key, occurrence) in outstanding_keys.iter().cloned() {
+                    let listed = roots
+                        .and_then(|roots| roots.key_of_path(Path::new(&key)))
+                        .is_some_and(|file_key| rewritten.contains(&file_key));
+                    if listed
+                        && still_unread
+                            .as_ref()
+                            .is_some_and(|unread| !unread.contains(key.as_str()))
+                    {
                         proof.read_covered.push((key, occurrence));
                     }
                 }
@@ -1071,15 +1179,12 @@ impl GraphState {
         }
         if hub_healthy {
             let fp_state = lock_recover(&self.fp_map);
-            if let (Some(map), Some(walked_at)) = (fp_state.map.as_ref(), fp_state.walked_at) {
+            if let (Some(map), Some(roots), Some(walked_at)) =
+                (fp_state.map.as_ref(), fp_state.roots.as_ref(), fp_state.walked_at)
+            {
                 if walked_at.elapsed() < WALK_VERIFY_INTERVAL {
-                    let entries: Vec<(String, u128, u64)> =
-                        map.iter().map(|(p, (m, l))| (p.clone(), *m, *l)).collect();
-                    let fp = crate::graph_db::GraphFp {
-                        files: fold_fingerprint_entries(&entries),
-                        topology: fp_state.topology,
-                    };
-                    let clean = fp_state.clean;
+                    let fp = fold_portable_fingerprint(map, fp_state.topology);
+                    let clean = fp_state.clean && !roots.is_empty();
                     *cache = Some(ScanCache {
                         at: Instant::now(),
                         disk_fp: fp,
@@ -1106,14 +1211,31 @@ impl GraphState {
             // before it: a change delivered here belongs to neither.
             hook(self);
         }
-        let mut entries: Vec<(String, u128, u64)> =
-            universe.stats.into_iter().map(|s| (s.path, s.mtime, s.len)).collect();
-        entries.sort();
-        let topology = super::scan::topology_u64(&project.configs);
-        let fp = crate::graph_db::GraphFp { files: fold_fingerprint_entries(&entries), topology };
+        let keys_complete = project.search_roots.as_ref().is_some_and(|roots| {
+            universe
+                .stats
+                .iter()
+                .all(|stat| stat.key(roots).is_some() && stat.content_hash().is_some())
+        });
+        let topology = project.portable_topology;
+        let fp = super::scan::fingerprint_of_project(&universe.stats, &project);
+        let portable_complete = keys_complete && fp.is_some();
+        let clean = clean && portable_complete;
+        let fp = fp.unwrap_or(crate::graph_db::GraphFp { files: 0, topology });
+        let map = portable_complete.then(|| {
+            project.search_roots.as_ref().expect("portable_complete implies roots").clone()
+        });
+        let map = map.map(|roots| {
+            universe
+                .stats
+                .iter()
+                .filter_map(|stat| stat.key(&roots).zip(stat.content_hash()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        });
         {
             let mut fp_state = lock_recover(&self.fp_map);
-            fp_state.map = Some(entries.into_iter().map(|(p, m, l)| (p, (m, l))).collect());
+            fp_state.map = map;
+            fp_state.roots = project.search_roots.clone();
             fp_state.walked_at = Some(Instant::now());
             fp_state.topology = topology;
             fp_state.clean = clean;
@@ -1189,18 +1311,42 @@ impl GraphState {
             fp_state.walked_at = None;
             return;
         }
-        let Some(map) = fp_state.map.as_mut() else {
+        let Some(roots) = fp_state.roots.clone() else {
+            fp_state.map = None;
+            fp_state.walked_at = None;
+            fp_state.clean = false;
             return;
         };
+        if fp_state.map.is_none() {
+            return;
+        }
+        let mut updates = Vec::with_capacity(relevant.len());
         for entry in relevant {
-            let key = entry.canonical.to_string_lossy().into_owned();
-            match stat_pair(&entry.canonical) {
-                Some(pair) => {
-                    map.insert(key, pair);
+            let Some(key) = roots.root_of(&entry.raw, &entry.canonical) else {
+                fp_state.map = None;
+                fp_state.walked_at = None;
+                fp_state.clean = false;
+                return;
+            };
+            match std::fs::read(&entry.canonical) {
+                Ok(bytes) => updates.push((key, Some(*blake3::hash(&bytes).as_bytes()))),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    updates.push((key, None));
                 }
-                None => {
-                    map.remove(&key);
+                Err(_) => {
+                    fp_state.map = None;
+                    fp_state.walked_at = None;
+                    fp_state.clean = false;
+                    return;
                 }
+            }
+        }
+        let Some(map) = fp_state.map.as_mut() else { return };
+        for (key, hash) in updates {
+            if let Some(hash) = hash {
+                map.insert(key, hash);
+            } else {
+                map.remove(&key);
             }
         }
     }
@@ -1229,24 +1375,26 @@ pub(super) fn entry_is_config_file(entry: &ChangeEntry) -> bool {
     is_config(&entry.canonical) || is_config(&entry.raw)
 }
 
-pub(super) fn fold_fingerprint_entries(entries: &[(String, u128, u64)]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    entries.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn stat_pair(path: &Path) -> Option<(u128, u64)> {
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() {
-        return None;
+fn fold_portable_fingerprint(
+    entries: &std::collections::BTreeMap<bsl_search::FileKey, [u8; 32]>,
+    topology: u64,
+) -> crate::graph_db::GraphFp {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bsl-analyzer-portable-files-v1\0");
+    for (key, hash) in entries {
+        hasher.update(&(key.root_id.len() as u64).to_le_bytes());
+        hasher.update(key.root_id.as_bytes());
+        hasher.update(&(key.path.len() as u64).to_le_bytes());
+        hasher.update(key.path.as_bytes());
+        hasher.update(hash);
     }
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    Some((mtime, meta.len()))
+    let digest = hasher.finalize();
+    crate::graph_db::GraphFp {
+        files: u64::from_le_bytes(
+            digest.as_bytes()[..8].try_into().expect("blake3 yields >= 8 bytes"),
+        ),
+        topology,
+    }
 }
 
 #[cfg(test)]
@@ -1268,7 +1416,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
             crate::graph::test_support::sample_workspace(root);
-            let hub = crate::change_hub::WorkspaceChangeHub::start(vec![root.to_path_buf()]);
+            let hub = crate::graph::test_support::workspace_hub(root);
             assert!(hub.wait_until_watching(std::time::Duration::from_secs(5)));
             let before = hub.active_cursor_count();
             let graph = Arc::new(
@@ -1345,7 +1493,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         crate::graph::test_support::sample_workspace(root);
-        let hub = crate::change_hub::WorkspaceChangeHub::start(vec![root.to_path_buf()]);
+        let hub = crate::graph::test_support::workspace_hub(root);
         assert!(hub.wait_until_watching(std::time::Duration::from_secs(5)));
         let before = hub.active_cursor_count();
 
@@ -1383,7 +1531,6 @@ mod tests {
         sample_workspace, seed_cache, wait_ready, wait_until, wait_until_within, write,
     };
     use super::*;
-    use crate::change_hub::WorkspaceChangeHub;
     use std::time::Duration;
 
     #[test]
@@ -1844,7 +1991,7 @@ mod tests {
         std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
         sample_workspace(root);
 
-        let hub = WorkspaceChangeHub::start(vec![root.to_path_buf()]);
+        let hub = crate::graph::test_support::workspace_hub(root);
         assert!(hub.wait_until_watching(Duration::from_secs(5)));
         let mut graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
         graph.drift_interval = Duration::from_secs(120);
@@ -1931,7 +2078,7 @@ mod tests {
         write(root, "Configuration.xml", "<Configuration/>");
         write(ext, "Configuration.xml", "<Configuration/>");
 
-        let hub = WorkspaceChangeHub::start(vec![root.to_path_buf()]);
+        let hub = crate::graph::test_support::workspace_hub(root);
         assert!(hub.wait_until_watching(Duration::from_secs(5)));
         let mut graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
         graph.drift_interval = Duration::ZERO;
@@ -1995,13 +2142,11 @@ mod tests {
     /// forever if its thread is gone.
     #[test]
     fn a_foreign_cursors_debt_does_not_cost_the_graph_a_walk() {
-        use crate::change_hub::WorkspaceChangeHub;
-
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         sample_workspace(root);
 
-        let hub = WorkspaceChangeHub::start(vec![root.to_path_buf()]);
+        let hub = crate::graph::test_support::workspace_hub(root);
         assert!(hub.wait_until_watching(Duration::from_secs(5)));
         let mut graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
         // Without this the throttled scan cache answers before the health question is ever
@@ -2075,7 +2220,7 @@ mod tests {
         let root = dir.path();
         write_extension_workspace(root, false);
 
-        let hub = WorkspaceChangeHub::start(vec![root.to_path_buf()]);
+        let hub = crate::graph::test_support::workspace_hub(root);
         assert!(hub.wait_until_watching(Duration::from_secs(5)));
         let mut graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
         graph.drift_interval = Duration::from_secs(120);
@@ -2122,7 +2267,7 @@ mod tests {
         std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
         sample_workspace(root);
 
-        let hub = WorkspaceChangeHub::start(vec![root.to_path_buf()]);
+        let hub = crate::graph::test_support::workspace_hub(root);
         assert!(hub.wait_until_watching(Duration::from_secs(5)));
         let mut graph = GraphState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
         graph.drift_interval = Duration::from_secs(120);
@@ -2379,7 +2524,7 @@ mod tests {
         // so nothing it did proves anything about an obligation.
         let blind_metadata = graph.recovery_proof(
             2,
-            None,
+            None::<&[String]>,
             RecoveryCoverage::Walked {
                 scope: validated.clone(),
                 enumerated: &enumerated_with,
@@ -2428,7 +2573,7 @@ mod tests {
         let enumerated: std::collections::HashSet<&str> = ["/ws/Модуль.bsl"].into_iter().collect();
         let blind = graph.recovery_proof(
             2,
-            None,
+            None::<&[String]>,
             RecoveryCoverage::Walked {
                 scope: super::super::debt::RecoveryScope::of(
                     &[std::path::PathBuf::from("/ws")],
@@ -2449,25 +2594,64 @@ mod tests {
             "and it claimed authority over what is still unread",
         );
 
-        // The strict reader itself: an absent key is an empty set, a broken payload is an
-        // error.
+        // The strict reader itself: a missing key is an incomplete schema-21 artefact,
+        // an explicit empty array is valid, and a broken payload is an error.
         let path = dir.path().join("meta.sqlite");
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)", []).unwrap();
-        assert_eq!(
-            crate::graph_db::read_unread_paths_strict(&conn).unwrap(),
-            Vec::<String>::new(),
-            "an artefact that recorded nothing unread has nothing unread",
-        );
-        conn.execute("INSERT INTO meta (key, value) VALUES ('unread_paths', 'not json')", [])
-            .unwrap();
         assert!(
-            crate::graph_db::read_unread_paths_strict(&conn).is_err(),
+            crate::graph_db::read_unread_keys_strict(&conn).is_err(),
+            "schema 21 requires unread_paths metadata even when the set is empty",
+        );
+        conn.execute("INSERT INTO meta (key, value) VALUES ('unread_paths', '[]')", []).unwrap();
+        assert_eq!(
+            crate::graph_db::read_unread_keys_strict(&conn).unwrap(),
+            Vec::<bsl_search::FileKey>::new(),
+            "an explicit empty unread set is valid metadata",
+        );
+        conn.execute("UPDATE meta SET value = 'not json' WHERE key = 'unread_paths'", []).unwrap();
+        assert!(
+            crate::graph_db::read_unread_keys_strict(&conn).is_err(),
             "a payload that will not decode was read as an empty answer",
         );
         assert!(
             crate::graph_db::read_unread_paths(&conn).is_empty(),
             "control: the lenient reader still answers empty, which is why it is not authority",
         );
+        conn.execute(
+            "UPDATE meta SET value = '[\"/ws/legacy.bsl\"]' WHERE key = 'unread_paths'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            crate::graph_db::read_unread_keys_strict(&conn).is_err(),
+            "schema 21 requires structured root/path unread keys",
+        );
+    }
+
+    #[test]
+    fn prepare_snapshot_rejects_corrupt_unread_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let fingerprint = workspace_fingerprint(root);
+        seed_cache(root, fingerprint);
+
+        let path = crate::cache::graph_db_path(root);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("UPDATE meta SET value = 'not json' WHERE key = 'unread_paths'", []).unwrap();
+        drop(conn);
+
+        let graph = GraphState::for_workspace(root.to_path_buf());
+        match graph.prepare_snapshot_pool(7, fingerprint, false) {
+            Err(SnapshotPrepareError::Open(error)) => assert!(
+                error.to_string().contains("structured unread_paths"),
+                "corrupt unread metadata must retain its cause: {error:#}"
+            ),
+            Err(SnapshotPrepareError::Changed) => {
+                panic!("corrupt unread metadata must be an operation error")
+            }
+            Ok(_) => panic!("corrupt unread metadata must prevent snapshot preparation"),
+        }
     }
 }
