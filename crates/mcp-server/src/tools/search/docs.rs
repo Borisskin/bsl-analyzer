@@ -4,13 +4,17 @@ use super::gating::{
     map_reference_baseline_resolution,
 };
 use super::render::{
-    format_doc_hits, format_lexical_doc_hits, format_semantic_doc_hits, no_hits_response, Envelope,
+    doc_hit_blocks, embedding_mcp_error, failure_hits_response, format_doc_hits,
+    format_lexical_doc_hits, format_semantic_doc_hits, lexical_doc_hit_blocks, no_hits_response,
+    not_ready_with_failure, Envelope,
 };
 use super::status::docs_not_ready;
 use super::types::{AcquireFailure, SearchFailure};
 use super::wait::{embed_unless_cancelled, Withdrawn};
 use crate::baseline::{BaselineCall, ConfiguredBaselineStatus, ExternalBaselineService};
-use bsl_search::{lexical_hits_for_resolved_view, SearchEngine, SearchError};
+use bsl_search::{
+    lexical_hits_for_resolved_view, EmbeddingFailure, SearchEngine, SearchError, SearchHit,
+};
 use rmcp::model::CallToolResult;
 use rmcp::ErrorData as McpError;
 use std::sync::{Arc, MutexGuard};
@@ -44,9 +48,11 @@ fn engine_guard<'a>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn find_docs(
     engine: &crate::state::SharedSearchEngine,
     cancel: &CancellationToken,
+    semantic_failure: Option<EmbeddingFailure>,
     configured_baseline: Option<&ConfiguredBaselineStatus>,
     external_baseline: Option<Arc<ExternalBaselineService>>,
     query: &str,
@@ -56,7 +62,7 @@ pub fn find_docs(
     ensure_reference_baseline_runtime_ready(configured_baseline, external_baseline.as_ref())?;
     let guard = match engine_guard(engine, cancel, "find_docs")? {
         Ok(guard) => guard,
-        Err(not_ready) => return Ok(not_ready),
+        Err(not_ready) => return Ok(not_ready_with_failure(not_ready, semantic_failure)),
     };
 
     if let Some(source) = external_baseline {
@@ -73,11 +79,23 @@ pub fn find_docs(
                 limit,
             ))? {
                 Ok(hits) if !hits.is_empty() => {
-                    return Ok(format_lexical_doc_hits(&hits, max_output_tokens)
-                        .into_response("find_docs"));
+                    return Ok(match semantic_failure {
+                        Some(failure) => failure_hits_response(
+                            lexical_doc_hit_blocks(&hits),
+                            "",
+                            None,
+                            Envelope::No,
+                            "find_docs",
+                            failure,
+                            max_output_tokens,
+                            None,
+                        ),
+                        None => format_lexical_doc_hits(&hits, max_output_tokens)
+                            .into_response("find_docs"),
+                    });
                 }
                 Ok(_) => {
-                    return Ok(no_hits_response(None, Envelope::No, "find_docs", None));
+                    return Ok(find_docs_response(&[], semantic_failure, max_output_tokens));
                 }
                 Err(error) => {
                     if error.is_terminal() {
@@ -97,26 +115,40 @@ pub fn find_docs(
                 "failed to resolve external reference baseline view for lexical search",
             )? {
                 let hits = lexical_hits_for_resolved_view(&view, query, limit, Some("platform"));
-                if !hits.is_empty() {
-                    return Ok(format_doc_hits(&hits, max_output_tokens).into_response("find_docs"));
-                }
-                return Ok(no_hits_response(None, Envelope::No, "find_docs", None));
+                return Ok(find_docs_response(&hits, semantic_failure, max_output_tokens));
             }
         }
     }
 
     let Some(engine) = guard.as_ref() else {
-        return Ok(docs_not_ready("find_docs"));
+        return Ok(not_ready_with_failure(docs_not_ready("find_docs"), semantic_failure));
     };
     let hits = engine
         .text_search(query, limit, Some("platform"))
         .map_err(|e| McpError::internal_error(format!("search error: {e}"), None))?;
 
-    if hits.is_empty() {
-        return Ok(no_hits_response(None, Envelope::No, "find_docs", None));
-    }
+    Ok(find_docs_response(&hits, semantic_failure, max_output_tokens))
+}
 
-    Ok(format_doc_hits(&hits, max_output_tokens).into_response("find_docs"))
+fn find_docs_response(
+    hits: &[SearchHit],
+    failure: Option<EmbeddingFailure>,
+    budget: usize,
+) -> CallToolResult {
+    match failure {
+        Some(failure) => failure_hits_response(
+            doc_hit_blocks(hits),
+            "",
+            None,
+            Envelope::No,
+            "find_docs",
+            failure,
+            budget,
+            None,
+        ),
+        None if hits.is_empty() => no_hits_response(None, Envelope::No, "find_docs", None),
+        None => format_doc_hits(hits, budget).into_response("find_docs"),
+    }
 }
 
 fn semantic_not_available() -> McpError {
@@ -127,9 +159,11 @@ fn semantic_not_available() -> McpError {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn search_docs(
     engine: &crate::state::SharedSearchEngine,
     cancel: &CancellationToken,
+    semantic_failure: Option<EmbeddingFailure>,
     configured_baseline: Option<&ConfiguredBaselineStatus>,
     external_baseline: Option<Arc<ExternalBaselineService>>,
     query: &str,
@@ -137,6 +171,23 @@ pub fn search_docs(
     max_output_tokens: usize,
 ) -> Result<CallToolResult, SearchFailure> {
     ensure_reference_baseline_runtime_ready(configured_baseline, external_baseline.as_ref())?;
+    if cancel.is_cancelled() {
+        return Err(SearchFailure::Cancelled);
+    }
+    let resolve_baseline = || match external_baseline.as_ref() {
+        Some(source) => map_reference_baseline_resolution(
+            configured_baseline,
+            unless_withdrawn(source.resolve_snapshot(cancel))?,
+            "failed to resolve external reference baseline snapshot for semantic search",
+        )
+        .map_err(SearchFailure::from),
+        None => Ok(None),
+    };
+    if let Some(failure) = semantic_failure {
+        // Preserve terminal baseline precedence without waiting on the engine or embedding.
+        resolve_baseline()?;
+        return Err(embedding_mcp_error(failure).into());
+    }
 
     // The same shape as the semantic code path: take what the embed needs from the engine,
     // release the lock, embed off it, take the lock again for the now-fast search. The
@@ -162,21 +213,16 @@ pub fn search_docs(
     let Some(embedder) = embedder else {
         return Err(semantic_not_available().into());
     };
-
-    // Resolve the baseline snapshot BEFORE the embed, off the lock: a terminal baseline
-    // failure must not cost a wasted round-trip to the embedder.
-    let resolved = match external_baseline.as_ref() {
-        Some(source) => map_reference_baseline_resolution(
-            configured_baseline,
-            unless_withdrawn(source.resolve_snapshot(cancel))?,
-            "failed to resolve external reference baseline snapshot for semantic search",
-        )?,
-        None => None,
-    };
+    // An unconfigured semantic engine keeps its original early refusal; a configured one
+    // resolves terminal baseline failures before spending a query request.
+    let resolved = resolve_baseline()?;
 
     let query_embedding = match embed_unless_cancelled(embedder, query, cancel) {
         Err(Withdrawn) => return Err(SearchFailure::Cancelled),
         Ok(Ok(vector)) => vector,
+        Ok(Err(e)) if e.embedding_failure().is_some() => {
+            return Err(embedding_mcp_error(e.embedding_failure().unwrap()).into());
+        }
         Ok(Err(e)) => {
             return Err(McpError::internal_error(format!("search error: {e}"), None).into());
         }
@@ -283,6 +329,7 @@ mod tests {
             &never(),
             None,
             None,
+            None,
             "Массив",
             10,
             usize::MAX,
@@ -293,7 +340,7 @@ mod tests {
         assert!(text.starts_with("#1 ["), "text listing unchanged: {text}");
 
         let body = result.structured_content.as_ref().expect("structured listing");
-        assert_eq!(body["schema_version"], "4");
+        assert_eq!(body["schema_version"], "6");
         assert_eq!(body["action"], "find_docs");
         let hits = body["hits"].as_array().expect("hits array");
         assert_eq!(hits[0]["rank"], 1);
@@ -332,6 +379,7 @@ mod tests {
         let result = find_docs(
             &crate::state::shared_engine(Some(engine)),
             &never(),
+            None,
             None,
             None,
             &query,
@@ -377,6 +425,7 @@ mod tests {
             &never(),
             None,
             None,
+            None,
             &format!("создать значение {}", expected.owner),
             10,
             usize::MAX,
@@ -400,6 +449,7 @@ mod tests {
             &never(),
             None,
             None,
+            None,
             "Массив",
             10,
             usize::MAX,
@@ -416,6 +466,7 @@ mod tests {
         let empty = find_docs(
             &crate::state::shared_engine(Some(engine)),
             &never(),
+            None,
             None,
             None,
             "Массив",
@@ -453,6 +504,7 @@ mod tests {
             &crate::state::shared_engine(Some(engine)),
             &never(),
             None,
+            None,
             Some(source),
             "Массив",
             10,
@@ -474,6 +526,7 @@ mod tests {
         let error = find_docs(
             &crate::state::shared_engine(Some(engine)),
             &never(),
+            None,
             Some(&ConfiguredBaselineStatus {
                 backend: "postgres",
                 selection: "latest reference".to_owned(),
@@ -509,6 +562,7 @@ mod tests {
         let error = search_docs(
             &crate::state::shared_engine(Some(engine)),
             &never(),
+            None,
             Some(&ConfiguredBaselineStatus {
                 backend: "postgres",
                 selection: "latest reference".to_owned(),
@@ -557,6 +611,7 @@ mod tests {
         let result = search_docs(
             &crate::state::shared_engine(Some(engine)),
             &never(),
+            None,
             None,
             Some(source),
             "Массив",

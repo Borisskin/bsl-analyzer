@@ -32,8 +32,11 @@ struct ResidentBuild {
     stats: HashMap<String, u64>,
     config_fp: u64,
     scan_roots: Vec<PathBuf>,
-    /// The build snapshot's topology hash, for the hub re-arm supersession guard.
+    /// The build snapshot's portable topology hash, published in the freshness envelope.
     topology: u64,
+    /// The physical topology hash, for the hub re-arm supersession guard: the hub watches
+    /// directories, and a root retargeted to another directory keeps its portable hash.
+    physical_topology: u64,
     /// Whether the walk this resident was built from could speak for the whole tree.
     scan_clean: bool,
 }
@@ -577,7 +580,7 @@ impl DiagnosticsState {
                 }
                 *lock_recover(&self.scan) = None;
                 tracing::info!(files, "diagnostics resident db ready");
-                self.ensure_hub_roots(&built.scan_roots, built.topology);
+                self.ensure_hub_roots(&built.scan_roots, built.physical_topology);
                 self.recheck_config_identity_after_publish();
             }
             Err(msg) => {
@@ -660,7 +663,7 @@ impl DiagnosticsState {
                 drop(inner);
                 *lock_recover(&self.scan) = None;
                 tracing::info!(files, "diagnostics resident db reloaded");
-                self.ensure_hub_roots(&built.scan_roots, built.topology);
+                self.ensure_hub_roots(&built.scan_roots, built.physical_topology);
                 self.recheck_config_identity_after_publish();
             }
             Err(msg) => {
@@ -836,6 +839,7 @@ impl DiagnosticsState {
             config_fp,
             scan_roots: snapshot.scan_roots,
             topology,
+            physical_topology: crate::graph::scan::topology_u64(&snapshot.configs),
             scan_clean,
         })
     }
@@ -851,7 +855,7 @@ impl DiagnosticsState {
         // A slow build finishing after a newer topology reload must not roll the
         // shared hub back onto its older root set (see the graph-side twin).
         let live = crate::graph::input::ProjectSnapshot::load_excluding(root, &self.excluded);
-        if live.portable_topology != built_topology {
+        if crate::graph::scan::topology_u64(&live.configs) != built_topology {
             tracing::info!("skipping hub re-arm: the built snapshot's topology is superseded");
             return;
         }

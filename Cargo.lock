@@ -400,6 +400,8 @@ dependencies = [
  "vfs",
  "vfs-notify",
  "walkdir",
+ "win-security-identifier",
+ "windows-sys 0.61.2",
  "winresource",
  "zip",
 ]
@@ -505,6 +507,7 @@ dependencies = [
  "serde_json",
  "syntax",
  "tempfile",
+ "test-utils",
  "thiserror 1.0.69",
  "tracing",
  "tracing-subscriber",

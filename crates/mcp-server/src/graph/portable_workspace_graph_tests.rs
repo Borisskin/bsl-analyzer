@@ -375,6 +375,7 @@ fn moved_cached_graph_reuses_revision_reads_new_sources_and_preserves_search_vec
     let cache = WorkspaceCacheLayout::for_workspace(&new_root);
     let server = CountingEmbeddingServer::start();
     let server_url = server.url();
+    let _test_embedding = crate::state::test_support::EnvVarGuard::set("BSL_TEST_EMBEDDING", "1");
     let _embedding_url = crate::state::test_support::EnvVarGuard::set("EMBEDDING_URL", &server_url);
     let _embedding_model =
         crate::state::test_support::EnvVarGuard::set("EMBEDDING_MODEL", "test-model");
@@ -854,6 +855,7 @@ fn incompatible_graph_format_builds_once_without_reembedding_ready_search_index(
 
     let server = CountingEmbeddingServer::start();
     let server_url = server.url();
+    let _test_embedding = crate::state::test_support::EnvVarGuard::set("BSL_TEST_EMBEDDING", "1");
     let _embedding_url = crate::state::test_support::EnvVarGuard::set("EMBEDDING_URL", &server_url);
     let _embedding_model =
         crate::state::test_support::EnvVarGuard::set("EMBEDDING_MODEL", "test-model");
@@ -894,4 +896,82 @@ fn incompatible_graph_format_builds_once_without_reembedding_ready_search_index(
     assert_eq!(contexts_after, contexts_before, "graph format rebuild keeps graph contexts");
     assert_eq!(server.calls(), 0, "graph format migration must not call the model");
     state.shutdown();
+}
+
+/// Set every workspace file an hour back, so no hash taken of it falls in the racy window.
+fn age_tree(root: &Path) {
+    let hour_ago = SystemTime::now() - Duration::from_secs(3600);
+    for entry in fs::read_dir(root).expect("read workspace directory") {
+        let path = entry.expect("workspace entry").path();
+        if path.is_dir() {
+            age_tree(&path);
+        } else {
+            set_file_modified(&path, hour_ago);
+        }
+    }
+}
+
+fn scan_project(root: &Path) -> (super::input::ProjectSnapshot, bsl_search::WorkspaceRoots) {
+    let cache = WorkspaceCacheLayout::for_workspace(root);
+    let excluded: Vec<_> = cache.spellings().iter().map(|path| path.to_path_buf()).collect();
+    let project = super::input::ProjectSnapshot::load_excluding(root, &excluded);
+    let roots = project.search_roots.clone().expect("validated workspace roots");
+    (project, roots)
+}
+
+/// A restarted process reuses the hashes the cached graph recorded for unchanged files, and a
+/// copied tree — other inodes, other change times — is read in full.
+#[test]
+fn a_restarted_process_reuses_the_hashes_its_graph_recorded() {
+    let dir = tempfile::tempdir().expect("workspace tempdir");
+    let root = dir.path().join("ws");
+    sample_workspace(&root);
+    super::test_support::write(&root, "Configuration.xml", "<Configuration/>");
+    super::test_support::write(
+        &root,
+        "bsl-analyzer.toml",
+        "[source]\nroot = \".\"\nextensions = []\n",
+    );
+    age_tree(&root);
+    let fingerprint = super::scan::workspace_fingerprint(&root);
+    seed_cache(&root, fingerprint);
+
+    let (project, roots) = scan_project(&root);
+    super::content_hash::forget_under(&root);
+    let cold =
+        super::universe::ScannedUniverse::scan_excluding(&project.scan_roots, &project.excluded);
+    assert!(cold.hashed_files > 0, "a process that remembers nothing reads every file");
+    super::content_hash::forget_under(&root);
+    super::content_hash::seed(crate::graph_db::read_stored_observations(
+        &WorkspaceCacheLayout::for_workspace(&root).graph_db_path(),
+        &roots,
+    ));
+    let seeded =
+        super::universe::ScannedUniverse::scan_excluding(&project.scan_roots, &project.excluded);
+    assert_eq!(seeded.hashed_files, 0, "the recorded hashes stand in for the reads");
+    assert_eq!(
+        super::scan::fingerprint_of_project(&seeded.stats, &project),
+        Some(fingerprint),
+        "reused hashes describe the same content",
+    );
+
+    let copy = dir.path().join("copy");
+    copy_tree(&root, &copy);
+    age_tree(&copy);
+    let (copy_project, copy_roots) = scan_project(&copy);
+    super::content_hash::seed(crate::graph_db::read_stored_observations(
+        &WorkspaceCacheLayout::for_workspace(&copy).graph_db_path(),
+        &copy_roots,
+    ));
+    let copied = super::universe::ScannedUniverse::scan_excluding(
+        &copy_project.scan_roots,
+        &copy_project.excluded,
+    );
+    #[cfg(unix)]
+    assert_eq!(copied.hashed_files, copied.stats.len(), "a copy is read in full");
+    assert_eq!(
+        super::scan::fingerprint_of_project(&copied.stats, &copy_project).map(|fp| fp.files),
+        Some(fingerprint.files),
+        "the copy has the same content identity",
+    );
 }

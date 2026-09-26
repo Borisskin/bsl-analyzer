@@ -12,21 +12,7 @@ use rmcp::ErrorData as McpError;
 use serde_json::json;
 use std::collections::HashSet;
 use std::fmt::Write;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-
-/// Append live indexing progress to a "still building" message so the failed `search_code`
-/// response carries the same signal as `search(status)`, instead of a flat "try again" that
-/// hides whether the build is progressing or stuck.
-pub(super) fn with_index_progress(message: String, progress: &IndexProgress) -> String {
-    if progress.is_active() {
-        let done_b = progress.done_batches.load(Ordering::Relaxed);
-        let total_b = progress.total_batches.load(Ordering::Relaxed);
-        format!("{message} (indexing {}% — {done_b}/{total_b} batches)", progress.percent())
-    } else {
-        message
-    }
-}
 
 /// Poll-back hint (ms) for a not-ready `search_code` response. Index build and overlay
 /// warmup advance on a multi-second cadence, so a sub-second retry just spins.
@@ -47,18 +33,8 @@ pub(crate) fn search_not_ready(
     progress: &IndexProgress,
     action: &str,
 ) -> CallToolResult {
-    let mut prog = json!({ "active": progress.is_active() });
-    if progress.is_active() {
-        prog["pct"] = json!(progress.percent());
-        prog["batches"] = json!({
-            "done": progress.done_batches.load(Ordering::Relaxed),
-            "total": progress.total_batches.load(Ordering::Relaxed),
-        });
-        prog["chunks"] = json!({
-            "done": progress.done_chunks.load(Ordering::Relaxed),
-            "total": progress.total_chunks.load(Ordering::Relaxed),
-        });
-    }
+    let snapshot = progress.snapshot();
+    let prog = crate::indexing::legacy_progress(snapshot.as_ref());
     structured(json!({
         "action": action,
         "schema_version": super::types::search_schema_version(action),
@@ -206,6 +182,8 @@ pub(super) fn search_status_with_cap(
         .lock()
         .map_err(|e| McpError::internal_error(format!("semantic runtime lock error: {e}"), None))?
         .clone();
+    let semantic_failure =
+        overlay_warmup.embedding_failure().or_else(|| semantic_runtime.embedding_failure());
     // One non-blocking probe feeds every baseline-derived line below (summary wording, source
     // labels, the External baseline section). Status makes NO network round-trips of its own:
     // the probe serves the last completed background probe and re-kicks one when stale.
@@ -286,7 +264,7 @@ pub(super) fn search_status_with_cap(
             // An empty engine slot is not one state. The index may still be building, or its
             // initialization may have failed — and on that path nothing will publish a table
             // later, so telling the reader to wait would be advice to wait forever.
-            None if matches!(semantic_runtime, SemanticRuntimeStatus::Failed(_)) => {
+            None if semantic_runtime.is_failed() => {
                 let _ = writeln!(
                     out,
                     "  unavailable (search index initialization failed; see the runtime status \
@@ -361,7 +339,9 @@ pub(super) fn search_status_with_cap(
         );
 
         let search_state = match &semantic_runtime {
-            SemanticRuntimeStatus::Failed(_) => "ready (semantic runtime failed)",
+            SemanticRuntimeStatus::Failed(_) | SemanticRuntimeStatus::EmbeddingFailed(_) => {
+                "ready (semantic runtime failed)"
+            }
             // Honest about the window the watcher/overlay sync briefly holds the engine lock:
             // a concurrent search_code now queues behind that hold (it blocks on the engine
             // mutex rather than failing) and returns real results once the sync frees the lock,
@@ -398,10 +378,9 @@ pub(super) fn search_status_with_cap(
                 }
                 WorkspaceSearchMode::SqliteLocal => "syncing local semantic index".to_owned(),
             },
-            SemanticRuntimeStatus::Indexing => with_index_progress(
-                "building local semantic index in background".to_owned(),
-                progress,
-            ),
+            SemanticRuntimeStatus::Indexing => {
+                "building local semantic index in background".to_owned()
+            }
             SemanticRuntimeStatus::Ready => match workspace_search_mode {
                 WorkspaceSearchMode::PostgresRemoteOverlay => {
                     if semantic {
@@ -420,6 +399,7 @@ pub(super) fn search_status_with_cap(
             },
             SemanticRuntimeStatus::Failed(_) => "failed (inspect status)".to_owned(),
             SemanticRuntimeStatus::Stopped => "stopped with the daemon".to_owned(),
+            SemanticRuntimeStatus::EmbeddingFailed(failure) => format!("failed ({failure})"),
         };
         let _ = writeln!(out, "  Semantic: {semantic_status}");
         let _ = writeln!(out, "  FTS:      {}", if chunks > 0 { "available" } else { "empty" });
@@ -495,6 +475,9 @@ pub(super) fn search_status_with_cap(
                         (SemanticRuntimeStatus::Failed(_), _) => "failed".to_owned(),
                         (SemanticRuntimeStatus::Stopped, _) => {
                             "local sqlite semantic indexing stopped with the daemon".to_owned()
+                        }
+                        (SemanticRuntimeStatus::EmbeddingFailed(failure), _) => {
+                            format!("failed ({failure})")
                         }
                     };
                     let _ = writeln!(out, "  Code semantic source: {code_semantic_source}");
@@ -671,27 +654,8 @@ pub(super) fn search_status_with_cap(
         }
     }
 
-    // Always surface a progress signal while the index is building (engine not yet ready)
-    // or an overlay re-index is active — never a bare "building" line with nothing to poll.
-    // Live counters are shown ONLY while `active` (a build is genuinely counting); an
-    // inactive build object can hold stale totals from a finished/failed attempt (it is
-    // never reset()), so we report a phase line instead of misleading numbers.
-    // Genuinely building = we held the lock but the engine was not yet published. A busy timeout
-    // (no guard) is reported separately above as "Local index: busy", not as initializing.
-    if progress.is_active() {
-        let total = progress.total_chunks.load(Ordering::Relaxed);
-        let done = progress.done_chunks.load(Ordering::Relaxed);
-        let total_b = progress.total_batches.load(Ordering::Relaxed);
-        let done_b = progress.done_batches.load(Ordering::Relaxed);
-        let pct = progress.percent();
-
-        let _ = writeln!(out);
-        let _ = writeln!(out, "Indexing in progress: {pct}%");
-        let _ = writeln!(out, "  Batches:  {done_b}/{total_b}");
-        let _ = writeln!(out, "  Chunks:   {done}/{total}");
-    } else if index_building {
-        let _ = writeln!(out);
-        let _ = writeln!(out, "Indexing pending: initializing (no live counters yet)");
+    if index_building && !progress.is_active() {
+        let _ = writeln!(out, "\nIndexing pending: initializing (no live counters yet)");
     }
 
     let _ = writeln!(out);
@@ -703,23 +667,20 @@ pub(super) fn search_status_with_cap(
 
     let state = match engine_state {
         SummaryEngineState::Busy => "busy",
-        SummaryEngineState::Building
-            if matches!(semantic_runtime, SemanticRuntimeStatus::Failed(_)) =>
-        {
-            "failed"
-        }
+        SummaryEngineState::Building if semantic_runtime.is_failed() => "failed",
         SummaryEngineState::Building => "loading",
         SummaryEngineState::Ready => "ready",
     };
-    Ok(crate::tools::response::structured_with_text(
-        out,
-        json!({
-            "action": "status",
-            "schema_version": "1",
-            "profile": profile.as_str(),
-            "state": state,
-        }),
-    ))
+    let mut body = json!({
+        "action": "status",
+        "schema_version": "3",
+        "profile": profile.as_str(),
+        "state": state,
+    });
+    if let Some(failure) = semantic_failure {
+        body["semantic_failure"] = json!(failure);
+    }
+    Ok(crate::tools::response::structured_with_text(out, body))
 }
 
 /// Write the plain-language Summary block an LLM agent reads first. It states, in three to four
@@ -818,6 +779,9 @@ fn write_summary_block(
             "semantic indexing stopped with the daemon; nothing further will be embedded."
                 .to_owned()
         }
+        (SemanticRuntimeStatus::EmbeddingFailed(failure), _) => {
+            format!("embedding failed ({failure}).")
+        }
         (SemanticRuntimeStatus::OverlaySyncing, _) => {
             if baseline_probe_unreachable(baseline_probe) {
                 "local overlay still syncing; the shared baseline is not currently reachable (see the External baseline section).".to_owned()
@@ -872,6 +836,9 @@ fn write_summary_block(
                 }
                 OverlayWarmupState::Failed(reason) => format!(
                     "not built (warmup failed: {reason}); [S] still served by the baseline. The retry driver repeats the pass automatically."
+                ),
+                OverlayWarmupState::EmbeddingFailed(failure) => format!(
+                    "not built (warmup failed: {failure}); search_code uses lexical fallback. The retry driver repeats the pass after new workspace changes."
                 ),
                 OverlayWarmupState::Skipped(reason) => format!("disabled ({reason})."),
             }
@@ -958,9 +925,7 @@ mod workspace_changes_tests {
 #[cfg(test)]
 mod tests {
     use super::super::test_support::unreachable_workspace_service;
-    use super::{
-        baseline_warming_not_ready, search_status, search_status_with_cap, with_index_progress,
-    };
+    use super::{baseline_warming_not_ready, search_status, search_status_with_cap};
     use crate::baseline::{
         ConfiguredBaselineStatus, ExternalBaselineState, ExternalBaselineStatus,
     };
@@ -968,10 +933,84 @@ mod tests {
     use bsl_search::{Document, IndexProgress, SearchEngine};
     use rmcp::model::ErrorCode;
     use std::fs;
-    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Barrier, Mutex};
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
+
+    #[test]
+    fn payload_mcp_contract_status_preserves_lexical_state_and_selects_the_current_owner() {
+        use bsl_search::{EmbeddingFailure, EmbeddingFailureCode};
+        let dir = tempdir().unwrap();
+        let engine = crate::state::shared_engine(Some(
+            SearchEngine::fts_only(&dir.path().join("search.db")).unwrap(),
+        ));
+        let main_failure = EmbeddingFailure::new(EmbeddingFailureCode::EmbeddingTimeout);
+        let overlay_failure = EmbeddingFailure {
+            code: EmbeddingFailureCode::EmbeddingInputTooLarge,
+            request_bytes: Some(256),
+            max_request_bytes: Some(128),
+        };
+        let runtime = Arc::new(Mutex::new(SemanticRuntimeStatus::EmbeddingFailed(main_failure)));
+        let run = |profile, overlay| {
+            search_status_with_cap(
+                profile,
+                &engine,
+                &IndexProgress::new(),
+                &runtime,
+                WorkspaceSearchMode::SqliteLocal,
+                overlay,
+                None,
+                None,
+                false,
+                Duration::ZERO,
+            )
+            .unwrap()
+        };
+
+        for profile in [crate::McpProfile::Workspace, crate::McpProfile::Reference] {
+            let result = run(profile, OverlayWarmupState::Pending);
+            let body = result.structured_content.unwrap();
+            assert_eq!(body["schema_version"], "3");
+            assert_eq!(body["state"], "ready");
+            assert_eq!(body["semantic_failure"], serde_json::json!(main_failure));
+            assert!(result.content[0].as_text().unwrap().text.contains("embedding_timeout"));
+        }
+
+        let result =
+            run(crate::McpProfile::Workspace, OverlayWarmupState::EmbeddingFailed(overlay_failure));
+        assert_eq!(
+            result.structured_content.unwrap()["semantic_failure"],
+            serde_json::json!(overlay_failure)
+        );
+        let guard = engine.lock().unwrap();
+        let body =
+            run(crate::McpProfile::Workspace, OverlayWarmupState::EmbeddingFailed(overlay_failure))
+                .structured_content
+                .unwrap();
+        assert_eq!(body["state"], "busy");
+        assert_eq!(body["semantic_failure"], serde_json::json!(overlay_failure));
+        drop(guard);
+
+        *engine.lock().unwrap() = None;
+        let body = run(crate::McpProfile::Workspace, OverlayWarmupState::Pending)
+            .structured_content
+            .unwrap();
+        assert_eq!(body["state"], "failed");
+        assert_eq!(body["semantic_failure"], serde_json::json!(main_failure));
+        *runtime.lock().unwrap() = SemanticRuntimeStatus::Indexing;
+        let body =
+            run(crate::McpProfile::Workspace, OverlayWarmupState::EmbeddingFailed(overlay_failure))
+                .structured_content
+                .unwrap();
+        assert_eq!(body["state"], "loading");
+        assert_eq!(body["semantic_failure"], serde_json::json!(overlay_failure));
+        *runtime.lock().unwrap() = SemanticRuntimeStatus::Ready;
+        let body = run(crate::McpProfile::Reference, OverlayWarmupState::Pending)
+            .structured_content
+            .unwrap();
+        assert_eq!(body["state"], "loading");
+        assert!(body.get("semantic_failure").is_none());
+    }
 
     #[test]
     fn baseline_warming_not_ready_preserves_structured_envelope() {
@@ -1052,21 +1091,6 @@ mod tests {
                 .pending_dirty_paths,
             1,
             "status is a pure snapshot even when a refresh could consume the mark"
-        );
-    }
-
-    #[test]
-    fn index_progress_suffix_appended_only_when_active() {
-        let progress = IndexProgress::new();
-        assert_eq!(with_index_progress("building".to_owned(), &progress), "building");
-        progress.active.store(true, Ordering::Relaxed);
-        progress.total_chunks.store(100, Ordering::Relaxed);
-        progress.done_chunks.store(77, Ordering::Relaxed);
-        progress.total_batches.store(10, Ordering::Relaxed);
-        progress.done_batches.store(7, Ordering::Relaxed);
-        assert_eq!(
-            with_index_progress("building".to_owned(), &progress),
-            "building (indexing 77% — 7/10 batches)",
         );
     }
 
@@ -1263,6 +1287,7 @@ mod tests {
                 selection: "branch main".to_owned(),
                 resolved: None,
                 state: ExternalBaselineState::Error("connection refused".to_owned()),
+                semantic_details: None,
             },
             Duration::from_secs(1),
         );
@@ -1396,11 +1421,10 @@ mod tests {
         engine.index_directory_fts(workspace).unwrap();
         engine.set_workspace_root(workspace);
         let progress = Arc::new(IndexProgress::default());
-        progress.active.store(true, Ordering::Relaxed);
-        progress.total_chunks.store(200, Ordering::Relaxed);
-        progress.done_chunks.store(50, Ordering::Relaxed);
-        progress.total_batches.store(20, Ordering::Relaxed);
-        progress.done_batches.store(5, Ordering::Relaxed);
+        let _pass = progress.begin_pass();
+        let token = _pass.token();
+        token.set_totals(0, 200, 20);
+        token.advance(50, 5);
         let result = search_status(
             crate::McpProfile::Workspace,
             &crate::state::shared_engine(Some(engine)),
@@ -1422,7 +1446,7 @@ mod tests {
         assert!(text.contains("Search index: ready"));
         assert!(text.contains("overlay syncing") && text.contains("queues behind the sync"));
         assert!(text.contains("Semantic: syncing local overlay embeddings against remote baseline"));
-        assert!(text.contains("Indexing in progress: 25%"));
+        assert!(!text.contains("Indexing in progress: 25%"), "boundary owns counter rendering");
     }
 
     #[test]

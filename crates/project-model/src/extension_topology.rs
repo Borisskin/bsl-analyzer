@@ -666,12 +666,7 @@ where
             hasher.update(&[u8::from(!node.sees_every_extension)]);
         }
         field(&mut hasher, fold_lower_per_char(&node.name).as_bytes());
-        let encoded_path = if node.kind.is_external() {
-            node.canonical_path.as_os_str().as_encoded_bytes().to_vec()
-        } else {
-            path(&node.canonical_path)
-        };
-        field(&mut hasher, &encoded_path);
+        field(&mut hasher, &path(&node.canonical_path));
         let mut deps: Vec<String> = node
             .depends_on
             .iter()
@@ -720,6 +715,40 @@ mod tests {
 
     fn names(topology: &ExtensionTopology, ids: &[NodeId]) -> Vec<String> {
         ids.iter().map(|id| topology.node(*id).name().to_string()).collect()
+    }
+
+    /// A workspace moved as a whole keeps its portable topology — external objects included,
+    /// since discovery finds them under the workspace — while an external object that moves
+    /// inside the workspace still changes it.
+    #[test]
+    fn portable_fingerprint_survives_moving_the_workspace_with_external_objects() {
+        let topology_at = |workspace: &str, external: &str| {
+            let at = |relative: &str| PathBuf::from(format!("{workspace}/{relative}"));
+            let specs = vec![
+                ExtensionNodeSpec {
+                    path: at("cfe/one"),
+                    canonical_path: at("cfe/one"),
+                    ..spec("one", &[])
+                },
+                ExtensionNodeSpec {
+                    path: at(external),
+                    canonical_path: at(external),
+                    ..external_spec("Обработка", None)
+                },
+            ];
+            let base = at("cf");
+            let topology = ExtensionTopology::build(&base, specs).unwrap();
+            topology.portable_fingerprint(&base, Path::new(workspace))
+        };
+
+        assert_eq!(
+            topology_at("/old-ws", "src/epf/Обработка"),
+            topology_at("/new-ws", "src/epf/Обработка"),
+        );
+        assert_ne!(
+            topology_at("/old-ws", "src/epf/Обработка"),
+            topology_at("/old-ws", "epf/Обработка"),
+        );
     }
 
     #[test]

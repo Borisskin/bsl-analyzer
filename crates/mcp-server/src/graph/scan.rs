@@ -26,6 +26,11 @@ pub(crate) struct FileStat {
     /// The hash read during the owning scan. Keeping it with the stat means
     /// the verdict and the persisted fingerprint describe the same bytes.
     pub(crate) content_hash: Option<[u8; 32]>,
+    /// The stat identity `content_hash` was taken under, persisted so a later process can
+    /// reuse the hash without reading the file.
+    pub(crate) stat: super::content_hash::StatIdentity,
+    /// When the bytes behind `content_hash` were read; `None` when they were not.
+    pub(crate) observed_at_ns: Option<u128>,
 }
 
 impl FileStat {
@@ -40,6 +45,8 @@ impl FileStat {
             mtime,
             len,
             content_hash: None,
+            stat: super::content_hash::StatIdentity { len, mtime_ns: mtime, change: None },
+            observed_at_ns: None,
         }
     }
 
@@ -74,6 +81,15 @@ impl FileStat {
         })
     }
 
+    /// The observation behind `content_hash`, for a row whose bytes this scan actually read.
+    pub(crate) fn persisted_observation(&self) -> Option<super::content_hash::Observation> {
+        Some(super::content_hash::Observation {
+            stat: self.stat,
+            hash: self.content_hash?,
+            observed_at_ns: self.observed_at_ns?,
+        })
+    }
+
     /// The durable key for this scan row. Both spellings are required: the canonical
     /// spelling decides ownership when the target lies under a registered root, while
     /// the walked spelling is the only usable identity for a target outside all roots.
@@ -105,6 +121,8 @@ pub(crate) fn file_fingerprint(path: &Path) -> Option<u64> {
             mtime,
             len: meta.len(),
             content_hash: std::fs::read(path).ok().map(|bytes| *blake3::hash(&bytes).as_bytes()),
+            stat: super::content_hash::StatIdentity::of(&meta),
+            observed_at_ns: None,
         }
         .fingerprint(),
     )
@@ -149,8 +167,11 @@ pub(crate) fn scan_stats_over_roots_excluding(
     excluded: &[PathBuf],
 ) -> (Vec<FileStat>, super::universe::ScanVerdict) {
     let set = SourceSet::scan_excluding(roots, excluded);
-    let (stats, unreadable) = super::universe::file_stats_with_content_errors(&set);
-    (stats, super::universe::ScanVerdict::of(&set).with_content_unreadable(unreadable))
+    let scan = super::universe::file_stats_with_content_errors(&set, roots);
+    (
+        scan.stats,
+        super::universe::ScanVerdict::of(&set).with_content_unreadable(scan.content_unreadable),
+    )
 }
 
 /// A cheap fingerprint of the workspace identity: the order-independent fold of

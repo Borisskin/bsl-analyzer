@@ -5,7 +5,6 @@
 //! Uses the lightweight `reference` profile so no heavy workspace build is needed,
 //! and points the per-user runtime dir at a tempdir so the socket is isolated.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -260,7 +259,7 @@ async fn background_work_holds_the_backend_and_then_lets_it_go() {
     let key = key_for(&src);
 
     let state = SharedState::shared();
-    state.index_progress().active.store(true, Ordering::SeqCst);
+    let mut pass = state.index_progress().begin_pass();
     let server = McpServer::new(McpProfile::Reference, state.clone());
 
     // Long orphan grace, so only the idle TTL can explain an exit; the TTL is tiny, so the
@@ -280,7 +279,7 @@ async fn background_work_holds_the_backend_and_then_lets_it_go() {
         "the backend gave up while its background work was still running"
     );
 
-    state.index_progress().active.store(false, Ordering::SeqCst);
+    pass.finish(bsl_search::IndexPassState::Ready);
 
     let exited = tokio::time::timeout(Duration::from_secs(20), backend).await;
     assert!(exited.is_ok(), "the backend held on after its background work was done");

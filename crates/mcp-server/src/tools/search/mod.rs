@@ -1,6 +1,8 @@
 //! Search tool execution paths and stable public entrypoints.
 
 mod acquire;
+mod budget;
+pub(crate) use budget::finalize_indexed_response;
 mod call;
 #[cfg(test)]
 mod cancel_tests;
@@ -26,6 +28,7 @@ pub(crate) use wait::{await_reply, Withdrawn, REPLY_POLL};
 pub use docs::{find_docs, search_docs};
 #[allow(unused_imports)]
 pub use hybrid::{hybrid_code, hybrid_code_cancellable};
+pub(crate) use render::{embedding_mcp_error, not_ready_with_failure};
 pub use status::search_status;
 pub(crate) use status::{
     append_workspace_changes, baseline_warming_not_ready, docs_not_ready, search_not_ready,

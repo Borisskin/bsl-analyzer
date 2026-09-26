@@ -51,8 +51,10 @@ pub(crate) struct GraphPublishSignal {
     /// Search roots paired with this publication. A fresh build carries the exact
     /// [`crate::graph::ProjectSnapshot`] it built from; cached adoption carries the current
     /// validated project snapshot after proving its graph fingerprint matches the artifact.
-    /// `None` means project loading failed; consumers keep their last-known-good table and
-    /// report the root request unhandled.
+    /// `None` when project loading failed, and for a stale cached graph published while its
+    /// catch-up build runs. A root request is then reported unhandled and consumers keep their
+    /// last-known-good table; the graph's portable keys are resolved through the search
+    /// engine's own roots.
     pub(crate) workspace_roots: Option<bsl_search::WorkspaceRoots>,
 }
 

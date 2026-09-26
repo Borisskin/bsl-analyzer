@@ -77,7 +77,9 @@ use crate::graph::input::{build_source_root, db_for_files};
 // 21: graph file addresses are persisted as root_id/path pairs and the files
 // table carries full BLAKE3 content hashes, so absolute paths and stat-only
 // identity cannot survive as the current format.
-pub(crate) const SCHEMA_VERSION: u32 = 21;
+// 22: the files table records the stat identity each content hash was taken under, so a
+// later process reuses the hash of an unchanged file instead of reading it again.
+pub(crate) const SCHEMA_VERSION: u32 = 22;
 
 /// One file's persisted identity in the `files` table: its complete content hash,
 /// a compact projection retained for the existing drift API, and (for `.bsl`) its
@@ -95,6 +97,9 @@ pub(crate) struct FileFingerprint {
     /// Resolution-signature hash, `None` for `.xml` (filled in by the body-only fast
     /// path; currently always `None`).
     pub sig_hash: Option<u64>,
+    /// The stat identity `content_hash` was read under; `None` for a file whose bytes were
+    /// not read, so its unreadable marker is never taken for a content hash.
+    pub observation: Option<crate::graph::content_hash::Observation>,
 }
 
 /// The workspace identity a graph build reflects, as two independent components.
@@ -282,6 +287,12 @@ impl GraphDbWriter {
                 content_hash BLOB NOT NULL,
                 fingerprint  INTEGER NOT NULL,
                 sig_hash     INTEGER,
+                stat_len         INTEGER,
+                stat_mtime_ns    INTEGER,
+                stat_ctime_ns    INTEGER,
+                stat_ino         INTEGER,
+                stat_dev         INTEGER,
+                stat_observed_ns INTEGER,
                 PRIMARY KEY (root_id, path)
             ) WITHOUT ROWID;
 
@@ -395,17 +406,21 @@ impl GraphDbWriter {
     pub(crate) fn write_files(&mut self, rows: &[FileFingerprint]) -> anyhow::Result<()> {
         let tx = self.conn.transaction().context("begin files batch")?;
         {
-            let mut stmt = tx.prepare_cached(
-                "INSERT OR REPLACE INTO files (root_id, path, content_hash, fingerprint, sig_hash) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-            )?;
+            let mut stmt = tx.prepare_cached(FILES_INSERT_SQL)?;
             for row in rows {
+                let [len, mtime, ctime, ino, dev, observed] = observation_columns(row.observation);
                 stmt.execute(params![
                     row.root_id,
                     row.path,
                     row.content_hash.as_slice(),
                     row.fingerprint as i64,
                     row.sig_hash.map(|h| h as i64),
+                    len,
+                    mtime,
+                    ctime,
+                    ino,
+                    dev,
+                    observed,
                 ])?;
             }
         }
@@ -500,6 +515,91 @@ impl GraphDbWriter {
         self.conn.execute_batch("ANALYZE;").context("analyse graph database")?;
         Ok(())
     }
+}
+
+const FILES_INSERT_SQL: &str = "INSERT OR REPLACE INTO files \
+     (root_id, path, content_hash, fingerprint, sig_hash, \
+      stat_len, stat_mtime_ns, stat_ctime_ns, stat_ino, stat_dev, stat_observed_ns) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
+
+/// The stat columns of a `files` row. SQLite integers are signed 64-bit: nanosecond times fit
+/// until 2262, and inode/device numbers are stored bit for bit.
+fn observation_columns(
+    observation: Option<crate::graph::content_hash::Observation>,
+) -> [Option<i64>; 6] {
+    let Some(observation) = observation else { return [None; 6] };
+    let stat = observation.stat;
+    let change = stat.change;
+    [
+        Some(stat.len as i64),
+        Some(stat.mtime_ns as i64),
+        change.map(|change| change.ctime_ns as i64),
+        change.map(|change| change.ino as i64),
+        change.map(|change| change.dev as i64),
+        Some(observation.observed_at_ns as i64),
+    ]
+}
+
+/// The content hashes the graph at `db_path` recorded together with the stat identity they
+/// were read under, addressed through the current roots. A row whose file was not read, or
+/// whose stat columns are incomplete, carries nothing to reuse.
+pub(crate) fn read_stored_observations(
+    db_path: &Path,
+    roots: &bsl_search::WorkspaceRoots,
+) -> Vec<(PathBuf, crate::graph::content_hash::Observation)> {
+    use crate::graph::content_hash::{ChangeIdentity, Observation, StatIdentity};
+    let Ok(conn) =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        return Vec::new();
+    };
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT root_id, path, content_hash, stat_len, stat_mtime_ns, stat_ctime_ns, stat_ino, \
+                stat_dev, stat_observed_ns \
+         FROM files WHERE stat_len IS NOT NULL AND stat_mtime_ns IS NOT NULL \
+                      AND stat_observed_ns IS NOT NULL",
+    ) else {
+        return Vec::new();
+    };
+    type Row = (String, String, Vec<u8>, i64, i64, Option<i64>, Option<i64>, Option<i64>, i64);
+    let Ok(rows) = stmt.query_map([], |row| -> rusqlite::Result<Row> {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+            row.get(7)?,
+            row.get(8)?,
+        ))
+    }) else {
+        return Vec::new();
+    };
+    rows.flatten()
+        .filter_map(|(root_id, path, hash, len, mtime, ctime, ino, dev, observed)| {
+            let hash: [u8; 32] = hash.try_into().ok()?;
+            let change = match (ctime, ino, dev) {
+                (Some(ctime), Some(ino), Some(dev)) => Some(ChangeIdentity {
+                    ctime_ns: i128::from(ctime),
+                    ino: ino as u64,
+                    dev: dev as u64,
+                }),
+                (None, None, None) => None,
+                _ => return None,
+            };
+            let file = roots.resolve_walked(&bsl_search::FileKey::new(root_id, path))?;
+            Some((
+                file,
+                Observation {
+                    stat: StatIdentity { len: len as u64, mtime_ns: mtime as u128, change },
+                    hash,
+                    observed_at_ns: observed as u128,
+                },
+            ))
+        })
+        .collect()
 }
 
 fn durable_file_key(
@@ -604,9 +704,9 @@ fn unread_keys_from_paths(
         .collect()
 }
 
-/// The same modules, read STRICTLY: an absent key means "nothing was unread" — the schema
-/// version gates out artefacts that predate the key — but a query that fails or a payload that
-/// will not decode is a failure to LOOK, not an empty answer. The structured key is retained
+/// The same modules, read STRICTLY: every writer of the current schema records the key, even
+/// as an empty list, so an absent key, a query that fails or a payload that will not decode is
+/// a failure to LOOK, not an empty answer. The structured key is retained
 /// all the way to recovery; it must never be flattened with a separator that can collide with a
 /// root or path.
 pub(crate) fn read_unread_keys_strict(
@@ -981,6 +1081,7 @@ fn build_graph_database_inner(
                 content_hash,
                 fingerprint: s.fingerprint(),
                 sig_hash: sig_by_path.get(&s.path).copied(),
+                observation: s.persisted_observation(),
             })
         })
         .collect();
@@ -1451,10 +1552,23 @@ pub(crate) fn update_graph_database_bodies(
             };
             let content_hash = stat.persisted_content_hash();
             let sig = rows.sig_hashes.get(module).copied();
+            let [len, mtime, ctime, ino, dev, observed] =
+                observation_columns(stat.persisted_observation());
             tx.execute(
-                "INSERT OR REPLACE INTO files (root_id, path, content_hash, fingerprint, sig_hash) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![root_id, path, content_hash.as_slice(), stat.fingerprint() as i64, sig.map(|h| h as i64)],
+                FILES_INSERT_SQL,
+                params![
+                    root_id,
+                    path,
+                    content_hash.as_slice(),
+                    stat.fingerprint() as i64,
+                    sig.map(|h| h as i64),
+                    len,
+                    mtime,
+                    ctime,
+                    ino,
+                    dev,
+                    observed,
+                ],
             )?;
         }
 
@@ -1952,6 +2066,43 @@ mod tests {
         assert_eq!(qualified, "first", "INSERT OR IGNORE keeps the first-seen spelling");
     }
 
+    /// Only a row whose bytes were read carries a reusable hash: an unreadable file's marker
+    /// must never come back as its content.
+    #[test]
+    fn only_read_rows_are_offered_for_reuse() {
+        use crate::graph::content_hash::{Observation, StatIdentity};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bsl-graph.db");
+        let observation = Observation {
+            stat: StatIdentity { len: 3, mtime_ns: 5, change: None },
+            hash: [1; 32],
+            observed_at_ns: 7,
+        };
+        let row = |path: &str, observation| FileFingerprint {
+            root_id: "".to_string(),
+            path: path.to_string(),
+            content_hash: [1; 32],
+            fingerprint: 1,
+            sig_hash: None,
+            observation,
+        };
+        let mut w = GraphDbWriter::create(&path).unwrap();
+        w.write_files(&[row("Read.bsl", Some(observation)), row("Unread.bsl", None)]).unwrap();
+        w.finalize(&GraphMeta {
+            revision: 1,
+            fingerprint: GraphFp::default(),
+            files: 0,
+            built_at: "t".to_string(),
+        })
+        .unwrap();
+
+        let roots = bsl_search::WorkspaceRoots::build(dir.path(), dir.path(), &[]).0;
+        let offered = read_stored_observations(&path, &roots);
+        assert_eq!(offered.len(), 1, "{offered:?}");
+        assert!(offered[0].0.ends_with("Read.bsl"));
+        assert_eq!(offered[0].1, observation);
+    }
+
     #[test]
     fn write_files_round_trips_fingerprints_and_null_sig_hash() {
         let dir = tempfile::tempdir().unwrap();
@@ -1965,6 +2116,7 @@ mod tests {
                 content_hash: [1; 32],
                 fingerprint: 111,
                 sig_hash: None,
+                observation: None,
             },
             FileFingerprint {
                 root_id: "".to_string(),
@@ -1972,6 +2124,7 @@ mod tests {
                 content_hash: [2; 32],
                 fingerprint: 222,
                 sig_hash: None,
+                observation: None,
             },
         ])
         .unwrap();

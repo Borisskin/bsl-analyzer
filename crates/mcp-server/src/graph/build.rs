@@ -55,6 +55,15 @@ impl LoadFailure {
         Self::new(LoadFailureReason::OperationError, error.to_string())
     }
 
+    fn lifecycle_outcome(&self) -> bsl_search::lifecycle::Outcome {
+        use bsl_search::lifecycle::Outcome;
+        match self.reason {
+            LoadFailureReason::TransientRefusal => Outcome::Refused,
+            LoadFailureReason::Superseded | LoadFailureReason::Released => Outcome::Interrupted,
+            LoadFailureReason::OperationError => Outcome::Failed,
+        }
+    }
+
     pub(super) fn refused(message: impl Into<String>) -> Self {
         Self::new(LoadFailureReason::TransientRefusal, message)
     }
@@ -172,6 +181,12 @@ impl GraphState {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             build_and_publish_graph_file(&workspace_root, generation, self, Some(&mut sink))
         }));
+        let observation_outcome = match &outcome {
+            Ok(Ok(_)) => bsl_search::lifecycle::Outcome::Completed,
+            Ok(Err(failure)) => sink.failure.as_ref().unwrap_or(failure).lifecycle_outcome(),
+            Err(_) => bsl_search::lifecycle::Outcome::Interrupted,
+        };
+        sink.finish(observation_outcome);
         let built = match outcome {
             Ok(Ok(v)) => v,
             Ok(Err(failure)) => return Err(sink.failure.take().unwrap_or(failure)),
@@ -762,6 +777,11 @@ impl GraphState {
         };
         let project =
             crate::graph::ProjectSnapshot::load_excluding(workspace_root, &self.cache_exclusions());
+        // The cached graph remembers which stat identity each of its hashes was read under; a
+        // file whose identity has not moved since then is not read again to prove it.
+        if let Some(roots) = project.search_roots.as_ref() {
+            super::content_hash::seed(crate::graph_db::read_stored_observations(&path, roots));
+        }
         let now = crate::graph::universe::ScannedUniverse::scan_excluding(
             &project.scan_roots,
             &project.excluded,
@@ -1330,6 +1350,7 @@ struct FusedChunkWriter<'e> {
     source_root: PathBuf,
     canonical_source_root: Option<PathBuf>,
     failure: Option<LoadFailure>,
+    observation: Option<bsl_search::lifecycle::Batch>,
 }
 
 impl<'e> FusedChunkWriter<'e> {
@@ -1340,6 +1361,10 @@ impl<'e> FusedChunkWriter<'e> {
     ) -> Self {
         let roots = engine.workspace_roots().cloned();
         let canonical_source_root = source_path.canonicalize().ok();
+        let observation = Some(bsl_search::lifecycle::Batch::new(
+            engine.store().db_path(),
+            bsl_search::lifecycle::Reason::ExplicitRebuild,
+        ));
         Self {
             engine,
             lease,
@@ -1347,6 +1372,13 @@ impl<'e> FusedChunkWriter<'e> {
             source_root: source_path,
             canonical_source_root,
             failure: None,
+            observation,
+        }
+    }
+
+    fn finish(&mut self, outcome: bsl_search::lifecycle::Outcome) {
+        if let Some(observation) = self.observation.take() {
+            observation.finish(outcome);
         }
     }
 
@@ -1372,105 +1404,132 @@ impl ide::FusedChunkSink for FusedChunkWriter<'_> {
         &mut self,
         rows: &[ide::ChunkRow],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // The producer emits a module's chunks consecutively, so group consecutive
-        // same-path rows into one per-file write (each module appears once per batch).
-        let mut groups: Vec<(String, Vec<bsl_search::Chunk>, Vec<Option<String>>)> = Vec::new();
-        for row in rows {
-            if groups.last().map(|(p, _, _)| p.as_str()) != Some(row.path.as_str()) {
-                groups.push((row.path.clone(), Vec::new(), Vec::new()));
+        let context = self.observation.as_ref().expect("fused writer not finished").context();
+        context.in_scope(|| {
+            // The producer emits a module's chunks consecutively, so group consecutive
+            // same-path rows into one per-file write (each module appears once per batch).
+            let mut groups: Vec<(String, Vec<bsl_search::Chunk>, Vec<Option<String>>)> = Vec::new();
+            for row in rows {
+                if groups.last().map(|(p, _, _)| p.as_str()) != Some(row.path.as_str()) {
+                    groups.push((row.path.clone(), Vec::new(), Vec::new()));
+                }
+                let (_, chunks, ctxs) = groups.last_mut().expect("just pushed");
+                chunks.push(bsl_search::Chunk {
+                    kind: row.kind,
+                    name: row.symbol.clone(),
+                    is_export: row.is_export,
+                    annotations: row.annotations.clone(),
+                    line_start: row.line_start,
+                    line_end: row.line_end,
+                    text: row.text.clone(),
+                });
+                ctxs.push(row.graph_context.clone());
             }
-            let (_, chunks, ctxs) = groups.last_mut().expect("just pushed");
-            chunks.push(bsl_search::Chunk {
-                kind: row.kind,
-                name: row.symbol.clone(),
-                is_export: row.is_export,
-                annotations: row.annotations.clone(),
-                line_start: row.line_start,
-                line_end: row.line_end,
-                text: row.text.clone(),
-            });
-            ctxs.push(row.graph_context.clone());
-        }
 
-        for (abs, chunks, ctxs) in &groups {
-            // Graph paths use `/` even on Windows. A canonical Windows path can start
-            // with `\\?\`; turning that prefix into `//?/` makes it unreadable there.
-            #[cfg(windows)]
-            let disk_path = std::path::PathBuf::from(abs.replace('/', "\\"));
-            #[cfg(not(windows))]
-            let disk_path = std::path::PathBuf::from(abs);
-            // A module outside every registered root is not this index's business. With a table
-            // configured that means "under no declared root"; without one it means "outside the
-            // configuration", which is the prefix check this used to be — a separator boundary
-            // included, so `…/cf_ext` is never mistaken for a file inside `…/cf`.
-            let Some(key) = self.key_of(&disk_path) else {
-                continue;
-            };
-            let bytes = match std::fs::read(&disk_path) {
-                Ok(b) => b,
-                Err(_) => continue, // unreadable now → leave for the standalone indexer
-            };
-            let hash = bsl_search::content_blake3(&bytes);
-            // Skip a file whose content is byte-identical to what is already stored: its
-            // chunks and (paid-for) embeddings are kept. Re-ingesting would DELETE+reinsert
-            // them with a NULL embedding and force a needless re-embed of the whole corpus on
-            // every graph rebuild — the exact cost this avoids. The graph itself still rebuilds
-            // fully (its own concern); only the embeddings stay incremental.
-            //
-            // Trade-off: the stored graph context records a method's *outbound* edges (whom it
-            // calls / which metadata it reads). If a CALLEE is renamed or removed, an unchanged
-            // caller's stored context can name the old target until that caller is itself
-            // touched (or a `force_stale` rebuild re-ingests it). We accept this small
-            // cross-file staleness in the embedding's context rather than re-embed every caller
-            // of any changed symbol — embeddings are an approximation and this self-heals on the
-            // next edit of the affected file.
-            if self.engine.store().file_hash(&key.root_id, &key.path).ok().flatten().as_deref()
-                == Some(hash.as_slice())
-            {
-                continue;
+            for (abs, chunks, ctxs) in &groups {
+                // Graph paths use `/` even on Windows. A canonical Windows path can start
+                // with `\\?\`; turning that prefix into `//?/` makes it unreadable there.
+                #[cfg(windows)]
+                let disk_path = std::path::PathBuf::from(abs.replace('/', "\\"));
+                #[cfg(not(windows))]
+                let disk_path = std::path::PathBuf::from(abs);
+                // A module outside every registered root is not this index's business. With a table
+                // configured that means "under no declared root"; without one it means "outside the
+                // configuration", which is the prefix check this used to be — a separator boundary
+                // included, so `…/cf_ext` is never mistaken for a file inside `…/cf`.
+                let Some(key) = self.key_of(&disk_path) else {
+                    continue;
+                };
+                let bytes = match std::fs::read(&disk_path) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        bsl_search::lifecycle::decision(
+                            self.engine.store().db_path(),
+                            &key,
+                            bsl_search::lifecycle::Reason::ReadError,
+                            None,
+                            None,
+                        );
+                        continue; // unreadable now → leave for the standalone indexer
+                    }
+                };
+                let hash = bsl_search::content_blake3(&bytes);
+                // Skip a file whose content is byte-identical to what is already stored: its
+                // chunks and (paid-for) embeddings are kept. Re-ingesting would DELETE+reinsert
+                // them with a NULL embedding and force a needless re-embed of the whole corpus on
+                // every graph rebuild — the exact cost this avoids. The graph itself still rebuilds
+                // fully (its own concern); only the embeddings stay incremental.
+                //
+                // Trade-off: the stored graph context records a method's *outbound* edges (whom it
+                // calls / which metadata it reads). If a CALLEE is renamed or removed, an unchanged
+                // caller's stored context can name the old target until that caller is itself
+                // touched (or a `force_stale` rebuild re-ingests it). We accept this small
+                // cross-file staleness in the embedding's context rather than re-embed every caller
+                // of any changed symbol — embeddings are an approximation and this self-heals on the
+                // next edit of the affected file.
+                let stored = self.engine.store().file_hash(&key.root_id, &key.path);
+                let reason = bsl_search::lifecycle::hash_reason(
+                    stored.as_ref().map(|value| value.as_deref()).map_err(|_| ()),
+                    &hash,
+                );
+                bsl_search::lifecycle::decision(
+                    self.engine.store().db_path(),
+                    &key,
+                    reason,
+                    stored.as_ref().ok().and_then(|value| value.as_deref()),
+                    Some(&hash),
+                );
+                if reason == bsl_search::lifecycle::Reason::Unchanged {
+                    continue;
+                }
+                match bsl_search::lifecycle::with_reason(reason, || {
+                    self.lease.publish_checkpointed(|checkpoint| {
+                        self.engine
+                            .ingest_fused_file_checkpointed(&key, &hash, chunks, ctxs, checkpoint)
+                    })
+                }) {
+                    LeaseOperationOutcome::Applied(()) => {}
+                    LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(
+                        error,
+                    )) => {
+                        self.failure = Some(LoadFailure::operation(&error));
+                        return Err(error.into());
+                    }
+                    LeaseOperationOutcome::OperationError(LeaseOperationError::Lease(error)) => {
+                        self.failure = Some(LoadFailure::operation(error));
+                        return Err(std::io::Error::other("fused ingest stopped").into());
+                    }
+                    LeaseOperationOutcome::TransientRefusal => {
+                        self.failure = Some(LoadFailure::new(
+                            LoadFailureReason::TransientRefusal,
+                            "workspace cache ownership was temporarily refused during fused ingest",
+                        ));
+                        return Err(std::io::Error::other("fused ingest stopped").into());
+                    }
+                    LeaseOperationOutcome::Superseded => {
+                        self.failure = Some(LoadFailure::new(
+                            LoadFailureReason::Superseded,
+                            "workspace cache ownership was superseded during fused ingest",
+                        ));
+                        return Err(std::io::Error::other("fused ingest stopped").into());
+                    }
+                    LeaseOperationOutcome::Released => {
+                        self.failure = Some(LoadFailure::new(
+                            LoadFailureReason::Released,
+                            "workspace cache ownership was released during fused ingest",
+                        ));
+                        return Err(std::io::Error::other("fused ingest stopped").into());
+                    }
+                }
+                #[cfg(test)]
+                FUSED_FILE_COMMITTED_HOOK.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().take() {
+                        hook();
+                    }
+                });
             }
-            match self.lease.publish_checkpointed(|checkpoint| {
-                self.engine.ingest_fused_file_checkpointed(&key, &hash, chunks, ctxs, checkpoint)
-            }) {
-                LeaseOperationOutcome::Applied(()) => {}
-                LeaseOperationOutcome::OperationError(LeaseOperationError::Operation(error)) => {
-                    self.failure = Some(LoadFailure::operation(&error));
-                    return Err(error.into());
-                }
-                LeaseOperationOutcome::OperationError(LeaseOperationError::Lease(error)) => {
-                    self.failure = Some(LoadFailure::operation(error));
-                    return Err(std::io::Error::other("fused ingest stopped").into());
-                }
-                LeaseOperationOutcome::TransientRefusal => {
-                    self.failure = Some(LoadFailure::new(
-                        LoadFailureReason::TransientRefusal,
-                        "workspace cache ownership was temporarily refused during fused ingest",
-                    ));
-                    return Err(std::io::Error::other("fused ingest stopped").into());
-                }
-                LeaseOperationOutcome::Superseded => {
-                    self.failure = Some(LoadFailure::new(
-                        LoadFailureReason::Superseded,
-                        "workspace cache ownership was superseded during fused ingest",
-                    ));
-                    return Err(std::io::Error::other("fused ingest stopped").into());
-                }
-                LeaseOperationOutcome::Released => {
-                    self.failure = Some(LoadFailure::new(
-                        LoadFailureReason::Released,
-                        "workspace cache ownership was released during fused ingest",
-                    ));
-                    return Err(std::io::Error::other("fused ingest stopped").into());
-                }
-            }
-            #[cfg(test)]
-            FUSED_FILE_COMMITTED_HOOK.with(|hook| {
-                if let Some(hook) = hook.borrow_mut().take() {
-                    hook();
-                }
-            });
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -1539,6 +1598,28 @@ pub(crate) fn read_stored_sig_hashes(
     map.extend(rows.flatten());
     map
 }
+
+#[cfg(test)]
+mod module_total_tests {
+    use super::bsl_module_total_filekeys;
+    use bsl_search::FileKey;
+
+    #[test]
+    fn the_incremental_threshold_counts_case_variant_modules() {
+        let mut stored = std::collections::HashMap::new();
+        stored.insert(FileKey::configuration("CommonModules/A/Ext/Module.bsl"), [1u8; 32]);
+        stored.insert(FileKey::configuration("CommonModules/B/Ext/Module.BSL"), [2u8; 32]);
+        stored.insert(FileKey::configuration("CommonModules/B.xml"), [3u8; 32]);
+        assert_eq!(
+            bsl_module_total_filekeys(&stored),
+            2,
+            "Module.BSL — модуль и участвует в знаменателе порога"
+        );
+    }
+}
+
+#[cfg(test)]
+mod vector_lifecycle_tests;
 
 #[cfg(test)]
 mod tests {
@@ -6962,6 +7043,12 @@ mod tests {
                     mtime,
                     len,
                     content_hash,
+                    stat: crate::graph::content_hash::StatIdentity {
+                        len,
+                        mtime_ns: mtime,
+                        change: None,
+                    },
+                    observed_at_ns: None,
                 });
             }
         }

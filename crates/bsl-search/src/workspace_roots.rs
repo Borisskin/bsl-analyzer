@@ -351,6 +351,25 @@ impl WorkspaceRoots {
         self.roots.iter().map(|root| root.id.as_str())
     }
 
+    /// Root ids present in both tables whose directory binding changed.
+    ///
+    /// The id alone survives a move: the configuration keeps the empty id wherever its directory
+    /// is, and an extension alias can be retargeted. A rebound id keeps its key space, so matching
+    /// bytes may keep their rows — but nothing learned from the old directory about a key whose
+    /// new bytes were not compared may be kept.
+    pub(crate) fn rebound_root_ids(&self, next: &Self) -> std::collections::HashSet<String> {
+        self.roots
+            .iter()
+            .filter(|root| {
+                next.roots
+                    .iter()
+                    .find(|candidate| candidate.id == root.id)
+                    .is_some_and(|candidate| candidate != *root)
+            })
+            .map(|root| root.id.clone())
+            .collect()
+    }
+
     /// Registered roots as `(id, declared path)`, in registration order.
     /// Take the subtrees a scan of these roots must not descend into.
     ///
@@ -1052,6 +1071,32 @@ mod tests {
             let key = owner(&roots, &made[1].join(MODULE)).unwrap();
             assert_eq!(roots.resolve(&key).as_deref(), Some(made[1].join(MODULE).as_path()));
         }
+    }
+
+    #[test]
+    fn rebound_ids_are_the_kept_ids_whose_directory_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("ws");
+        let old_made = dirs(&workspace, &["old-cf", "ext/kept", "ext/removed"]);
+        let new_made = dirs(&workspace, &["new-cf", "ext/kept", "ext/added"]);
+        let old = WorkspaceRoots::build(
+            &workspace,
+            &old_made[0],
+            &[old_made[1].clone(), old_made[2].clone()],
+        )
+        .0;
+        let next = WorkspaceRoots::build(
+            &workspace,
+            &new_made[0],
+            &[new_made[1].clone(), new_made[2].clone()],
+        )
+        .0;
+
+        let rebound = old.rebound_root_ids(&next);
+        assert!(rebound.contains(CONFIGURATION_ROOT_ID), "the stable empty id was rebound");
+        assert!(!rebound.contains("ext/kept"));
+        assert!(!rebound.contains("ext/removed"), "a removed id is not rebound");
+        assert!(!rebound.contains("ext/added"), "an added id is not rebound");
     }
 
     mod containment {

@@ -12,6 +12,7 @@
 //! so a served response's revision always describes the exact build it serves.
 
 mod build;
+pub(crate) mod content_hash;
 mod debt;
 pub(crate) mod input;
 pub(crate) mod mdo_files;

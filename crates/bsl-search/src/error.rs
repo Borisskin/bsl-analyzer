@@ -9,6 +9,56 @@
 /// collide on one primary key.
 pub const SCHEMA_VERSION_CURRENT: i32 = 3;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingFailureCode {
+    EmbeddingInvalidConfig,
+    EmbeddingInputTooLarge,
+    EmbeddingRequestTooLarge,
+    EmbeddingResponseTooLarge,
+    EmbeddingTimeout,
+    EmbeddingTransportError,
+    EmbeddingProviderError,
+    EmbeddingInvalidResponse,
+    EmbeddingFailed,
+}
+
+impl EmbeddingFailureCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::EmbeddingInvalidConfig => "embedding_invalid_config",
+            Self::EmbeddingInputTooLarge => "embedding_input_too_large",
+            Self::EmbeddingRequestTooLarge => "embedding_request_too_large",
+            Self::EmbeddingResponseTooLarge => "embedding_response_too_large",
+            Self::EmbeddingTimeout => "embedding_timeout",
+            Self::EmbeddingTransportError => "embedding_transport_error",
+            Self::EmbeddingProviderError => "embedding_provider_error",
+            Self::EmbeddingInvalidResponse => "embedding_invalid_response",
+            Self::EmbeddingFailed => "embedding_failed",
+        }
+    }
+}
+
+/// Safe diagnostic shared by native results and MCP. It never carries provider text.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, thiserror::Error,
+)]
+#[serde(deny_unknown_fields)]
+#[error("{}", code.as_str())]
+pub struct EmbeddingFailure {
+    pub code: EmbeddingFailureCode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_request_bytes: Option<usize>,
+}
+
+impl EmbeddingFailure {
+    pub fn new(code: EmbeddingFailureCode) -> Self {
+        Self { code, request_bytes: None, max_request_bytes: None }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SearchError {
     #[error("SQLite error: {0}")]
@@ -20,8 +70,11 @@ pub enum SearchError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("embedder error: {0}")]
+    #[error("embedding_failed")]
     Embedder(String),
+
+    #[error(transparent)]
+    Embedding(#[from] EmbeddingFailure),
 
     #[error("index error: {0}")]
     Index(String),
@@ -50,6 +103,14 @@ pub enum SearchError {
 }
 
 impl SearchError {
+    pub fn embedding_failure(&self) -> Option<EmbeddingFailure> {
+        match self {
+            Self::Embedding(failure) => Some(*failure),
+            Self::Embedder(_) => Some(EmbeddingFailure::new(EmbeddingFailureCode::EmbeddingFailed)),
+            _ => None,
+        }
+    }
+
     pub fn is_storage_not_initialized(&self) -> bool {
         matches!(self, Self::StorageNotInitialized { .. })
     }
@@ -63,6 +124,8 @@ impl SearchError {
             Self::StorageNotInitialized { .. } => Some("storage_not_initialized"),
             Self::SchemaVersionMismatch { .. } => Some("schema_version_mismatch"),
             Self::ExternalBaseline(message) => external_baseline_reason_code(message),
+            Self::Embedding(failure) => Some(failure.code.as_str()),
+            Self::Embedder(_) => Some("embedding_failed"),
             _ => None,
         }
     }
@@ -82,7 +145,7 @@ impl SearchError {
             Self::ExternalBaseline(message) => message_names(message, RETRYABLE_REASONS),
             Self::Postgres(error) => postgres_error_is_retryable(error),
             Self::Io(_) => true,
-            Self::Embedder(_) | Self::Index(_) => false,
+            Self::Embedder(_) | Self::Embedding(_) | Self::Index(_) => false,
             Self::Sqlite(_) => false,
         }
     }
@@ -93,6 +156,7 @@ impl SearchError {
             Self::StorageNotInitialized { .. }
                 | Self::SchemaVersionMismatch { .. }
                 | Self::Embedder(_)
+                | Self::Embedding(_)
                 | Self::Index(_)
         ) || matches!(self, Self::Postgres(error) if !postgres_error_is_retryable(error))
             || matches!(

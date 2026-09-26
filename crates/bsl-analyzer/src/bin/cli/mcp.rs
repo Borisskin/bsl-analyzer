@@ -1290,6 +1290,7 @@ fn build_server(
         onec_password,
         enable_tools,
     } = inputs;
+    super::logging::activate_vector_journal(source_dir.as_deref());
     let state = match profile {
         mcp_server::McpProfile::Workspace => {
             let source_dir = source_dir.ok_or_else(|| {

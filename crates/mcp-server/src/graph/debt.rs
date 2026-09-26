@@ -486,8 +486,7 @@ impl RecoveryScope {
 
     /// How many roots this descriptor names, for a cost measurement that has to say what it
     /// walked.
-    #[cfg(test)]
-    #[cfg(unix)]
+    #[cfg(all(test, unix))]
     pub(super) fn roots_len(&self) -> usize {
         self.roots.len()
     }
@@ -609,10 +608,6 @@ pub(super) struct RecoveryPublicationProof {
     /// publication has no fresh authority over membership at all — a cache served as it
     /// stands, or metadata that would not read.
     pub(super) declared_unread: Option<Vec<String>>,
-    /// The durable addresses from the graph metadata. The physical strings above are a
-    /// process-local recovery view; this structured copy prevents portable keys from being
-    /// flattened with a separator before that view is resolved through the current roots.
-    pub(super) declared_unread_keys: Option<Vec<bsl_search::FileKey>>,
     /// Whether the walk behind it may speak for the whole tree. `None` when it did not walk.
     pub(super) scan_complete: Option<bool>,
     /// Whether the tree moved under this build. A complete enumeration of a world that has
@@ -1321,12 +1316,7 @@ impl GraphDebt {
         // whose unread metadata would not read, have no authority over what is outstanding —
         // the strict reader says so by returning nothing at all, where the lenient one
         // returned an empty list and answered everything.
-        let vouched = !proof.straddled
-            && proof.declared_unread.is_some()
-            // A portable producer carries the structured declaration alongside its resolved
-            // process-local view. Synthetic legacy proofs have no key field and retain their
-            // existing semantics.
-            && proof.declared_unread_keys.as_ref().is_none_or(|_| proof.declared_unread.is_some());
+        let vouched = !proof.straddled && proof.declared_unread.is_some();
         let declares_gaps = proof.declared_unread.as_ref().is_some_and(|unread| !unread.is_empty());
         let owes_validation = match proof.scan_complete {
             Some(complete) => !complete || proof.straddled,

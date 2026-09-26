@@ -88,6 +88,7 @@ impl SharedEmbeddingPublisher {
         S: EmbeddingStore,
         E: EmbeddingGenerator + Clone + Send + 'static,
     {
+        embedder.batch_ranges(&[], self.policy.batch_size())?;
         let dimension = embedder.dimension();
         let model_id = embedder.model_id().to_owned();
         store.ensure_embedding_identity(&model_id, dimension)?;
@@ -141,16 +142,12 @@ impl SharedEmbeddingPublisher {
             });
         }
 
-        let batch_size = self.policy.batch_size();
+        let texts: Vec<&str> = missing.iter().map(|(_, text)| text.as_str()).collect();
+        let ranges = embedder.batch_ranges(&texts, self.policy.batch_size())?;
         let progress_interval = self.policy.progress_interval();
         let total_missing = missing.len();
-        let total_batches = total_missing.div_ceil(batch_size);
+        let total_batches = ranges.len();
         let concurrency = self.policy.concurrency().min(total_batches.max(1));
-
-        let batched = missing
-            .chunks(batch_size)
-            .map(|batch| batch.to_vec())
-            .collect::<Vec<Vec<(String, String)>>>();
 
         let (task_tx, task_rx) = bounded::<Vec<(String, String)>>(concurrency * 2);
         let (result_tx, result_rx) =
@@ -164,14 +161,27 @@ impl SharedEmbeddingPublisher {
                 thread::spawn(move || {
                     while let Ok(batch) = rx.recv() {
                         let texts = batch.iter().map(|(_, text)| text.as_str()).collect::<Vec<_>>();
-                        let result = emb.embed_batch(&texts).map(|vectors| {
-                            batch
+                        let result = emb.embed_batch(&texts).and_then(|vectors| {
+                            if vectors.len() != batch.len()
+                                || vectors.iter().any(|vector| {
+                                    vector.len() != emb.dimension()
+                                        || vector.iter().any(|value| !value.is_finite())
+                                })
+                            {
+                                return Err(crate::EmbeddingFailure::new(
+                                    crate::EmbeddingFailureCode::EmbeddingInvalidResponse,
+                                )
+                                .into());
+                            }
+                            Ok(batch
                                 .into_iter()
                                 .zip(vectors)
                                 .map(|((embedding_key, _), embedding)| (embedding_key, embedding))
-                                .collect::<Vec<_>>()
+                                .collect::<Vec<_>>())
                         });
-                        let _ = tx.send(result);
+                        if tx.send(result).is_err() {
+                            break;
+                        }
                     }
                 })
             })
@@ -180,8 +190,8 @@ impl SharedEmbeddingPublisher {
         drop(result_tx);
 
         let producer = thread::spawn(move || {
-            for batch in batched {
-                if task_tx.send(batch).is_err() {
+            for range in ranges {
+                if task_tx.send(missing[range].to_vec()).is_err() {
                     break;
                 }
             }
@@ -194,16 +204,27 @@ impl SharedEmbeddingPublisher {
         let mut first_error = None;
 
         while batch_index < total_batches {
-            let result = result_rx.recv().map_err(|_| {
-                SearchError::Embedder(
-                    "embedding worker pool terminated before all batches were processed".to_owned(),
-                )
-            })?;
+            let result = match result_rx.recv() {
+                Ok(result) => result,
+                Err(_) => {
+                    first_error.get_or_insert_with(|| {
+                        crate::EmbeddingFailure::new(crate::EmbeddingFailureCode::EmbeddingFailed)
+                            .into()
+                    });
+                    break;
+                }
+            };
             batch_index += 1;
 
             match result {
                 Ok(generated) if first_error.is_none() => {
-                    let stats = store.store_embeddings(&model_id, dimension, &generated)?;
+                    let stats = match store.store_embeddings(&model_id, dimension, &generated) {
+                        Ok(stats) => stats,
+                        Err(error) => {
+                            first_error.get_or_insert(error);
+                            continue;
+                        }
+                    };
                     stored_total += stats.stored;
                     reused_total += stats.reused;
                     processed += generated.len();
@@ -235,9 +256,19 @@ impl SharedEmbeddingPublisher {
             }
         }
 
-        let _ = producer.join();
+        drop(result_rx);
+        if producer.join().is_err() {
+            first_error.get_or_insert_with(|| {
+                crate::EmbeddingFailure::new(crate::EmbeddingFailureCode::EmbeddingFailed).into()
+            });
+        }
         for worker in workers {
-            let _ = worker.join();
+            if worker.join().is_err() {
+                first_error.get_or_insert_with(|| {
+                    crate::EmbeddingFailure::new(crate::EmbeddingFailureCode::EmbeddingFailed)
+                        .into()
+                });
+            }
         }
 
         if let Some(error) = first_error {
@@ -512,5 +543,174 @@ mod tests {
             content_hash: format!("hash:{path}:{text}"),
             graph_context: None,
         }
+    }
+
+    #[test]
+    fn payload_configuration_publisher_rejects_zero_for_empty_or_cached_work() {
+        use crate::embedder::payload_tests::{success, vector, PayloadServer};
+        let server = PayloadServer::new(success);
+        let store = FakeEmbeddingStore::default();
+        let documents = [indexed_document("Cached.bsl", "cached input")];
+        store.embeddings.lock().unwrap().insert(
+            (crate::semantic_key_for_indexed_document(&documents[0]), "fixture".into(), 3),
+            vector(&crate::semantic_text_for_indexed_document(&documents[0])),
+        );
+        let publisher = SharedEmbeddingPublisher::new(EmbeddingExecutionPolicy::default());
+        for input in [&documents[..0], &documents[..]] {
+            assert_eq!(
+                publisher
+                    .publish(&store, &crate::Embedder::new(server.config(0)), input, None)
+                    .unwrap_err()
+                    .to_string(),
+                "embedding_invalid_config"
+            );
+            publisher
+                .publish(&store, &crate::Embedder::new(server.config(4096)), input, None)
+                .unwrap();
+        }
+        assert!(server.requests().is_empty());
+        assert!(store.stored_batches.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn payload_shared_publish_trait_plan_and_key_mapping() {
+        use crate::embedder::payload_tests::{success, vector, PayloadServer};
+        let documents: Vec<_> = (0..6)
+            .map(|i| indexed_document(&format!("Модуль{i}.bsl"), &format!("Текст {i}")))
+            .collect();
+        let limit = documents.iter().map(|doc| serde_json::json!({"model":"fixture","input":[crate::semantic_text_for_indexed_document(doc)],"dimensions":3}).to_string().len()).max().unwrap();
+        let server = PayloadServer::new(success);
+        let embedder = crate::Embedder::new(server.config(limit));
+        let store = FakeEmbeddingStore::default();
+        let key = crate::semantic_key_for_indexed_document(&documents[2]);
+        store.embeddings.lock().unwrap().insert(
+            (key, "fixture".into(), 3),
+            vector(&crate::semantic_text_for_indexed_document(&documents[2])),
+        );
+        let progress = Mutex::new(Vec::new());
+        let stats = SharedEmbeddingPublisher::new(EmbeddingExecutionPolicy {
+            batch_size: 32,
+            concurrency: 2,
+            progress_interval: 1,
+        })
+        .publish(&store, &embedder, &documents, Some(&|event| progress.lock().unwrap().push(event)))
+        .unwrap();
+        assert_eq!((stats.stored, stats.reused), (5, 1));
+        assert_eq!(server.requests().len(), 5);
+        assert!(server.requests().iter().all(|body| body.len() <= limit));
+        for doc in &documents {
+            let key = (crate::semantic_key_for_indexed_document(doc), "fixture".into(), 3);
+            assert_eq!(
+                store.embeddings.lock().unwrap()[&key],
+                vector(&crate::semantic_text_for_indexed_document(doc))
+            );
+        }
+        assert!(matches!(
+            progress.lock().unwrap().last(),
+            Some(super::EmbeddingProgress::Batch { total_batches: 5, batches_done: 5, .. })
+        ));
+        let fake = FakeEmbedder::default();
+        assert_eq!(fake.batch_ranges(&["a", "b", "c"], 2).unwrap(), vec![0..2, 2..3]);
+        assert_eq!(fake.batch_ranges(&["a", "b"], 0).unwrap(), vec![0..1, 1..2]);
+        SharedEmbeddingPublisher::new(EmbeddingExecutionPolicy {
+            batch_size: 2,
+            concurrency: 2,
+            progress_interval: 1,
+        })
+        .publish(&FakeEmbeddingStore::default(), &fake, &documents[..5], None)
+        .unwrap();
+        let mut counts = fake.calls.lock().unwrap().clone();
+        counts.sort_unstable();
+        assert_eq!(counts, vec![1, 2, 2]);
+    }
+
+    #[test]
+    fn payload_shared_publish_failure_retains_prior_store_and_returns_no_completion() {
+        use crate::embedder::payload_tests::{success, PayloadServer};
+        let server =
+            PayloadServer::new(
+                |i, body| if i == 1 { (413, "refused".into()) } else { success(i, body) },
+            );
+        let embedder = crate::Embedder::new(server.config(4096));
+        let documents: Vec<_> =
+            (0..3).map(|i| indexed_document(&format!("M{i}.bsl"), "input")).collect();
+        let store = FakeEmbeddingStore::default();
+        let result = BaselinePublisher::new(EmbeddingExecutionPolicy {
+            batch_size: 1,
+            concurrency: 1,
+            progress_interval: 1,
+        })
+        .publish(
+            &store,
+            &Snapshot::new("payload", CorpusId::WorkspaceCode),
+            &SnapshotPublishMetadata { branch: None, commit: None },
+            &documents,
+            Some(&embedder),
+            None,
+        );
+        assert_eq!(result.unwrap_err().to_string(), "embedding_request_too_large");
+        assert_eq!(store.embeddings.lock().unwrap().len(), 1);
+        assert_eq!(*store.stored_batches.lock().unwrap(), vec![1]);
+        // This is the existing snapshot counter. The CLI propagates our Err before its separate semantic completion write.
+        assert_eq!(*store.publish_calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn payload_shared_publish_preserves_worker_concurrency_bound() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Clone)]
+        struct Gated {
+            started: crossbeam_channel::Sender<()>,
+            release: crossbeam_channel::Receiver<()>,
+            active: Arc<AtomicUsize>,
+            peak: Arc<AtomicUsize>,
+        }
+        impl EmbeddingGenerator for Gated {
+            fn model_id(&self) -> &str {
+                "gated"
+            }
+            fn dimension(&self) -> usize {
+                3
+            }
+            fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, SearchError> {
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(active, Ordering::SeqCst);
+                self.started.send(()).unwrap();
+                let released = self.release.recv_timeout(std::time::Duration::from_secs(2));
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                released.map_err(|_| SearchError::Embedder("fixture watchdog".into()))?;
+                Ok(texts.iter().map(|_| vec![1.0, 2.0, 3.0]).collect())
+            }
+        }
+        let (started_tx, started_rx) = crossbeam_channel::unbounded();
+        let (release_tx, release_rx) = crossbeam_channel::unbounded();
+        let peak = Arc::new(AtomicUsize::new(0));
+        let embedder = Gated {
+            started: started_tx,
+            release: release_rx,
+            active: Arc::new(AtomicUsize::new(0)),
+            peak: peak.clone(),
+        };
+        let worker = std::thread::spawn(move || {
+            let documents: Vec<_> =
+                (0..4).map(|i| indexed_document(&format!("M{i}"), "input")).collect();
+            SharedEmbeddingPublisher::new(EmbeddingExecutionPolicy {
+                batch_size: 1,
+                concurrency: 2,
+                progress_interval: 1,
+            })
+            .publish(&FakeEmbeddingStore::default(), &embedder, &documents, None)
+        });
+        for _ in 0..2 {
+            for _ in 0..2 {
+                started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            }
+            assert!(started_rx.try_recv().is_err());
+            for _ in 0..2 {
+                release_tx.send(()).unwrap();
+            }
+        }
+        assert_eq!(worker.join().unwrap().unwrap().stored, 4);
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
     }
 }

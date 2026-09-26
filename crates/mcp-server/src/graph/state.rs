@@ -94,6 +94,7 @@ impl Published {
 pub(super) struct Inner {
     pub(super) status: GraphStatus,
     pub(super) published: Option<Published>,
+    pub(super) indexing_unread_files: Option<usize>,
     /// The ticket of the build holding the slot. Written with the grant and cleared with the
     /// outcome, so a slot that reads as taken always names what it was taken for.
     pub(super) claimed: Option<super::debt::BuildTicket>,
@@ -499,6 +500,7 @@ impl GraphState {
                 building: None,
                 carrier: 0,
                 carries: 0,
+                indexing_unread_files: None,
             })),
             scan: Arc::new(Mutex::new(None)),
             workspace_root,
@@ -1372,16 +1374,14 @@ impl GraphState {
     }
 
     /// Attach the barrier described by [`Self::probe_window_hook`].
-    #[cfg(test)]
-    #[cfg(unix)]
+    #[cfg(all(test, unix))]
     pub(super) fn with_probe_window_hook(mut self, hook: LatchWindowHook) -> Self {
         self.probe_window_hook = Some(hook);
         self
     }
 
     /// Attach the barrier described by [`Self::scan_receipt_hook`].
-    #[cfg(test)]
-    #[cfg(unix)]
+    #[cfg(all(test, unix))]
     pub(super) fn with_scan_receipt_hook(mut self, hook: LatchWindowHook) -> Self {
         self.scan_receipt_hook = Some(hook);
         self
@@ -1773,6 +1773,60 @@ impl GraphState {
         matches!(self.status(), GraphStatus::Loading) || self.reload_running()
     }
 
+    /// A bounded owner sample; no descriptor checkout, SQL, drift scan or blocking lock.
+    pub(crate) fn indexing_snapshot(&self) -> crate::indexing::Target {
+        self.status_report_with_indexing().1
+    }
+
+    fn indexing_from_inner(
+        &self,
+        inner: &Inner,
+        superseded: bool,
+        released: bool,
+        debt_stale: Option<bool>,
+        observed_stale: bool,
+    ) -> crate::indexing::Target {
+        use crate::indexing::{Kind, Reason, State, Target};
+        if superseded {
+            return Target::new(Kind::Graph, State::Superseded, Some(Reason::Superseded));
+        }
+        if released {
+            return Target::new(Kind::Graph, State::Cancelled, Some(Reason::Cancelled));
+        }
+        let (state, reason) = match &inner.status {
+            GraphStatus::Idle => (State::Waiting, Some(Reason::Initializing)),
+            GraphStatus::Disabled => (State::Unknown, Some(Reason::SnapshotUnavailable)),
+            GraphStatus::Loading => (State::Running, None),
+            GraphStatus::Failed(_) => (State::Failed, Some(Reason::NativeFailure)),
+            GraphStatus::Ready { .. } => {
+                let Some(published) = &inner.published else { return Target::unknown(Kind::Graph) };
+                match &published.reload {
+                    ReloadState::Running => (State::Running, None),
+                    ReloadState::Failed(_) => (State::Failed, Some(Reason::NativeFailure)),
+                    ReloadState::Idle => {
+                        let Some(unread) = inner.indexing_unread_files else {
+                            return Target::unknown(Kind::Graph);
+                        };
+                        let Some(debt_stale) = debt_stale else {
+                            return Target::unknown(Kind::Graph);
+                        };
+                        if published.stale
+                            || published.force_stale
+                            || unread > 0
+                            || debt_stale
+                            || observed_stale
+                        {
+                            (State::Waiting, Some(Reason::StaleGeneration))
+                        } else {
+                            (State::Ready, None)
+                        }
+                    }
+                }
+            }
+        };
+        Target::new(Kind::Graph, state, reason)
+    }
+
     pub(crate) fn status(&self) -> GraphStatus {
         lock_recover(&self.inner).status.clone()
     }
@@ -1846,12 +1900,43 @@ impl GraphState {
         }
     }
 
-    /// Cached lifecycle snapshot for the `status` action. It uses only process-local state and
-    /// the pre-opened descriptor pool; drift detection belongs to background graph owners.
+    #[cfg(test)]
     pub(crate) fn status_report(&self) -> GraphStatusReport {
-        let superseded = self.lease.is_superseded();
-        let drift_watch = self.workspace_root.is_some().then(|| self.drift_watch().as_str());
-        let report = |state: &'static str, superseded: Option<bool>| GraphStatusReport {
+        self.status_report_with_indexing().0
+    }
+
+    /// Legacy report and telemetry share one publication/revision sample.
+    pub(crate) fn status_report_with_indexing(
+        &self,
+    ) -> (GraphStatusReport, crate::indexing::Target) {
+        use crate::indexing::{Kind, Target};
+        use crate::tools::location::DriftWatch;
+        let watch_sample = (|| {
+            let phase = self.watch.try_lock().ok()?.0;
+            let (polling, cycle, overdue) = match &self.change_hub {
+                Some(hub) => hub.try_poll_status()?,
+                None => (false, None, false),
+            };
+            let watch = match phase {
+                super::watcher::WatchPhase::Unwatched | super::watcher::WatchPhase::Stopped => {
+                    DriftWatch::Unobserved
+                }
+                super::watcher::WatchPhase::Starting => DriftWatch::Starting,
+                super::watcher::WatchPhase::Running if self.change_hub.is_none() => {
+                    DriftWatch::Unobserved
+                }
+                super::watcher::WatchPhase::Running if polling => DriftWatch::Polling,
+                super::watcher::WatchPhase::Running => DriftWatch::Watching,
+            };
+            let stale = matches!(watch, DriftWatch::Unobserved | DriftWatch::Starting) || overdue;
+            Some((watch, cycle, stale))
+        })();
+        let drift_watch = self
+            .workspace_root
+            .as_ref()
+            .and(watch_sample.as_ref())
+            .map(|(watch, _, _)| watch.as_str());
+        let report = |state, superseded| GraphStatusReport {
             state,
             files: None,
             unread_files: None,
@@ -1861,59 +1946,72 @@ impl GraphState {
             error: None,
             superseded,
             drift_watch,
-            poll_cycle_secs: self
-                .change_hub
-                .as_ref()
-                .and_then(|hub| hub.poll_report())
-                .map(|(_, cycle)| cycle.as_secs()),
+            poll_cycle_secs: watch_sample.and_then(|(_, cycle, _)| cycle),
         };
-
-        let status = {
-            let inner = lock_recover(&self.inner);
-            inner.status.clone()
+        let Some((_, _, watch_stale)) = watch_sample else {
+            return (report("loading", None), Target::unknown(Kind::Graph));
         };
-
-        if superseded {
-            if let GraphStatus::Ready { files } = status {
-                if let Some(snapshot) = self.snapshot() {
-                    let freshness = self.cached_freshness(&snapshot);
-                    return GraphStatusReport {
-                        files: Some(files),
-                        unread_files: Some(snapshot.unread_files()),
-                        revision: Some(freshness.revision),
-                        stale: Some(freshness.stale),
-                        reload: Some(freshness.reload),
-                        ..report("ready", Some(true))
-                    };
+        let Ok(inner) = self.inner.try_lock() else {
+            return (report("loading", None), Target::unknown(Kind::Graph));
+        };
+        let superseded = self.lease.is_superseded();
+        let debt_stale = self.debt.try_lock().ok().map(|debt| debt.stale());
+        let snapshot_stale = inner.published.as_ref().and_then(|published| {
+            self.snapshot_pool.try_lock().ok().and_then(|pool| {
+                pool.iter()
+                    .find(|entry| entry.generation == published.generation)
+                    .map(|entry| entry.force_stale)
+            })
+        });
+        let target = self.indexing_from_inner(
+            &inner,
+            superseded,
+            self.lease.is_released(),
+            debt_stale,
+            snapshot_stale.unwrap_or(false) || (self.workspace_root.is_some() && watch_stale),
+        );
+        if let GraphStatus::Ready { files } = &inner.status {
+            if let (Some(published), Some(unread)) = (&inner.published, inner.indexing_unread_files)
+            {
+                // Preserve legacy read availability without checking out a descriptor or doing I/O.
+                if let (Some(snapshot_stale), Some(debt_stale)) = (snapshot_stale, debt_stale) {
+                    return (
+                        GraphStatusReport {
+                            files: Some(*files),
+                            unread_files: Some(unread),
+                            revision: Some(published.generation),
+                            stale: Some(
+                                published.stale
+                                    || published.force_stale
+                                    || snapshot_stale
+                                    || unread > 0
+                                    || matches!(published.reload, ReloadState::Running)
+                                    || debt_stale
+                                    || watch_stale,
+                            ),
+                            reload: Some(published.reload.label()),
+                            ..report("ready", superseded.then_some(true))
+                        },
+                        target,
+                    );
                 }
             }
-            return GraphStatusReport {
+        }
+        let legacy = if superseded {
+            GraphStatusReport {
                 error: Some(SUPERSEDED_GRAPH_ERROR.to_owned()),
                 ..report("failed", Some(true))
-            };
-        }
-
-        match status {
-            GraphStatus::Disabled => report("disabled", None),
-            GraphStatus::Idle | GraphStatus::Loading => report("loading", None),
-            GraphStatus::Failed(msg) => {
-                GraphStatusReport { error: Some(msg), ..report("failed", None) }
             }
-            GraphStatus::Ready { files } => match self.snapshot() {
-                Some(snapshot) => {
-                    let freshness = self.cached_freshness(&snapshot);
-                    GraphStatusReport {
-                        files: Some(files),
-                        unread_files: Some(snapshot.unread_files()),
-                        revision: Some(freshness.revision),
-                        stale: Some(freshness.stale),
-                        reload: Some(freshness.reload),
-                        ..report("ready", None)
-                    }
+        } else {
+            match &inner.status {
+                GraphStatus::Disabled => report("disabled", None),
+                GraphStatus::Failed(msg) => {
+                    GraphStatusReport { error: Some(msg.clone()), ..report("failed", None) }
                 }
-                None => report("loading", None),
-            },
-        }
+                _ => report("loading", None),
+            }
+        };
+        (legacy, target)
     }
 
     /// Start the initial load: `Idle → Loading`, one loader thread, nothing else.
@@ -2779,15 +2877,14 @@ mod tests {
                         return;
                     }
                     *barrier_ticket.lock().unwrap() = graph.claimed_ticket();
+                    let observed = barrier_hub.seq();
                     super::super::test_support::write(
                         &barrier_root,
                         "CommonModules/Поздний/Ext/Module.bsl",
                         "Функция Поздняя() Экспорт Возврат 9; КонецФункции",
                     );
-                    let seq = crate::graph::test_support::wait_for_hub_seq_above(
-                        &barrier_hub,
-                        graph.observation(),
-                    );
+                    let seq =
+                        crate::graph::test_support::wait_for_hub_seq_above(&barrier_hub, observed);
                     barrier_fact.store(seq as i64, Ordering::SeqCst);
                     match late {
                         "change" => graph.record_change_quietly(seq),
@@ -2804,13 +2901,13 @@ mod tests {
             *lock_recover(&window_graph) = Some(graph.clone());
             armed.store(true, Ordering::SeqCst);
 
+            let observed = hub.seq();
             super::super::test_support::write(
                 root,
                 "CommonModules/Сервер/Ext/Module.bsl",
                 "Функция Считать() Экспорт Возврат 2; КонецФункции",
             );
-            let admitted_fact =
-                crate::graph::test_support::wait_for_hub_seq_above(&hub, graph.observation());
+            let admitted_fact = crate::graph::test_support::wait_for_hub_seq_above(&hub, observed);
             match lane {
                 "change" => graph.record_change_quietly(admitted_fact),
                 _ => graph.record_forced_quietly(admitted_fact),
@@ -3957,6 +4054,68 @@ mod tests {
     /// re-render hangs on. Without the `notify_published()` call at the publish site the
     /// counter stays zero and this fails.
     #[test]
+    fn indexing_owner_lifecycles_graph() {
+        use crate::indexing::{Reason, State};
+        let mut graph = GraphState::with_status(GraphStatus::Idle, None);
+        assert_eq!(graph.indexing_snapshot().state, State::Waiting);
+        {
+            let _held = graph.watch.lock().unwrap();
+            assert_eq!(graph.indexing_snapshot().state, State::Unknown);
+        }
+        {
+            let _guard = graph.inner.lock().unwrap();
+            let (report, target) = graph.status_report_with_indexing();
+            assert_eq!(target.state, State::Unknown);
+            assert_eq!(report.state, "loading");
+        }
+        graph.inner.lock().unwrap().status = GraphStatus::Loading;
+        assert_eq!(graph.indexing_snapshot().state, State::Running);
+        {
+            let mut inner = graph.inner.lock().unwrap();
+            inner.status = GraphStatus::Ready { files: 0 };
+            inner.indexing_unread_files = Some(0);
+            inner.published = Some(Published {
+                generation: 7,
+                observed_through: Some(0),
+                fingerprint: crate::graph_db::GraphFp::default(),
+                stale: false,
+                reload: ReloadState::Idle,
+                force_stale: false,
+                search_roots: None,
+            });
+        }
+        let (report, target) = graph.status_report_with_indexing();
+        assert_eq!(target.state, State::Ready);
+        let workspace = tempfile::tempdir().unwrap();
+        graph.workspace_root = Some(workspace.path().to_path_buf());
+        assert_eq!(
+            graph.indexing_snapshot().state,
+            State::Waiting,
+            "an unwatched workspace cannot report a fresh graph"
+        );
+        graph.workspace_root = None;
+        assert_eq!(report.revision, None); // no pre-opened descriptor in this owner-only fixture
+        assert_eq!(report.stale, None);
+        graph.inner.lock().unwrap().indexing_unread_files = Some(1);
+        let (report, target) = graph.status_report_with_indexing();
+        assert_eq!(target.reason_code, Some(Reason::StaleGeneration));
+        assert_eq!(report.revision, None); // no pre-opened descriptor in this owner-only fixture
+        assert_eq!(report.stale, None);
+        graph.inner.lock().unwrap().indexing_unread_files = Some(0);
+        graph.inner.lock().unwrap().published.as_mut().unwrap().reload = ReloadState::Running;
+        assert_eq!(graph.indexing_snapshot().state, State::Running);
+        graph.inner.lock().unwrap().published.as_mut().unwrap().reload =
+            ReloadState::Failed("private failure".to_owned());
+        assert_eq!(graph.indexing_snapshot().state, State::Failed);
+        let json = serde_json::to_value(graph.indexing_snapshot()).unwrap();
+        for field in ["phase", "progress", "pass_id"] {
+            assert!(json[field].is_null());
+        }
+        assert!(!json.to_string().contains("private failure"));
+        assert_eq!(graph.scan_count(), 0);
+    }
+
+    #[test]
     fn publish_hook_fires_after_a_build_publishes() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -4980,6 +5139,11 @@ mod tests {
                 "a timed-out wait must name {named:?}; it reported {reported:?}"
             );
         }
+        lock_recover(&graph.inner).published.as_mut().unwrap().reload =
+            ReloadState::Failed("snapshot replacement refused".to_owned());
+        let summary = super::super::test_support::graph_state_summary(&graph);
+        assert!(summary.contains("reload failed"));
+        assert!(summary.contains("snapshot replacement refused"));
     }
 
     /// Wait for the forced reload to publish AND discharge its obligation. Waiting on
@@ -6313,6 +6477,11 @@ mod tests {
         let graph = GraphState::for_workspace(root.to_path_buf());
         graph.ensure_loading();
         wait_ready(&graph);
+        // A snapshot is visible before its builder releases the carried ticket. A probe
+        // offered in that window is correctly refused while a build is still in flight.
+        wait_until(&graph, "the initial builder to release its ticket", || {
+            !graph.build_in_flight()
+        });
         let observation = graph.observation();
         assert_eq!(
             graph.snapshot().map(|snapshot| snapshot.unread_files()),
@@ -6325,7 +6494,8 @@ mod tests {
         lock_recover(&graph.debt).probe_now(Instant::now());
         graph.probe_recovery();
         wait_until(&graph, "the first healed module to be read", || {
-            graph.snapshot().is_some_and(|snapshot| snapshot.unread_files() == 1)
+            !graph.build_in_flight()
+                && graph.snapshot().is_some_and(|snapshot| snapshot.unread_files() == 1)
         });
         assert!(
             !lock_recover(&graph.debt).owes_recovery_build(),
@@ -6338,7 +6508,8 @@ mod tests {
         lock_recover(&graph.debt).probe_now(Instant::now());
         graph.probe_recovery();
         wait_until(&graph, "the second healed module to be read", || {
-            graph.snapshot().is_some_and(|snapshot| snapshot.unread_files() == 0)
+            !graph.build_in_flight()
+                && graph.snapshot().is_some_and(|snapshot| snapshot.unread_files() == 0)
         });
         assert_eq!(graph.observation(), observation, "the fact stream moved");
         drop(restore);
@@ -7397,6 +7568,8 @@ mod tests {
     /// point path at all. Which branch ran is recorded rather than assumed.
     #[test]
     fn a_point_patch_answers_what_it_rewrote_and_nothing_else() {
+        use super::super::test_support::{wait_publish_pass_within, WAIT_CEILING};
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         sample_workspace(root);
@@ -7420,6 +7593,7 @@ mod tests {
         graph.set_watch(super::super::watcher::WatchPhase::Running, None);
         graph.ensure_loading();
         wait_ready(&graph);
+        wait_publish_pass_within(&graph, WAIT_CEILING, 1);
         let generation = |graph: &GraphState| {
             lock_recover(&graph.inner).published.as_ref().map(|p| p.generation).unwrap_or(0)
         };
@@ -7453,11 +7627,14 @@ mod tests {
         // A body-only edit of a module nobody is owed anything about: the point path is
         // eligible, and this is what a real patch looks like.
         let before = generation(&graph);
+        let passes = graph.publish_passes.load(Ordering::SeqCst);
+        let observed = hub.seq();
         lock_recover(&graph.incremental_decisions).clear();
         fs::write(&edited, "&НаСервере\nФункция Взять() Экспорт Возврат 2; КонецФункции").unwrap();
-        crate::graph::test_support::wait_for_hub_seq_above(&hub, graph.observation());
+        crate::graph::test_support::wait_for_hub_seq_above(&hub, observed);
         graph.nudge_rebuild();
         wait_until(&graph, "the body-only edit to be published", || generation(&graph) > before);
+        wait_publish_pass_within(&graph, WAIT_CEILING, passes + 1);
         let decisions = lock_recover(&graph.incremental_decisions).clone();
         assert_eq!(
             decisions.last().copied(),
@@ -7475,10 +7652,13 @@ mod tests {
         // — not a measured healing — brings it into the patch's own rewritten set.
         lock_recover(&graph.incremental_decisions).clear();
         let at = generation(&graph);
+        let passes = graph.publish_passes.load(Ordering::SeqCst);
+        let observed = hub.seq();
         fs::write(&other, "&НаСервере\nФункция Взять() Экспорт Возврат 3; КонецФункции").unwrap();
-        crate::graph::test_support::wait_for_hub_seq_above(&hub, graph.observation());
+        crate::graph::test_support::wait_for_hub_seq_above(&hub, observed);
         graph.nudge_rebuild();
         wait_until(&graph, "the rewritten module to be published", || generation(&graph) > at);
+        wait_publish_pass_within(&graph, WAIT_CEILING, passes + 1);
         let decisions = lock_recover(&graph.incremental_decisions).clone();
         assert_eq!(
             decisions.last().copied(),

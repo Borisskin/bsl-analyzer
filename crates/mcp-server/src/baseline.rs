@@ -201,6 +201,18 @@ impl DeferredBaselineRuntime {
         }
     }
 
+    /// Telemetry copies only the handle, never arbitrary configuration/error strings.
+    /// Outer None means contention; inner None means no available baseline.
+    pub(crate) fn try_external(&self) -> Option<Option<Arc<ExternalBaselineService>>> {
+        let slot = self.inner.slot.try_lock().ok()?;
+        Some(match &*slot {
+            BaselineSlot::Ready(runtime) => {
+                runtime.as_ref().and_then(|runtime| runtime.external_baseline.clone())
+            }
+            BaselineSlot::Pending => None,
+        })
+    }
+
     /// The service handle, if the runtime is ready and has one. Never blocks.
     pub(crate) fn external(&self) -> Option<Arc<ExternalBaselineService>> {
         match &*self.inner.slot.lock().unwrap_or_else(|e| e.into_inner()) {
@@ -343,7 +355,7 @@ impl CachedBaselineStatus {
 /// yet (first call; a background probe has been kicked).
 #[derive(Debug, Clone)]
 pub(crate) enum BaselineStatusProbe {
-    Cached(CachedBaselineStatus),
+    Cached(Box<CachedBaselineStatus>),
     Pending,
 }
 
@@ -899,8 +911,52 @@ impl ExternalBaselineService {
         }
 
         match cached {
-            Some(entry) => BaselineStatusProbe::Cached(entry),
+            Some(entry) => BaselineStatusProbe::Cached(Box::new(entry)),
             None => BaselineStatusProbe::Pending,
+        }
+    }
+
+    /// Observe existing evidence only; never trigger a probe or wait for an owner.
+    pub(crate) fn indexing_publication(
+        &self,
+        model: &str,
+        dimension: usize,
+        overlay_identity: Option<&(String, Option<String>)>,
+    ) -> BaselineIndexingPublication {
+        use BaselineIndexingPublication::*;
+        let Ok(slot) = self.status_probe.slot.try_lock() else { return SnapshotUnavailable };
+        if self.status_probe.closed.load(Ordering::Acquire)
+            || self.status_probe.refreshing.load(Ordering::Acquire)
+        {
+            return Stale;
+        }
+        let Some(cached) = slot.as_ref() else { return Stale };
+        if cached.generation != self.source.refresh_generation() || cached.age() >= STATUS_PROBE_TTL
+        {
+            return Stale;
+        }
+        let ExternalBaselineState::Ready { snapshot_id, fingerprint, .. } = &cached.status.state
+        else {
+            return match cached.status.state {
+                ExternalBaselineState::Missing => Unavailable,
+                _ => SnapshotUnavailable,
+            };
+        };
+        if !overlay_identity.is_some_and(|(id, fp)| id == snapshot_id && fp == fingerprint) {
+            return Stale;
+        }
+        let Some(details) = &cached.status.semantic_details else { return UnverifiedCoverage };
+        if details.snapshot_id != *snapshot_id || details.fingerprint != *fingerprint {
+            return Stale;
+        }
+        let Some(publication) = &details.publication else { return UnverifiedIdentity };
+        if publication.model_id != model || publication.dimension != dimension {
+            return UnverifiedIdentity;
+        }
+        if publication.complete {
+            Ready
+        } else {
+            UnverifiedCoverage
         }
     }
 
@@ -1376,6 +1432,7 @@ impl RefreshableExternalBaselineSource {
                 schema,
                 selection,
                 resolved: None,
+                semantic_details: None,
                 state: ExternalBaselineState::Error(error.to_string()),
             },
         }
@@ -1619,6 +1676,7 @@ impl ExternalBaselineSource {
                     .unwrap_or_else(|| "bsl_search".to_owned()),
                 selection: self.selection.clone(),
                 resolved: None,
+                semantic_details: None,
                 state: ExternalBaselineState::Error(error.to_string()),
             },
         }
@@ -1640,8 +1698,19 @@ impl ExternalBaselineSource {
                 // client timeout. `snapshot_details` returns aggregated counts from
                 // snapshot/file-object metadata (O(files), not O(serving rows)) instead.
                 let snapshot_id_str = snapshot.id.0.clone();
-                let (documents, files) = match self.adapter.snapshot_details(&snapshot_id_str)? {
-                    Some(details) => (details.snapshot.documents, details.snapshot.files),
+                let (documents, files, semantic_details) = match self
+                    .adapter
+                    .snapshot_details(&snapshot_id_str)?
+                {
+                    Some(details) => (
+                        details.snapshot.documents,
+                        details.snapshot.files,
+                        Some(BaselineSemanticDetails {
+                            snapshot_id: details.snapshot.snapshot_id,
+                            fingerprint: details.snapshot.fingerprint,
+                            publication: details.semantic_publication,
+                        }),
+                    ),
                     None => {
                         // The snapshot resolved above but its detail row was not found —
                         // a brief metadata race. Report 0/0 (counts unavailable, not an empty
@@ -1651,7 +1720,7 @@ impl ExternalBaselineSource {
                             "probe_status: snapshot_details returned None for a resolved snapshot; \
                              reporting counts as 0 (metadata race)"
                         );
-                        (0, 0)
+                        (0, 0, None)
                     }
                 };
                 Ok(ExternalBaselineStatus {
@@ -1659,6 +1728,7 @@ impl ExternalBaselineSource {
                     schema,
                     selection,
                     resolved: Some(baseline_description(&resolved_baseline)),
+                    semantic_details,
                     state: ExternalBaselineState::Ready {
                         snapshot_id: snapshot.id.0,
                         fingerprint: snapshot.fingerprint,
@@ -1672,6 +1742,7 @@ impl ExternalBaselineSource {
                 schema,
                 selection,
                 resolved: None,
+                semantic_details: None,
                 state: ExternalBaselineState::Missing,
             }),
         }
@@ -1758,6 +1829,24 @@ pub(crate) struct ExternalBaselineStatus {
     pub selection: String,
     pub resolved: Option<String>,
     pub state: ExternalBaselineState,
+    pub semantic_details: Option<BaselineSemanticDetails>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BaselineSemanticDetails {
+    pub snapshot_id: String,
+    pub fingerprint: Option<String>,
+    pub publication: Option<bsl_search::BaselineSemanticPublication>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BaselineIndexingPublication {
+    Ready,
+    UnverifiedIdentity,
+    UnverifiedCoverage,
+    Stale,
+    Unavailable,
+    SnapshotUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2708,6 +2797,7 @@ mod tests {
             schema: "test".to_owned(),
             selection: "branch main".to_owned(),
             resolved: Some("branch main @ abc".to_owned()),
+            semantic_details: None,
             state: ExternalBaselineState::Ready {
                 snapshot_id: "snapshot:test".to_owned(),
                 fingerprint: Some("fp".to_owned()),
@@ -2723,8 +2813,69 @@ mod tests {
             schema: "test".to_owned(),
             selection: "branch main".to_owned(),
             resolved: None,
+            semantic_details: None,
             state: ExternalBaselineState::Error("connection refused".to_owned()),
         }
+    }
+
+    #[test]
+    fn indexing_remote_cache() {
+        use super::{BaselineIndexingPublication::*, BaselineSemanticDetails};
+        let service = unreachable_workspace_service();
+        let mut status = ready_status();
+        status.semantic_details = Some(BaselineSemanticDetails {
+            snapshot_id: "snapshot:test".to_owned(),
+            fingerprint: Some("fp".to_owned()),
+            publication: Some(bsl_search::BaselineSemanticPublication {
+                model_id: "model".to_owned(),
+                dimension: 4,
+                complete: true,
+            }),
+        });
+        let seed = |status, age| service.seed_status_cache_for_test(status, age);
+        let identity = ("snapshot:test".into(), Some("fp".into()));
+        assert_eq!(service.indexing_publication("model", 4, Some(&identity)), Stale);
+        seed(status.clone(), Duration::ZERO);
+        assert_eq!(service.indexing_publication("model", 4, Some(&identity)), Ready);
+        assert_eq!(service.indexing_publication("other", 4, Some(&identity)), UnverifiedIdentity);
+        assert_eq!(service.indexing_publication("model", 8, Some(&identity)), UnverifiedIdentity);
+        {
+            let _locked = service.status_probe.slot.lock().unwrap();
+            assert_eq!(
+                service.indexing_publication("model", 4, Some(&identity)),
+                SnapshotUnavailable
+            );
+        }
+        seed(status.clone(), super::STATUS_PROBE_TTL);
+        assert_eq!(service.indexing_publication("model", 4, Some(&identity)), Stale);
+        seed(status.clone(), Duration::ZERO);
+        service.source.bump_refresh_generation_for_test();
+        assert_eq!(service.indexing_publication("model", 4, Some(&identity)), Stale);
+        seed(status.clone(), Duration::ZERO);
+        service.status_probe.refreshing.store(true, Ordering::Release);
+        assert_eq!(service.indexing_publication("model", 4, Some(&identity)), Stale);
+        service.status_probe.refreshing.store(false, Ordering::Release);
+        let mut changed = status.clone();
+        changed.semantic_details.as_mut().unwrap().fingerprint = Some("different".to_owned());
+        seed(changed, Duration::ZERO);
+        assert_eq!(service.indexing_publication("model", 4, Some(&identity)), Stale);
+        let mut changed = status.clone();
+        changed.semantic_details.as_mut().unwrap().publication.as_mut().unwrap().complete = false;
+        seed(changed, Duration::ZERO);
+        assert_eq!(service.indexing_publication("model", 4, Some(&identity)), UnverifiedCoverage);
+        let mut changed = status.clone();
+        changed.semantic_details.as_mut().unwrap().publication = None;
+        seed(changed, Duration::ZERO);
+        assert_eq!(service.indexing_publication("model", 4, Some(&identity)), UnverifiedIdentity);
+        status.semantic_details = None;
+        seed(status.clone(), Duration::ZERO);
+        assert_eq!(service.indexing_publication("model", 4, Some(&identity)), UnverifiedCoverage);
+        status.state = ExternalBaselineState::Missing;
+        seed(status, Duration::ZERO);
+        assert_eq!(service.indexing_publication("model", 4, Some(&identity)), Unavailable);
+        // Every path above only peeks: neither a network probe nor an actor request runs.
+        assert!(!service.status_probe_refreshing_for_test());
+        assert!(service.source.snapshot_cache_slot_for_test().is_none());
     }
 
     #[test]

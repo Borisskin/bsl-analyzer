@@ -27,9 +27,44 @@ pub(super) const HYBRID_FETCH_MULTIPLIER: usize = 2;
 ///
 /// `5` — `search_code` only — adds `freshness.drift_watch` and the completeness reasons the
 /// overlay's own state gives. The `reference` profile's documentation actions changed nothing
-/// and stay on `4`: their number is theirs from here on, not a shared one.
-pub(super) const SEARCH_CODE_SCHEMA_VERSION: &str = "5";
-pub(super) const DOCS_SCHEMA_VERSION: &str = "4";
+/// and stayed on `4`: their number is independent. Structured indexing advances code to `6`
+/// and documentation to `5`; optional semantic failure diagnostics advance them to `7` and `6`.
+pub(super) const SEARCH_CODE_SCHEMA_VERSION: &str = "7";
+pub(super) const DOCS_SCHEMA_VERSION: &str = "6";
+
+// Schema-only mirrors keep the MCP dependency out of the native search crate.
+// The parity test below validates every native failure code against this schema.
+#[derive(JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code, reason = "schema-only mirror of the native embedding failure")]
+struct SemanticFailureSchema {
+    code: SemanticFailureCodeSchema,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(default, with = "usize", extend("maximum" = u64::MAX))]
+    request_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(default, with = "usize", extend("maximum" = u64::MAX))]
+    max_request_bytes: Option<usize>,
+}
+
+#[derive(JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[allow(
+    dead_code,
+    clippy::enum_variant_names,
+    reason = "schema-only mirror of the native embedding failure codes"
+)]
+enum SemanticFailureCodeSchema {
+    EmbeddingInvalidConfig,
+    EmbeddingInputTooLarge,
+    EmbeddingRequestTooLarge,
+    EmbeddingResponseTooLarge,
+    EmbeddingTimeout,
+    EmbeddingTransportError,
+    EmbeddingProviderError,
+    EmbeddingInvalidResponse,
+    EmbeddingFailed,
+}
 
 /// The schema version an action's answer carries.
 pub(super) fn search_schema_version(action: &str) -> &'static str {
@@ -66,6 +101,10 @@ enum SearchOutput<C> {
         schema_version: StatusSchemaVersion,
         profile: SearchProfile,
         state: SearchState,
+        indexing: crate::indexing::Indexing,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schemars(default, with = "SemanticFailureSchema")]
+        semantic_failure: Option<bsl_search::EmbeddingFailure>,
     },
 }
 
@@ -73,9 +112,13 @@ enum SearchOutput<C> {
 struct SearchHits<A, V> {
     action: A,
     schema_version: V,
+    indexing: crate::indexing::Indexing,
     hits: Vec<Value>,
     shown: usize,
     total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(default, with = "SemanticFailureSchema")]
+    semantic_failure: Option<bsl_search::EmbeddingFailure>,
     #[serde(skip_serializing_if = "Option::is_none")]
     budget_exhausted: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -86,12 +129,16 @@ struct SearchHits<A, V> {
 struct SearchNotReady<A, V> {
     action: A,
     schema_version: V,
+    indexing: crate::indexing::Indexing,
     status: NotReadyStatus,
     retry_after_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     progress: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(default, with = "SemanticFailureSchema")]
+    semantic_failure: Option<bsl_search::EmbeddingFailure>,
 }
 
 macro_rules! const_enum {
@@ -110,10 +157,10 @@ const_enum!(FindDocsAction, FindDocs, "find_docs");
 const_enum!(SearchDocsAction, SearchDocs, "search_docs");
 const_enum!(ListPlatformAction, ListPlatform, "list_platform");
 const_enum!(StatusAction, Status, "status");
-const_enum!(SearchCodeSchemaVersion, V5, "5");
-const_enum!(SearchSchemaVersion, V4, "4");
+const_enum!(SearchCodeSchemaVersion, V7, "7");
+const_enum!(SearchSchemaVersion, V6, "6");
 const_enum!(ListPlatformSchemaVersion, V1, "1");
-const_enum!(StatusSchemaVersion, V1, "1");
+const_enum!(StatusSchemaVersion, V3, "3");
 const_enum!(NotReadyStatus, NotReady, "not_ready");
 
 #[derive(JsonSchema, Serialize)]
@@ -183,10 +230,8 @@ pub(super) enum SemanticUnavailable {
     /// was indexed with, so its query vectors cannot be compared against the stored ones. The
     /// carried string names both identities and the env/config knobs to reconcile them.
     IdentityMismatch(String),
-    /// Embedding the query failed at request time (timeout, network, or upstream error). The
-    /// embedder is configured but did not answer for this query, so semantic cannot serve it;
-    /// lexical results stand on their own and the carried detail explains the transient cause.
-    EmbedderUnavailable(String),
+    /// A safe build/query failure; query diagnostics remain response-local.
+    EmbeddingFailed(bsl_search::EmbeddingFailure),
 }
 
 impl SemanticUnavailable {
@@ -203,9 +248,14 @@ impl SemanticUnavailable {
                 "semantic skipped: requires PostgreSQL baseline serving".to_owned()
             }
             Self::IdentityMismatch(message) => message.clone(),
-            Self::EmbedderUnavailable(detail) => {
-                format!("semantic skipped: embedder unavailable ({detail})")
-            }
+            Self::EmbeddingFailed(_) => "semantic skipped: embedding failed".to_owned(),
+        }
+    }
+
+    pub(super) fn embedding_failure(&self) -> Option<bsl_search::EmbeddingFailure> {
+        match self {
+            Self::EmbeddingFailed(failure) => Some(*failure),
+            _ => None,
         }
     }
 }
@@ -300,7 +350,149 @@ pub(super) fn direct_search_max_window(limit: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::SemanticUnavailable;
+    use super::*;
+    use bsl_search::{EmbeddingFailure, EmbeddingFailureCode};
+    use serde_json::json;
+
+    #[test]
+    fn payload_failure_schema_matches_native_serialization_and_rejects_unsafe_shapes() {
+        let schema = serde_json::to_value(schemars::schema_for!(SemanticFailureSchema)).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let codes = [
+            EmbeddingFailureCode::EmbeddingInvalidConfig,
+            EmbeddingFailureCode::EmbeddingInputTooLarge,
+            EmbeddingFailureCode::EmbeddingRequestTooLarge,
+            EmbeddingFailureCode::EmbeddingResponseTooLarge,
+            EmbeddingFailureCode::EmbeddingTimeout,
+            EmbeddingFailureCode::EmbeddingTransportError,
+            EmbeddingFailureCode::EmbeddingProviderError,
+            EmbeddingFailureCode::EmbeddingInvalidResponse,
+            EmbeddingFailureCode::EmbeddingFailed,
+        ];
+        // The list above is checked against the native enum by the compiler: a new code makes
+        // this match non-exhaustive, so the mirror cannot fall behind unnoticed.
+        for code in codes {
+            match code {
+                EmbeddingFailureCode::EmbeddingInvalidConfig
+                | EmbeddingFailureCode::EmbeddingInputTooLarge
+                | EmbeddingFailureCode::EmbeddingRequestTooLarge
+                | EmbeddingFailureCode::EmbeddingResponseTooLarge
+                | EmbeddingFailureCode::EmbeddingTimeout
+                | EmbeddingFailureCode::EmbeddingTransportError
+                | EmbeddingFailureCode::EmbeddingProviderError
+                | EmbeddingFailureCode::EmbeddingInvalidResponse
+                | EmbeddingFailureCode::EmbeddingFailed => {}
+            }
+        }
+        assert_eq!(
+            schema["$defs"]["SemanticFailureCodeSchema"]["enum"].as_array().unwrap().len(),
+            codes.len()
+        );
+        for code in codes {
+            let value = serde_json::to_value(EmbeddingFailure::new(code)).unwrap();
+            validator.validate(&value).unwrap_or_else(|error| panic!("{value}: {error}"));
+            assert_eq!(value, json!({"code": code.as_str()}));
+        }
+        let failure = EmbeddingFailure {
+            code: EmbeddingFailureCode::EmbeddingInputTooLarge,
+            request_bytes: Some(4097),
+            max_request_bytes: Some(4096),
+        };
+        let value = serde_json::to_value(failure).unwrap();
+        assert!(validator.is_valid(&value));
+        for invalid in [
+            json!({"code": "unknown"}),
+            json!({"code": "embedding_failed", "detail": "private"}),
+            json!({"code": "embedding_failed", "url": "private"}),
+            json!({"request_bytes": 4097}),
+        ] {
+            assert!(!validator.is_valid(&invalid), "accepted {invalid}");
+        }
+        for field in ["request_bytes", "max_request_bytes"] {
+            for invalid in [json!(-1), json!(1.5), json!(1e30), json!("4096"), Value::Null] {
+                let mut bad = value.clone();
+                bad[field] = invalid;
+                assert!(!validator.is_valid(&bad), "accepted {bad}");
+            }
+        }
+
+        let output_schema = Value::Object((*search_output_schema()).clone());
+        let output_validator = jsonschema::validator_for(&output_schema).unwrap();
+        // Every response leaves the handler with its indexing telemetry attached.
+        let indexed = |mut result: rmcp::model::CallToolResult| {
+            use crate::indexing::{Indexing, Kind, State, Target};
+            Indexing::single(Target::new(Kind::Reference, State::Ready, None)).attach(&mut result);
+            result.structured_content.unwrap()
+        };
+        for action in ["search_code", "find_docs", "search_docs"] {
+            let ready = indexed(super::super::render::no_hits_response(
+                None,
+                super::super::render::Envelope::No,
+                action,
+                None,
+            ));
+            let pending = indexed(super::super::status::docs_not_ready(action));
+            for mut output in [ready, pending] {
+                assert!(output.get("semantic_failure").is_none());
+                assert!(output_validator.is_valid(&output), "{output}");
+                output["semantic_failure"]["code"] = json!("unknown");
+                assert!(!output_validator.is_valid(&output), "accepted {output}");
+            }
+            let ready = super::super::render::failure_hits_response(
+                Vec::new(),
+                "",
+                None,
+                super::super::render::Envelope::No,
+                action,
+                failure,
+                6000,
+                None,
+            );
+            let pending = super::super::render::not_ready_with_failure(
+                super::super::status::docs_not_ready(action),
+                Some(failure),
+            );
+            for result in [ready, pending] {
+                let output = indexed(result);
+                assert_eq!(output["semantic_failure"], value);
+                assert!(output_validator.is_valid(&output), "{output}");
+            }
+        }
+        use crate::state::{OverlayWarmupState, SemanticRuntimeStatus, WorkspaceSearchMode};
+        for profile in [crate::McpProfile::Workspace, crate::McpProfile::Reference] {
+            for known_failure in [None, Some(failure)] {
+                let runtime = known_failure
+                    .map(SemanticRuntimeStatus::EmbeddingFailed)
+                    .unwrap_or(SemanticRuntimeStatus::Ready);
+                let result = super::super::status::search_status_with_cap(
+                    profile,
+                    &crate::state::shared_engine(None),
+                    &bsl_search::IndexProgress::new(),
+                    &Arc::new(std::sync::Mutex::new(runtime)),
+                    WorkspaceSearchMode::SqliteLocal,
+                    OverlayWarmupState::Pending,
+                    None,
+                    None,
+                    false,
+                    std::time::Duration::ZERO,
+                )
+                .unwrap();
+                let mut output = indexed(result);
+                assert_eq!(output.get("semantic_failure"), known_failure.map(|_| &value));
+                assert!(output_validator.is_valid(&output), "{output}");
+                output["semantic_failure"]["extra"] = json!(true);
+                assert!(!output_validator.is_valid(&output));
+            }
+        }
+        let error = super::super::render::embedding_mcp_error(failure);
+        assert_eq!(error.message, "Semantic embedding failed; use lexical search or retry.");
+        let data = error.data.unwrap();
+        assert_eq!(data, json!({"semantic_failure": value}));
+        assert!(validator.is_valid(&data["semantic_failure"]));
+        let reason = SemanticUnavailable::EmbeddingFailed(failure);
+        assert_eq!(reason.embedding_failure(), Some(failure));
+        assert_eq!(reason.note(), "semantic skipped: embedding failed");
+    }
 
     #[test]
     fn identity_mismatch_note_surfaces_the_carried_actionable_message() {
