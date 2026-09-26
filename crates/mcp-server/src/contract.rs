@@ -36,7 +36,7 @@ use crate::{McpProfile, McpServer};
 /// Consumers should require an exact major and a minimum minor. Bump this by hand in the
 /// same commit that changes the surface; the snapshot test over [`document`] puts the
 /// version field next to the change in the diff.
-pub const CONTRACT_VERSION: &str = "3.0";
+pub const CONTRACT_VERSION: &str = "3.1";
 
 /// URI of the MCP resource carrying [`document`].
 pub const CONTRACT_URI: &str = "bsl-analyzer://contract";
@@ -156,7 +156,7 @@ const WORKSPACE_TOOLS: &[ToolDecl] = &[
         name: "search",
         actions: WORKSPACE_SEARCH_ACTIONS,
         note: None,
-        output_schema_version: Some("6"),
+        output_schema_version: Some("7"),
         default_enabled: true,
     },
     tool("query", QUERY_ACTIONS),
@@ -206,7 +206,7 @@ const REFERENCE_TOOLS: &[ToolDecl] = &[
         name: "search",
         actions: REFERENCE_SEARCH_ACTIONS,
         note: None,
-        output_schema_version: Some("5"),
+        output_schema_version: Some("6"),
         default_enabled: true,
     },
     SYNTAX_HELP,
@@ -541,7 +541,7 @@ mod tests {
     #[test]
     fn indexing_discovery_contract() {
         use crate::indexing::{Indexing, Kind, State, Target};
-        assert_eq!(CONTRACT_VERSION, "3.0");
+        assert_eq!(CONTRACT_VERSION, "3.1");
         let indexing = serde_json::to_value(Indexing::single(Target::new(
             Kind::Reference,
             State::Ready,
@@ -561,9 +561,9 @@ mod tests {
             assert!(validator.is_valid(actual.structured_content.as_ref().unwrap()));
             for action in ["search_code", "find_docs", "search_docs"] {
                 let version = if action == "search_code" && profile == McpProfile::Workspace {
-                    "6"
+                    "7"
                 } else {
-                    "5"
+                    "6"
                 };
                 for mut body in [
                     json!({"action":action,"schema_version":version,"hits":[],"shown":0,"total":0,"indexing":indexing}),
@@ -574,7 +574,7 @@ mod tests {
                     assert!(!validator.is_valid(&body));
                 }
             }
-            let mut status = json!({"action":"status","schema_version":"2","profile":"reference","state":"ready","indexing":indexing});
+            let mut status = json!({"action":"status","schema_version":"3","profile":"reference","state":"ready","indexing":indexing});
             assert!(validator.is_valid(&status));
             status.as_object_mut().unwrap().remove("indexing");
             assert!(!validator.is_valid(&status));
@@ -902,7 +902,7 @@ mod tests {
         doc.insert("mcp".into(), mcp_surface());
         expect![[r#"
             {
-              "contract_version": "3.0",
+              "contract_version": "3.1",
               "mcp": {
                 "profiles": {
                   "reference": {
@@ -932,8 +932,8 @@ mod tests {
                           }
                         ],
                         "name": "search",
-                        "output_schema_fingerprint": "blake3:4c0fc50e14df483065c4194c7b56af04c06d89afa424b8539ef0bf6b085acb61",
-                        "output_schema_version": "5",
+                        "output_schema_fingerprint": "blake3:63a9e96880002c29049b85f76cd9528061c72ffa0aa500384c44716d70501d42",
+                        "output_schema_version": "6",
                         "params": [
                           {
                             "name": "action",
@@ -1250,8 +1250,8 @@ mod tests {
                           }
                         ],
                         "name": "search",
-                        "output_schema_fingerprint": "blake3:68d060048123447b5c90c02081e9a1e49557bf1e267e0790509b472b9537ec27",
-                        "output_schema_version": "6",
+                        "output_schema_fingerprint": "blake3:53b026ab8c57f8b8241d822016322968ec90ec4a95e2f206e114cc6fb38a74bd",
+                        "output_schema_version": "7",
                         "params": [
                           {
                             "name": "action",

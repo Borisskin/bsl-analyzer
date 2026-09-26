@@ -643,7 +643,7 @@ const WAITS: &[(&str, &str, &str, Waiting)] = &[
     // lease attempts is not held under it, which is why this wait is the owner's and bounded
     // by the attempt rather than by a foreign lease holder.
     ("state/bootstrap.rs", "publish_engine_with_retry", "acquire_for_owner(", Waiting::Owner),
-    ("state/bootstrap.rs", "ensure_loading_with_wait", "acquire_for_owner(", Waiting::Owner),
+    ("state/bootstrap.rs", "finish_initialization", "acquire_for_owner(", Waiting::Owner),
     // The one uncancellable hold, taken only by the reference profile's own shutdown.
     ("state/bootstrap.rs", "shutdown", "take_for_shutdown(", Waiting::OwnProtocol),
     ("state/embed.rs", "kick_context_reembed", "acquire_for_owner(", Waiting::Owner),
@@ -785,6 +785,7 @@ fn the_test_only_modules_are_the_ones_the_parent_gates() {
             "diagnostics_state/test_support.rs",
             "graph/test_support.rs",
             "indexing_runtime_tests.rs",
+            "payload_smoke_tests.rs",
             "state/indexing_tests.rs",
             "state/test_support.rs",
             "tools/search/cancel_tests.rs",

@@ -55,6 +55,63 @@ impl Drop for EnvVarGuard {
 pub(super) use fixtures::{mock_embedding_env, write_common_module, write_common_module_tree};
 pub(crate) use fixtures::{mock_semantic_config, spawn_mock_embedding_server};
 
+/// Explicit local fixtures for the handler acceptance tests: no environment changes,
+/// cache discovery, resident graph or filesystem watcher is needed by these search routes.
+pub(crate) fn payload_workspace_state(engine: bsl_search::SearchEngine) -> super::SharedState {
+    let state = super::SharedState::shared();
+    *state.search_engine.lock().unwrap() = Some(engine);
+    *state.semantic_runtime.lock().unwrap() = super::SemanticRuntimeStatus::Indexing;
+    state
+}
+
+pub(crate) fn payload_reference_state(
+    engine: Option<bsl_search::SearchEngine>,
+    runtime: super::SemanticRuntimeStatus,
+) -> super::SharedState {
+    let mut state = super::SharedState::shared();
+    *state.reference_search.lifecycle.lock().unwrap() = if engine.is_some() {
+        super::ReferenceSearchLifecycle::Ready
+    } else {
+        super::ReferenceSearchLifecycle::Loading
+    };
+    *state.reference_search.engine.lock().unwrap() = engine;
+    *state.reference_search.semantic_runtime.lock().unwrap() = runtime;
+    state.search_engine = state.reference_search.engine.clone();
+    state.semantic_runtime = state.reference_search.semantic_runtime.clone();
+    state.index_progress = state.reference_search.progress.clone();
+    state.baseline = crate::baseline::DeferredBaselineRuntime::absent();
+    state.reference_search.baseline = crate::baseline::DeferredBaselineRuntime::absent();
+    state
+}
+
+/// Workspace docs share the reference resident but keep a separate workspace verdict.
+pub(crate) fn payload_workspace_reference_state(
+    reference: &super::SharedState,
+) -> super::SharedState {
+    let mut state = reference.clone();
+    state.semantic_runtime = std::sync::Arc::new(Mutex::new(super::SemanticRuntimeStatus::Ready));
+    state
+}
+
+/// Exercise the production MCP background owner with an explicit fixture configuration.
+pub(crate) fn payload_start_embed(
+    state: &super::SharedState,
+    db_path: &std::path::Path,
+    config: bsl_search::SearchConfig,
+) {
+    super::SharedState::spawn_embed_pass(
+        state.search_engine.clone(),
+        state.owners.clone(),
+        state.semantic_runtime.clone(),
+        state.index_progress.clone(),
+        state.embed_flight.clone(),
+        state.workspace_lease.clone(),
+        db_path.to_path_buf(),
+        config,
+        super::bootstrap::DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
+    );
+}
+
 #[cfg(test)]
 mod fixtures {
     use super::EnvVarGuard;
@@ -131,6 +188,7 @@ mod fixtures {
                 dim: Some(3),
                 api_key: None,
                 provider: None,
+                ..Default::default()
             },
             execution: bsl_search::EmbeddingExecutionPolicy::default(),
         }

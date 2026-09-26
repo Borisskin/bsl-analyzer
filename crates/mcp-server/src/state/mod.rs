@@ -578,10 +578,7 @@ impl SharedState {
         };
         let (runtime_disabled, runtime_failed) = {
             let Ok(runtime) = self.semantic_runtime.try_lock() else { return unknown() };
-            (
-                matches!(*runtime, SemanticRuntimeStatus::Disabled),
-                matches!(*runtime, SemanticRuntimeStatus::Failed(_)),
-            )
+            (matches!(*runtime, SemanticRuntimeStatus::Disabled), runtime.is_failed())
         };
         let Some(engine) = self.search_engine.try_snapshot() else {
             let semantic = match &sample {
@@ -608,7 +605,9 @@ impl SharedState {
             matches!(self.workspace_search_mode, WorkspaceSearchMode::PostgresRemoteOverlay);
         let warmup = if remote {
             self.overlay_warmup.try_lock().ok().map(|state| match &*state {
-                OverlayWarmupState::Failed(_) => State::Failed,
+                OverlayWarmupState::Failed(_) | OverlayWarmupState::EmbeddingFailed(_) => {
+                    State::Failed
+                }
                 OverlayWarmupState::Superseded => State::Superseded,
                 OverlayWarmupState::Synced { .. } | OverlayWarmupState::NoLocalDiffs => {
                     State::Ready
@@ -1012,6 +1011,10 @@ impl SharedState {
 
     pub(crate) fn reference_search_engine(&self) -> SharedSearchEngine {
         Arc::clone(&self.reference_search.engine)
+    }
+
+    pub(crate) fn reference_semantic_runtime(&self) -> Arc<Mutex<SemanticRuntimeStatus>> {
+        Arc::clone(&self.reference_search.semantic_runtime)
     }
 
     pub(crate) fn reference_baseline_view(&self) -> crate::baseline::BaselineView {

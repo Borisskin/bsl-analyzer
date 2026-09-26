@@ -296,13 +296,10 @@ async fn indexing_polling_smoke() {
                     !fallback["hits"].as_array().unwrap().is_empty(),
                     "lexical hit survives query timeout"
                 );
-                let degraded = fallback["degraded"]
-                    .as_str()
-                    .expect("degraded semantic modality")
-                    .to_lowercase();
-                assert!(
-                    degraded.contains("timeout") || degraded.contains("timed out"),
-                    "actual timeout: {degraded}"
+                assert!(fallback["degraded"].is_string(), "degraded semantic modality");
+                assert_eq!(
+                    fallback["semantic_failure"]["code"], "embedding_timeout",
+                    "the typed cause names the timeout: {fallback}"
                 );
                 assert_eq!(fallback["freshness"]["completeness"]["status"], "partial");
                 assert_eq!(target(&fallback, "semantic")["state"], "ready");

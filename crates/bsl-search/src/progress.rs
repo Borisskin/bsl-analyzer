@@ -205,6 +205,19 @@ impl IndexPassToken {
             });
         });
     }
+    /// Extend the batch total for a pass that plans its requests one owner at a time: the
+    /// byte-bounded split of an owner is known only once its missing texts are.
+    pub fn add_batches(&self, batches: usize) {
+        self.update(|s| {
+            if let Some(c) = s.counters.as_mut() {
+                match c.total_batches.map(|total| total.checked_add(batches)) {
+                    Some(Some(total)) => c.total_batches = Some(total),
+                    Some(None) => s.counters = None,
+                    None => {}
+                }
+            }
+        });
+    }
     pub fn advance(&self, chunks: usize, batches: usize) {
         self.update(|s| {
             if let Some(c) = s.counters.as_mut() {
@@ -328,5 +341,29 @@ mod indexing_pass_lifecycle {
         assert_eq!(progress.snapshot().unwrap().state, IndexPassState::Superseded);
         let _pass = progress.begin_pass();
         assert_eq!(progress.snapshot().unwrap().state, IndexPassState::Running);
+    }
+    /// Without the extension, a byte-bounded split that outgrows the count-only estimate
+    /// would make `advance` drop the counters as inconsistent.
+    #[test]
+    fn a_plan_made_per_owner_extends_the_batch_total() {
+        let progress = IndexProgress::new();
+        let mut pass = progress.begin_pass();
+        let token = pass.token();
+        let counters = || progress.snapshot().unwrap().counters.unwrap();
+        token.set_totals(2, 5, 0);
+        token.add_batches(2);
+        token.advance(3, 2);
+        token.add_batches(1);
+        token.advance(2, 1);
+        assert_eq!(counters().total_batches, Some(3));
+        assert_eq!((counters().done_chunks, counters().done_batches), (5, 3));
+        token.advance(0, 1);
+        assert!(progress.snapshot().unwrap().counters.is_none(), "overrun drops counters");
+        token.set_totals(1, 1, usize::MAX);
+        token.add_batches(1);
+        assert!(progress.snapshot().unwrap().counters.is_none(), "overflow drops counters");
+        pass.finish(IndexPassState::Ready);
+        token.add_batches(1);
+        assert!(progress.snapshot().unwrap().counters.is_none());
     }
 }

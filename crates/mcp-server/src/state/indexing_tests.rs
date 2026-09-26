@@ -92,6 +92,11 @@ fn indexing_local_qualification_projection() {
         "engine contention cannot erase a known attempt"
     );
     drop(held);
+    *state.semantic_runtime.lock().unwrap() = SemanticRuntimeStatus::EmbeddingFailed(
+        bsl_search::EmbeddingFailure::new(bsl_search::EmbeddingFailureCode::EmbeddingTimeout),
+    );
+    assert_eq!(targets(&state)[1]["state"], "failed", "a typed embedding failure is a failure");
+    assert_eq!(targets(&state)[1]["reason_code"], "native_failure");
 }
 
 #[tokio::test]
@@ -690,6 +695,11 @@ fn indexing_remote_qualification_combines_publication_and_overlay() {
     assert_eq!(targets(&state)[1]["reason_code"], "overlay_pending");
     *state.overlay_warmup.lock().unwrap() = OverlayWarmupState::Failed("private diagnostic".into());
     assert_eq!(targets(&state)[1]["state"], "failed", "known failure wins over dirty overlay");
+    assert_eq!(targets(&state)[1]["reason_code"], "native_failure");
+    *state.overlay_warmup.lock().unwrap() = OverlayWarmupState::EmbeddingFailed(
+        bsl_search::EmbeddingFailure::new(bsl_search::EmbeddingFailureCode::EmbeddingTimeout),
+    );
+    assert_eq!(targets(&state)[1]["state"], "failed", "a typed overlay failure is not pending");
     assert_eq!(targets(&state)[1]["reason_code"], "native_failure");
     *state.overlay_warmup.lock().unwrap() = OverlayWarmupState::Superseded;
     assert_eq!(targets(&state)[1]["state"], "superseded");

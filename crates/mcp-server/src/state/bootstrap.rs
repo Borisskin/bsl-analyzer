@@ -11,7 +11,9 @@ use crate::change_hub::WorkspaceChangeHub;
 use crate::diagnostics_state::DiagnosticsState;
 use crate::graph::GraphState;
 use bsl_platform::PlatformDataInner;
-use bsl_search::{BaselineHashMode, CorpusId, IndexProgress, SearchEngine, SearchError};
+use bsl_search::{
+    BaselineHashMode, CorpusId, EmbeddingFailure, IndexProgress, SearchEngine, SearchError,
+};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::{
@@ -31,9 +33,11 @@ const EMBEDDING_PUBLISH_RETRY_BUDGET_ENV: &str = "EMBEDDING_PUBLISH_RETRY_BUDGET
 static EMBEDDING_PUBLISH_RETRY_BUDGET_WARNINGS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-fn search_failure(error: SearchError) -> (String, String) {
+type ReferenceInitError = (String, String, Option<EmbeddingFailure>);
+
+fn search_failure(error: SearchError) -> ReferenceInitError {
     let reason = error.reason_code().unwrap_or("search_error").to_owned();
-    (error.to_string(), reason)
+    (error.to_string(), reason, error.embedding_failure())
 }
 
 /// Writes the verdict a reference-search worker could not write for itself.
@@ -103,6 +107,10 @@ impl ReferenceSearchState {
             return;
         }
         *lifecycle = ReferenceSearchLifecycle::Loading;
+        SharedState::set_semantic_runtime_status(
+            &self.semantic_runtime,
+            SemanticRuntimeStatus::Disabled,
+        );
         drop(lifecycle);
 
         let state = self.clone();
@@ -134,68 +142,12 @@ impl ReferenceSearchState {
                                 "configured reference baseline is unavailable".to_owned()
                             }),
                         "baseline_unavailable".to_owned(),
+                        None,
                     ))
                 } else {
                     SharedState::init_reference_search_engine(&state.progress, baseline.external)
                 };
-                if state.stopped.load(Ordering::Acquire) {
-                    return;
-                }
-                match initialization {
-                    Ok(engine) => {
-                        let status = SharedState::semantic_runtime_status_for_mode(
-                            &engine,
-                            &WorkspaceSearchMode::SqliteLocal,
-                        );
-                        // `Ready` is the claim that the engine is in the slot, so it is made
-                        // only where the engine reaches it. A refused admission — the daemon
-                        // stopping, or a poisoned slot — published nothing, and saying ready
-                        // over an empty slot sends every reader to a profile that cannot
-                        // answer.
-                        match state.engine.acquire_for_owner(&state.stop) {
-                            Ok(mut slot) => {
-                                let mut lifecycle = state
-                                    .lifecycle
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                *slot = Some(engine);
-                                SharedState::set_semantic_runtime_status(
-                                    &state.semantic_runtime,
-                                    status,
-                                );
-                                *lifecycle = ReferenceSearchLifecycle::Ready;
-                            }
-                            Err(error) => {
-                                let message =
-                                    format!("reference search engine was not published: {error}");
-                                SharedState::set_semantic_runtime_status(
-                                    &state.semantic_runtime,
-                                    SemanticRuntimeStatus::Failed(message.clone()),
-                                );
-                                // The worker ended without putting an engine in the slot, which
-                                // is what this code has always named. A new one would reach
-                                // `find_docs`/`search_docs` callers as `data.reasonCode`, and
-                                // the reference profile is frozen.
-                                *state
-                                    .lifecycle
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                                    ReferenceSearchLifecycle::Failed {
-                                        message,
-                                        reason_code: "worker_gone".to_owned(),
-                                    };
-                            }
-                        }
-                    }
-                    Err((message, reason_code)) => {
-                        SharedState::set_semantic_runtime_status(
-                            &state.semantic_runtime,
-                            SemanticRuntimeStatus::Failed(message.clone()),
-                        );
-                        *state.lifecycle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                            ReferenceSearchLifecycle::Failed { message, reason_code };
-                    }
-                }
+                state.finish_initialization(initialization);
             },
         );
         match spawn {
@@ -228,6 +180,67 @@ impl ReferenceSearchState {
             ReferenceSearchLifecycle::Ready => Target::new(Kind::Reference, State::Ready, None),
             ReferenceSearchLifecycle::Failed { .. } => {
                 Target::new(Kind::Reference, State::Failed, Some(Reason::NativeFailure))
+            }
+        }
+    }
+
+    fn finish_initialization(
+        &self,
+        initialization: Result<(SearchEngine, Option<EmbeddingFailure>), ReferenceInitError>,
+    ) {
+        if self.stopped.load(Ordering::Acquire) {
+            return;
+        }
+        let lock_lifecycle =
+            || self.lifecycle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match initialization {
+            Ok((engine, embedding_failure)) => {
+                let status = embedding_failure.map_or_else(
+                    || {
+                        SharedState::semantic_runtime_status_for_mode(
+                            &engine,
+                            &WorkspaceSearchMode::SqliteLocal,
+                        )
+                    },
+                    SemanticRuntimeStatus::EmbeddingFailed,
+                );
+                // `Ready` is the claim that the engine is in the slot, so it is made only where
+                // the engine reaches it. A refused admission — the daemon stopping, or a
+                // poisoned slot — published nothing, and saying ready over an empty slot sends
+                // every reader to a profile that cannot answer.
+                match self.engine.acquire_for_owner(&self.stop) {
+                    Ok(mut slot) => {
+                        let mut lifecycle = lock_lifecycle();
+                        *slot = Some(engine);
+                        SharedState::set_semantic_runtime_status(&self.semantic_runtime, status);
+                        *lifecycle = ReferenceSearchLifecycle::Ready;
+                    }
+                    Err(error) => {
+                        let message = format!("reference search engine was not published: {error}");
+                        SharedState::set_semantic_runtime_status(
+                            &self.semantic_runtime,
+                            SemanticRuntimeStatus::Failed(message.clone()),
+                        );
+                        // The worker ended without putting an engine in the slot, which is what
+                        // this code has always named. A new one would reach
+                        // `find_docs`/`search_docs` callers as `data.reasonCode`, and the
+                        // reference profile is frozen.
+                        *lock_lifecycle() = ReferenceSearchLifecycle::Failed {
+                            message,
+                            reason_code: "worker_gone".to_owned(),
+                        };
+                    }
+                }
+            }
+            Err((message, reason_code, embedding_failure)) => {
+                SharedState::set_semantic_runtime_status(
+                    &self.semantic_runtime,
+                    embedding_failure.map_or_else(
+                        || SemanticRuntimeStatus::Failed(message.clone()),
+                        SemanticRuntimeStatus::EmbeddingFailed,
+                    ),
+                );
+                *lock_lifecycle() = ReferenceSearchLifecycle::Failed { message, reason_code };
             }
         }
     }
@@ -473,21 +486,33 @@ impl SharedState {
         // the SAME owner; no second warmup worker is introduced.
         let overlay_retry =
             if matches!(workspace_search_mode, WorkspaceSearchMode::PostgresRemoteOverlay) {
-                if Self::embedding_config().is_some() {
-                    Some(super::overlay_retry::OverlayRetry::spawn(
+                match Self::embedding_config() {
+                    Ok(Some(_)) => Some(super::overlay_retry::OverlayRetry::spawn(
                         Arc::clone(&search_engine),
                         owners.clone(),
                         Arc::clone(&overlay_warmup),
                         Arc::clone(&semantic_runtime),
                         workspace_lease.clone(),
                         embedding_publish_retry_budget,
-                    ))
-                } else {
-                    Self::set_overlay_warmup_state(
-                        &overlay_warmup,
-                        OverlayWarmupState::Skipped("no embedder configured".to_owned()),
-                    );
-                    None
+                    )),
+                    Ok(None) => {
+                        Self::set_overlay_warmup_state(
+                            &overlay_warmup,
+                            OverlayWarmupState::Skipped("no embedder configured".to_owned()),
+                        );
+                        None
+                    }
+                    Err(error) => {
+                        Self::set_semantic_runtime_status(
+                            &semantic_runtime,
+                            SemanticRuntimeStatus::from_search_error(&error),
+                        );
+                        Self::set_overlay_warmup_state(
+                            &overlay_warmup,
+                            OverlayWarmupState::from_search_error(&error),
+                        );
+                        None
+                    }
                 }
             } else {
                 None
@@ -711,7 +736,7 @@ impl SharedState {
                     Err(error) => {
                         Self::set_semantic_runtime_status(
                             &semantic_runtime,
-                            SemanticRuntimeStatus::Failed(error.to_string()),
+                            SemanticRuntimeStatus::from_search_error(&error),
                         );
                         // A product failure is not supersession: keep the graph independently
                         // available, but stop search retries because no engine can publish.
@@ -777,7 +802,19 @@ impl SharedState {
                             bsl_search::FenceOutcome::Superseded
                             | bsl_search::FenceOutcome::Released,
                         ) => Ok(None),
-                        Err(error) => Err(error),
+                        // The overlay was installed; losing some vectors must not withhold the
+                        // engine and with it the lexical search. Nothing is latched, since no
+                        // local owner could clear it: the refused keys stay dirty and are rebuilt
+                        // lexically, and their vectors wait for the next boot's prime, as before.
+                        Err(error) => match error.embedding_failure() {
+                            Some(_) => {
+                                tracing::warn!(
+                                    "workspace overlay prime left entries without vectors: {error}"
+                                );
+                                Ok(Some(()))
+                            }
+                            None => Err(error),
+                        },
                     },
                     OverlayInit::RemoteWarmup => Ok(Some(())),
                 };
@@ -792,7 +829,7 @@ impl SharedState {
                     Err(error) => {
                         Self::set_semantic_runtime_status(
                             &semantic_runtime,
-                            SemanticRuntimeStatus::Failed(error.to_string()),
+                            SemanticRuntimeStatus::from_search_error(&error),
                         );
                         graph.ensure_loading();
                         if let Some(retry) = &overlay_retry {
@@ -842,7 +879,7 @@ impl SharedState {
                     Err(error) => {
                         Self::set_semantic_runtime_status(
                             &semantic_runtime,
-                            SemanticRuntimeStatus::Failed(error.to_string()),
+                            SemanticRuntimeStatus::from_search_error(&error),
                         );
                         return;
                     }
@@ -998,11 +1035,12 @@ impl SharedState {
         }
     }
 
-    pub(super) fn embedding_config() -> Option<bsl_search::SearchConfig> {
-        let base_url = std::env::var("EMBEDDING_URL").ok()?;
+    pub(super) fn embedding_config() -> Result<Option<bsl_search::SearchConfig>, SearchError> {
+        let Ok(base_url) = std::env::var("EMBEDDING_URL") else { return Ok(None) };
         // The model must be declared explicitly: a wrong default would silently mix
         // vectors from different models into one index. Unset means FTS-only.
-        let model = std::env::var("EMBEDDING_MODEL").ok()?;
+        let Ok(model) = std::env::var("EMBEDDING_MODEL") else { return Ok(None) };
+        let max_request_bytes = bsl_search::EmbedderConfig::request_bytes_from_env()?;
         let dim: usize =
             std::env::var("EMBEDDING_DIM").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
         // Background index/embedding workers otherwise saturate every core and starve interactive
@@ -1018,13 +1056,14 @@ impl SharedState {
                     .unwrap_or(4)
             });
 
-        Some(bsl_search::SearchConfig {
+        Ok(Some(bsl_search::SearchConfig {
             embedder: bsl_search::EmbedderConfig {
                 base_url,
                 model,
                 dim: Some(dim),
                 api_key: std::env::var("EMBEDDING_API_KEY").ok(),
                 provider: std::env::var("EMBEDDING_PROVIDER").ok(),
+                max_request_bytes,
             },
             execution: bsl_search::EmbeddingExecutionPolicy {
                 batch_size: std::env::var("EMBEDDING_BATCH_SIZE")
@@ -1037,7 +1076,7 @@ impl SharedState {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(20),
             },
-        })
+        }))
     }
 
     fn embedding_publish_retry_budget() -> std::time::Duration {
@@ -1104,11 +1143,11 @@ impl SharedState {
         }
     }
 
-    fn open_search_engine(db_path: &Path) -> Option<SearchEngine> {
-        if let Some(config) = Self::embedding_config() {
-            return Self::open_semantic_search_engine(db_path, config);
+    fn open_search_engine(db_path: &Path) -> Result<Option<SearchEngine>, SearchError> {
+        if let Some(config) = Self::embedding_config()? {
+            return Ok(Self::open_semantic_search_engine(db_path, config));
         }
-        Self::open_fts_only_search_engine(db_path)
+        Ok(Self::open_fts_only_search_engine(db_path))
     }
 
     pub(super) fn startup_apply<T>(
@@ -1283,7 +1322,7 @@ impl SharedState {
         lease: &crate::workspace_lease::WorkspaceLease,
         stop: &super::OwnerStop,
     ) -> Result<Option<SearchEngine>, bsl_search::SearchError> {
-        let opened = match Self::embedding_config() {
+        let opened = match Self::embedding_config()? {
             Some(config) => SearchEngine::new_fenced(db_path, config, |apply| {
                 Self::startup_apply_checkpointed(lease, stop, apply)
             }),
@@ -1305,7 +1344,7 @@ impl SharedState {
         lease: &crate::workspace_lease::WorkspaceLease,
         stop: &super::OwnerStop,
     ) -> Result<Option<SearchEngine>, bsl_search::SearchError> {
-        let opened = match Self::embedding_config() {
+        let opened = match Self::embedding_config()? {
             Some(config) => SearchEngine::semantic_overlay_only_fenced(db_path, config, |apply| {
                 Self::startup_apply_checkpointed(lease, stop, apply)
             }),
@@ -1670,7 +1709,7 @@ impl SharedState {
             // the engine back immediately so lexical search and the graph go live in
             // minutes, and defer the ~hours-long embedding pass to a background thread
             // on its own connection (see `spawn_workspace_search_init`).
-            let pending_embed = Self::embedding_config()
+            let pending_embed = Self::embedding_config()?
                 .map(|config| PendingEmbed { db_path: db_path.clone(), config });
             // The fused parse pass ingested files present on disk but never removed rows for a `.bsl`
             // deleted while the daemon was down. Reconcile the store to disk so the overlay baseline
@@ -1760,6 +1799,7 @@ impl SharedState {
             let code_embeddings = embeddings_result.unwrap_or(0);
             let pending_embed = (code_chunks > code_embeddings)
                 .then(Self::embedding_config)
+                .transpose()?
                 .flatten()
                 .map(|config| PendingEmbed { db_path: db_path.clone(), config });
 
@@ -1874,9 +1914,9 @@ impl SharedState {
     fn init_reference_search_engine(
         progress: &Arc<IndexProgress>,
         external_baseline: Option<Arc<ExternalBaselineService>>,
-    ) -> Result<SearchEngine, (String, String)> {
+    ) -> Result<(SearchEngine, Option<EmbeddingFailure>), ReferenceInitError> {
         let db_path = Self::reference_search_db_path().ok_or_else(|| {
-            ("reference cache path is unavailable".to_owned(), "storage_error".to_owned())
+            ("reference cache path is unavailable".to_owned(), "storage_error".to_owned(), None)
         })?;
         Self::init_reference_search_engine_at(&db_path, progress, external_baseline)
     }
@@ -1885,16 +1925,21 @@ impl SharedState {
         db_path: &Path,
         progress: &Arc<IndexProgress>,
         external_baseline: Option<Arc<ExternalBaselineService>>,
-    ) -> Result<SearchEngine, (String, String)> {
+    ) -> Result<(SearchEngine, Option<EmbeddingFailure>), ReferenceInitError> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)
-                .map_err(|error| (error.to_string(), "storage_error".to_owned()))?;
+                .map_err(|error| (error.to_string(), "storage_error".to_owned(), None))?;
         }
 
-        let mut engine = Self::open_search_engine(db_path).ok_or_else(|| {
-            ("failed to open reference search engine".to_owned(), "storage_error".to_owned())
-        })?;
-        if external_baseline
+        let mut engine =
+            Self::open_search_engine(db_path).map_err(search_failure)?.ok_or_else(|| {
+                (
+                    "failed to open reference search engine".to_owned(),
+                    "storage_error".to_owned(),
+                    None,
+                )
+            })?;
+        let embedding_failure = if external_baseline
             .as_ref()
             .is_some_and(|baseline| matches!(baseline.corpus(), CorpusId::Reference))
         {
@@ -1931,6 +1976,7 @@ impl SharedState {
                         return Err((
                             "external reference baseline has no resolved snapshot".to_owned(),
                             "baseline_unavailable".to_owned(),
+                            None,
                         ));
                     }
                     Err(error) => {
@@ -1941,10 +1987,11 @@ impl SharedState {
             tracing::info!(
                 "external reference baseline is configured; lexical search uses the shared snapshot and semantic cache is synchronized locally"
             );
+            None
         } else {
-            Self::index_platform_docs(&mut engine, progress).map_err(search_failure)?;
-        }
-        Ok(engine)
+            Self::index_platform_docs(&mut engine, progress).map_err(search_failure)?
+        };
+        Ok((engine, embedding_failure))
     }
 
     fn index_external_reference_docs(
@@ -1996,11 +2043,11 @@ impl SharedState {
     fn index_platform_docs(
         engine: &mut SearchEngine,
         progress: &Arc<IndexProgress>,
-    ) -> Result<(), SearchError> {
+    ) -> Result<Option<EmbeddingFailure>, SearchError> {
         let platform = PlatformDataInner::instance();
         if platform.all_types().is_empty() {
             tracing::debug!("no platform data available, skipping docs indexing");
-            return Ok(());
+            return Ok(None);
         }
 
         let documents = crate::build_reference_documents();
@@ -2027,7 +2074,7 @@ impl SharedState {
         } else {
             tracing::info!("platform docs unchanged, skipped");
         }
-        Ok(())
+        Ok(outcome.embedding_failure)
     }
 
     fn reference_search_db_path() -> Option<PathBuf> {
@@ -2127,6 +2174,143 @@ mod tests {
             2,
             "both pauses should have left the engine acquirable",
         );
+    }
+
+    #[test]
+    fn payload_lifecycle_reference_lexical_publication_keeps_failure_and_recovers() {
+        use super::super::test_support::{mock_semantic_config, spawn_mock_embedding_server};
+        let _lock = env_lock();
+        let server = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("reference.db");
+        let documents = [Document {
+            title: "Массив".to_owned(),
+            body: "payloadrefmarker".to_owned(),
+            kind: "type".to_owned(),
+        }];
+        let state = super::ReferenceSearchState::new(None);
+        let mut limited = mock_semantic_config(&server);
+        limited.embedder.max_request_bytes = 1;
+        let mut engine = SearchEngine::new(&db_path, limited).unwrap();
+        let outcome = engine
+            .replace_reference_collection_if_stale(
+                "platform",
+                "platform://docs",
+                "payload-reference",
+                &documents,
+                Some(&state.progress),
+            )
+            .unwrap();
+        let failure = outcome.embedding_failure.expect("real local embedding refusal");
+        assert_eq!(failure.code, bsl_search::EmbeddingFailureCode::EmbeddingInputTooLarge);
+        state.finish_initialization(Ok((engine, outcome.embedding_failure)));
+        assert_eq!(state.lifecycle(), super::ReferenceSearchLifecycle::Ready);
+        assert_eq!(state.semantic_runtime.lock().unwrap().embedding_failure(), Some(failure));
+        {
+            let guard = state.engine.lock().unwrap();
+            let engine = guard.as_ref().unwrap();
+            assert_eq!(engine.vector_count(), 0);
+            assert_eq!(
+                engine.text_search("payloadrefmarker", 10, Some("platform")).unwrap().len(),
+                1
+            );
+        }
+
+        let mut recovered = SearchEngine::new(&db_path, mock_semantic_config(&server)).unwrap();
+        let outcome = recovered
+            .replace_reference_collection_if_stale(
+                "platform",
+                "platform://docs",
+                "payload-reference",
+                &documents,
+                Some(&state.progress),
+            )
+            .unwrap();
+        assert!(outcome.written, "the lexical stamp must request a semantic retry");
+        assert!(outcome.embedding_failure.is_none());
+        state.finish_initialization(Ok((recovered, outcome.embedding_failure)));
+        assert_eq!(state.lifecycle(), super::ReferenceSearchLifecycle::Ready);
+        assert_eq!(*state.semantic_runtime.lock().unwrap(), SemanticRuntimeStatus::Ready);
+        assert_eq!(state.engine.lock().unwrap().as_ref().unwrap().vector_count(), 1);
+        state.shutdown();
+    }
+
+    #[test]
+    fn payload_lifecycle_reference_config_error_reaches_the_runtime_owner() {
+        let _lock = env_lock();
+        let _url = EnvVarGuard::set("EMBEDDING_URL", "http://127.0.0.1:9/v1");
+        let _model = EnvVarGuard::set("EMBEDDING_MODEL", "test-model");
+        let _limit = EnvVarGuard::set("EMBEDDING_MAX_REQUEST_BYTES", "private-invalid-value");
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("reference.db");
+        let state = super::ReferenceSearchState::new(None);
+        let initialization =
+            SharedState::init_reference_search_engine_at(&db_path, &state.progress, None);
+        assert!(!db_path.exists(), "invalid configuration must fail before storage opens");
+        state.finish_initialization(initialization);
+        assert!(
+            matches!(state.lifecycle(), super::ReferenceSearchLifecycle::Failed { ref message, .. }
+            if message == "embedding_invalid_config")
+        );
+        assert_eq!(
+            state.semantic_runtime.lock().unwrap().embedding_failure().unwrap().code,
+            bsl_search::EmbeddingFailureCode::EmbeddingInvalidConfig,
+        );
+        assert!(state.engine.lock().unwrap().is_none());
+        state.shutdown();
+    }
+
+    #[test]
+    fn payload_configuration_rejects_invalid_enabled_settings_before_opening_storage() {
+        let _lock = env_lock();
+        let _url = EnvVarGuard::set("EMBEDDING_URL", "http://127.0.0.1:9/v1");
+        let _model = EnvVarGuard::set("EMBEDDING_MODEL", "test-model");
+        let _batch = EnvVarGuard::set("EMBEDDING_BATCH_SIZE", "7");
+        let _concurrency = EnvVarGuard::set("EMBEDDING_CONCURRENCY", "3");
+        let _limit = EnvVarGuard::unset("EMBEDDING_MAX_REQUEST_BYTES");
+        let config = SharedState::embedding_config().unwrap().unwrap();
+        assert_eq!(config.embedder.max_request_bytes, 1_048_576);
+        assert_eq!(config.execution.batch_size, 7);
+        assert_eq!(config.execution.concurrency, 3);
+
+        {
+            let _limit = EnvVarGuard::set("EMBEDDING_MAX_REQUEST_BYTES", "4096");
+            assert_eq!(
+                SharedState::embedding_config().unwrap().unwrap().embedder.max_request_bytes,
+                4096
+            );
+        }
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("unopened.db");
+        let lease = crate::workspace_lease::WorkspaceLease::unmanaged();
+        for invalid in
+            ["0".to_owned(), "private-invalid-value".to_owned(), format!("{}0", usize::MAX)]
+        {
+            let _limit = EnvVarGuard::set("EMBEDDING_MAX_REQUEST_BYTES", &invalid);
+            let error = SharedState::embedding_config().err().expect("invalid configuration");
+            assert_eq!(error.to_string(), "embedding_invalid_config");
+            assert_eq!(
+                error.embedding_failure().unwrap().code,
+                bsl_search::EmbeddingFailureCode::EmbeddingInvalidConfig
+            );
+            assert!(SharedState::open_search_engine_fenced(
+                &db_path,
+                &lease,
+                &super::super::OwnerStop::default()
+            )
+            .is_err());
+            assert!(SharedState::open_workspace_overlay_search_engine_fenced(
+                &db_path,
+                &lease,
+                &super::super::OwnerStop::default()
+            )
+            .is_err());
+            assert!(SharedState::open_search_engine(&db_path).is_err());
+            assert!(!db_path.exists(), "invalid enabled configuration must fail before storage");
+
+            let _model = EnvVarGuard::unset("EMBEDDING_MODEL");
+            assert!(SharedState::embedding_config().unwrap().is_none());
+        }
     }
 
     #[test]

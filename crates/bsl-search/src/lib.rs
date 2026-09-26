@@ -50,8 +50,8 @@ pub use engine::{
     ValidatedWorkspaceRootsTransitionPlan, WorkspaceOverlayDebt, WorkspaceRootsTransitionOutcome,
     WorkspaceRootsTransitionPlan, WorkspaceRootsTransitionSeed, WORKSPACE_APPLY_BATCH_ROWS,
 };
-pub use error::SearchError;
 pub use error::SCHEMA_VERSION_CURRENT;
+pub use error::{EmbeddingFailure, EmbeddingFailureCode, SearchError};
 pub use external_baseline::ensure_the_roots_mean_the_same_elsewhere;
 pub use external_baseline::ExternalBaselineAdapter;
 pub use external_baseline::{

@@ -640,7 +640,7 @@ impl SharedState {
                             );
                             Self::set_overlay_warmup_state(
                                 overlay_warmup,
-                                OverlayWarmupState::Failed(error.to_string()),
+                                OverlayWarmupState::from_search_error(&error),
                             );
                             return super::WorkspaceSearchApply::OperationError(error.to_string());
                         }
@@ -657,7 +657,7 @@ impl SharedState {
                             );
                             Self::set_overlay_warmup_state(
                                 overlay_warmup,
-                                OverlayWarmupState::Failed(error.to_string()),
+                                OverlayWarmupState::from_search_error(&error),
                             );
                             return super::WorkspaceSearchApply::OperationError(error.to_string());
                         }
@@ -742,7 +742,7 @@ impl SharedState {
                 tracing::warn!("workspace overlay semantic warmup failed: {error}");
                 Self::set_overlay_warmup_state(
                     overlay_warmup,
-                    OverlayWarmupState::Failed(error.to_string()),
+                    OverlayWarmupState::from_search_error(&error),
                 );
                 return super::WorkspaceSearchApply::OperationError(error.to_string());
             }
@@ -783,7 +783,7 @@ impl SharedState {
                     Err(error) => {
                         Self::set_overlay_warmup_state(
                             overlay_warmup,
-                            OverlayWarmupState::Failed(error.to_string()),
+                            OverlayWarmupState::from_search_error(&error),
                         );
                         return super::WorkspaceSearchApply::OperationError(error.to_string());
                     }
@@ -883,7 +883,7 @@ impl SharedState {
             Err(error) => {
                 Self::set_overlay_warmup_state(
                     overlay_warmup,
-                    OverlayWarmupState::Failed(error.to_string()),
+                    OverlayWarmupState::from_search_error(&error),
                 );
                 super::WorkspaceSearchApply::OperationError(error.to_string())
             }
@@ -1106,7 +1106,17 @@ impl SharedState {
                 .and_then(|engine| engine.has_semantic().then(|| engine.db_path().to_path_buf()))
         });
         let Some(db_path) = db_path else { return };
-        let Some(config) = Self::embedding_config() else { return };
+        let config = match Self::embedding_config() {
+            Ok(Some(config)) => config,
+            Ok(None) => return,
+            Err(error) => {
+                Self::set_semantic_runtime_status(
+                    semantic_runtime,
+                    SemanticRuntimeStatus::from_search_error(&error),
+                );
+                return;
+            }
+        };
 
         Self::spawn_embed_pass(
             Arc::clone(engine),
@@ -1492,9 +1502,7 @@ impl SharedState {
                             tracing::warn!("background embedding pass failed: {e}");
                             Self::set_semantic_runtime_status(
                                 &runtime,
-                                SemanticRuntimeStatus::Failed(format!(
-                                    "background embedding failed: {e}"
-                                )),
+                                SemanticRuntimeStatus::from_search_error(&e),
                             );
                                 status_guard.finish(LifecycleOutcome::Failed);
                             return;
@@ -1654,6 +1662,7 @@ mod embed_exit_status {
         let terminal = ["SemanticRuntimeStatus::", "Ready"].concat();
         let failed = ["SemanticRuntimeStatus::", "Failed"].concat();
         let stopped = ["SemanticRuntimeStatus::", "Stopped"].concat();
+        let typed_failure = ["SemanticRuntimeStatus::", "from_search_error"].concat();
 
         let exits = production.match_indices(&finish).count();
         assert!(exits > 0, "the pass has no exits at all; the needle must have moved");
@@ -1665,6 +1674,7 @@ mod embed_exit_status {
                 window.contains(&writes)
                     && (window.contains(&terminal)
                         || window.contains(&failed)
+                        || window.contains(&typed_failure)
                         || window.contains(&stopped)),
                 "an exit of the embedding pass silences the guard without saying how it ended, \
                  which leaves the runtime reading `Indexing` for a pass that is over:\n{window}",
@@ -3882,6 +3892,60 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(both, "the rerun loop embedded the chunk created after the pass started");
+    }
+
+    #[test]
+    fn payload_lifecycle_workspace_failure_is_retained_until_an_admitted_retry() {
+        let _lock = env_lock();
+        let (server, calls) = spawn_counting_embedding_server();
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("search.db");
+        seed_pending_embedding(&db_path);
+        let engine = crate::state::shared_engine(Some(
+            SearchEngine::new(&db_path, mock_semantic_config(&server)).unwrap(),
+        ));
+        let runtime = Arc::new(Mutex::new(crate::state::SemanticRuntimeStatus::Ready));
+        let flight = super::EmbedFlight::new();
+        let lease = crate::workspace_lease::WorkspaceLease::unmanaged();
+        let start = |config| {
+            SharedState::spawn_embed_pass(
+                Arc::clone(&engine),
+                crate::state::OwnerStop::default(),
+                Arc::clone(&runtime),
+                bsl_search::IndexProgress::new(),
+                Arc::clone(&flight),
+                lease.clone(),
+                db_path.clone(),
+                config,
+                DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
+            )
+        };
+
+        let mut too_small = mock_semantic_config(&server);
+        too_small.embedder.max_request_bytes = 1;
+        start(too_small);
+        wait_for_embed_flight(&flight);
+        let failure = runtime.lock().unwrap().embedding_failure().expect("typed pass failure");
+        assert_eq!(failure.code, bsl_search::EmbeddingFailureCode::EmbeddingInputTooLarge);
+        assert_eq!(failure.max_request_bytes, Some(1));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(engine.lock().unwrap().as_ref().unwrap().vector_count(), 0);
+
+        assert!(flight.claim());
+        start(mock_semantic_config(&server));
+        assert_eq!(runtime.lock().unwrap().embedding_failure(), Some(failure));
+        flight.release();
+
+        // Block only the final installation, so the admitted retry's reset can be observed
+        // independently of how quickly the loopback request finishes.
+        let guard = engine.lock().unwrap();
+        start(mock_semantic_config(&server));
+        assert_eq!(*runtime.lock().unwrap(), crate::state::SemanticRuntimeStatus::Indexing);
+        drop(guard);
+        wait_for_embed_flight(&flight);
+        assert_eq!(*runtime.lock().unwrap(), crate::state::SemanticRuntimeStatus::Ready);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(engine.lock().unwrap().as_ref().unwrap().vector_count(), 1);
     }
 
     #[test]

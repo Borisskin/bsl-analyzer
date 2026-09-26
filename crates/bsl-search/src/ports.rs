@@ -55,6 +55,18 @@ pub trait EmbeddingGenerator {
 
     fn dimension(&self) -> usize;
 
+    fn batch_ranges(
+        &self,
+        texts: &[&str],
+        max_items: usize,
+    ) -> Result<Vec<std::ops::Range<usize>>, SearchError> {
+        let max_items = max_items.max(1);
+        Ok((0..texts.len())
+            .step_by(max_items)
+            .map(|start| start..start.saturating_add(max_items).min(texts.len()))
+            .collect())
+    }
+
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, SearchError>;
 }
 

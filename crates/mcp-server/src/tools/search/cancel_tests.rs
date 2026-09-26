@@ -48,6 +48,7 @@ fn semantic_engine(dir: &TempDir, base_url: String) -> SharedEngine {
             dim: Some(8),
             api_key: None,
             provider: None,
+            ..Default::default()
         },
         ..SearchConfig::default()
     };
@@ -84,6 +85,7 @@ fn actions() -> Vec<(&'static str, SearchCall)> {
                     engine,
                     cancel,
                     &ready_runtime(),
+                    None,
                     WorkspaceSearchMode::SqliteLocal,
                     None,
                     None,
@@ -98,13 +100,13 @@ fn actions() -> Vec<(&'static str, SearchCall)> {
         (
             "find_docs",
             Box::new(|engine, cancel| {
-                find_docs(engine, cancel, None, None, "Массив", 10, usize::MAX)
+                find_docs(engine, cancel, None, None, None, "Массив", 10, usize::MAX)
             }),
         ),
         (
             "search_docs",
             Box::new(|engine, cancel| {
-                search_docs(engine, cancel, None, None, "Массив", 10, usize::MAX)
+                search_docs(engine, cancel, None, None, None, "Массив", 10, usize::MAX)
             }),
         ),
     ]
@@ -262,7 +264,7 @@ fn a_cancelled_docs_search_does_not_fall_back_to_the_corpus_view() {
         let engine = Arc::clone(&engine);
         let cancel = cancel.clone();
         let service = Arc::clone(&service);
-        move || find_docs(&engine, &cancel, None, Some(service), "Массив", 10, usize::MAX)
+        move || find_docs(&engine, &cancel, None, None, Some(service), "Массив", 10, usize::MAX)
     });
     latch.wait_started(2);
     assert_eq!(latch.executed(), vec!["resolve_snapshot"], "the lexical query is the one latched");
@@ -351,7 +353,7 @@ fn a_search_inside_the_query_embed_holds_no_lock_and_returns_at_its_cancellation
                     )
                     .map(|_| ())
                 } else {
-                    search_docs(&engine, &cancel, None, service, "Массив", 10, usize::MAX)
+                    search_docs(&engine, &cancel, None, None, service, "Массив", 10, usize::MAX)
                         .map(|_| ())
                 }
             }

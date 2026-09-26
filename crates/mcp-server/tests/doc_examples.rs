@@ -9,6 +9,7 @@
 //! that publishes no schema is not validated at all, and the blocks a schema declares as a
 //! bare object are validated only as objects. Both limits are enforced rather than trusted —
 //! a tool that gains a schema drops out of the exemption list by failing here.
+//! `tool=search:error` marks the embedding RPC error, validated separately from tool results.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -16,7 +17,7 @@ use std::path::Path;
 use mcp_server::{serve_stream, McpProfile, McpServer, SharedState, ToolGate};
 use rmcp::service::RunningService;
 use rmcp::{RoleClient, ServiceExt};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tempfile::TempDir;
 
 type Client = RunningService<RoleClient, ()>;
@@ -133,6 +134,27 @@ async fn published_schemas() -> BTreeMap<String, Value> {
     schemas
 }
 
+/// RPC errors have no successful outputSchema; reuse only its closed failure definition.
+fn embedding_error_schema(search_schema: &Value) -> Value {
+    assert!(search_schema["$defs"]["SemanticFailureSchema"].is_object());
+    json!({
+        "$defs": search_schema["$defs"],
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["code", "message", "data"],
+        "properties": {
+            "code": {"const": -32603},
+            "message": {"const": "Semantic embedding failed; use lexical search or retry."},
+            "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["semantic_failure"],
+                "properties": {"semantic_failure": {"$ref": "#/$defs/SemanticFailureSchema"}}
+            }
+        }
+    })
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_documented_example_validates_against_the_schema_its_tool_publishes() {
     let document = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(DOC))
@@ -140,6 +162,8 @@ async fn every_documented_example_validates_against_the_schema_its_tool_publishe
     let examples = examples(&document);
     assert!(!examples.is_empty(), "a gate over no examples is green whatever the examples say");
     let schemas = published_schemas().await;
+    let error_schema = embedding_error_schema(schemas.get("search").expect("search outputSchema"));
+    assert!(examples.iter().any(|example| example.tool == "search:error"));
 
     let mut unchecked = Vec::new();
     for example in &examples {
@@ -158,13 +182,17 @@ async fn every_documented_example_validates_against_the_schema_its_tool_publishe
             unchecked.push(format!("{} (line {})", example.tool, example.line));
             continue;
         }
-        let schema = schemas.get(&example.tool).unwrap_or_else(|| {
-            panic!(
-                "docs/mcp/TOOLS_AND_EXTENSION.md:{}: no tool named `{}` publishes a schema; \
+        let schema = if example.tool == "search:error" {
+            &error_schema
+        } else {
+            schemas.get(&example.tool).unwrap_or_else(|| {
+                panic!(
+                    "docs/mcp/TOOLS_AND_EXTENSION.md:{}: no tool named `{}` publishes a schema; \
                  either the name is wrong or it belongs in WITHOUT_SCHEMA",
-                example.line, example.tool,
-            )
-        });
+                    example.line, example.tool,
+                )
+            })
+        };
         let validator = jsonschema::validator_for(schema).unwrap_or_else(|error| {
             panic!("`{}` publishes an unusable schema: {error}", example.tool)
         });
@@ -176,6 +204,11 @@ async fn every_documented_example_validates_against_the_schema_its_tool_publishe
                 example.tool,
                 serde_json::to_string_pretty(&example.body).unwrap_or_default(),
             );
+        }
+        if example.tool == "search:error" {
+            let mut unsafe_example = example.body.clone();
+            unsafe_example["data"]["semantic_failure"]["provider_body"] = json!("private");
+            assert!(!validator.is_valid(&unsafe_example), "RPC diagnostics must stay closed");
         }
     }
 

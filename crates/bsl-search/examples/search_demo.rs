@@ -45,6 +45,10 @@ fn main() {
 
     let concurrency: usize =
         std::env::var("EMBEDDING_CONCURRENCY").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
+    let max_request_bytes = EmbedderConfig::request_bytes_from_env().unwrap_or_else(|error| {
+        eprintln!("Error: {error}");
+        std::process::exit(1);
+    });
 
     let config = SearchConfig {
         embedder: EmbedderConfig {
@@ -53,6 +57,7 @@ fn main() {
             dim: Some(dim),
             api_key: api_key.clone(),
             provider: std::env::var("EMBEDDING_PROVIDER").ok(),
+            max_request_bytes,
         },
         execution: bsl_search::EmbeddingExecutionPolicy {
             batch_size,
@@ -73,13 +78,7 @@ fn main() {
     println!("Batch size:  {batch_size}");
     println!();
 
-    let embedder = bsl_search::Embedder::new(EmbedderConfig {
-        base_url: config.embedder.base_url.clone(),
-        model: config.embedder.model.clone(),
-        dim: config.embedder.dim,
-        api_key: api_key.clone(),
-        provider: config.embedder.provider.clone(),
-    });
+    let embedder = bsl_search::Embedder::new(config.embedder.clone());
     if let Err(e) = embedder.health_check() {
         eprintln!("Error: embedding service not available: {e}");
         eprintln!();

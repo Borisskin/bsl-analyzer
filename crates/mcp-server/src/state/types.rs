@@ -1,4 +1,4 @@
-use bsl_search::SearchEngine;
+use bsl_search::{EmbeddingFailure, SearchEngine, SearchError};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -57,6 +57,24 @@ pub(crate) enum OverlayWarmupState {
     /// Prime or publish failed. The baseline semantic index still serves; local edits are not
     /// reflected semantically until the next MCP restart retries the warmup.
     Failed(String),
+    /// An embedding failure belongs to this overlay attempt, independently of the main index.
+    EmbeddingFailed(EmbeddingFailure),
+}
+
+impl OverlayWarmupState {
+    pub(crate) fn from_search_error(error: &SearchError) -> Self {
+        match error.embedding_failure() {
+            Some(failure) => Self::EmbeddingFailed(failure),
+            None => Self::Failed(error.to_string()),
+        }
+    }
+
+    pub(crate) fn embedding_failure(&self) -> Option<EmbeddingFailure> {
+        match self {
+            Self::EmbeddingFailed(failure) => Some(*failure),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +97,27 @@ pub(crate) enum SemanticRuntimeStatus {
     /// the MCP contract changes; what differs is that the log and the status line say shutdown
     /// rather than breakage.
     Stopped,
+    EmbeddingFailed(EmbeddingFailure),
+}
+
+impl SemanticRuntimeStatus {
+    pub(crate) fn from_search_error(error: &SearchError) -> Self {
+        match error.embedding_failure() {
+            Some(failure) => Self::EmbeddingFailed(failure),
+            None => Self::Failed(error.to_string()),
+        }
+    }
+
+    pub(crate) fn embedding_failure(&self) -> Option<EmbeddingFailure> {
+        match self {
+            Self::EmbeddingFailed(failure) => Some(*failure),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed(_) | Self::EmbeddingFailed(_))
+    }
 }
 
 /// How the boot must initialize the workspace overlay before the engine is published. The overlay
