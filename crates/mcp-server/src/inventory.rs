@@ -658,6 +658,7 @@ const WAITS: &[(&str, &str, &str, Waiting)] = &[
     ("state/embed.rs", "run_overlay_warmup", "acquire_for_owner(", Waiting::Owner),
     ("state/embed.rs", "run_overlay_warmup", "acquire_for_owner(", Waiting::Owner),
     ("state/embed.rs", "spawn_embed_pass", "acquire_for_owner(", Waiting::Owner),
+    ("state/embed.rs", "spawn_embed_pass", "acquire_for_owner(", Waiting::Owner),
     ("state/mod.rs", "apply_workspace_search", "acquire_for_owner(", Waiting::Owner),
     ("state/mod.rs", "apply_workspace_search_checkpointed", "acquire_for_owner(", Waiting::Owner),
     // `OwnerStop::sleep` itself: the primitive every retry pause is built on.
@@ -783,7 +784,9 @@ fn the_test_only_modules_are_the_ones_the_parent_gates() {
         [
             "diagnostics_state/test_support.rs",
             "graph/test_support.rs",
+            "indexing_runtime_tests.rs",
             "payload_smoke_tests.rs",
+            "state/indexing_tests.rs",
             "state/test_support.rs",
             "tools/search/cancel_tests.rs",
             "tools/search/test_support.rs",

@@ -716,8 +716,6 @@ mod tests {
     use bsl_search::SearchEngine;
     use tempfile::tempdir;
 
-    /// The schedule itself: no delay after a clean pass, exponential growth from one tick,
-    /// a hard cap — apart from the thread, so the shape is provable.
     #[test]
     fn payload_lifecycle_overlay_failure_and_retry_preserve_the_main_owner() {
         let _lock = env_lock();
@@ -778,6 +776,8 @@ mod tests {
         assert_eq!(retry.semantic_runtime.lock().unwrap().embedding_failure(), Some(main_failure));
     }
 
+    /// The schedule itself: no delay after a clean pass, exponential growth from one tick,
+    /// a hard cap — apart from the thread, so the shape is provable.
     #[test]
     fn the_retry_delay_grows_exponentially_to_a_cap() {
         assert_eq!(retry_delay(0), Duration::ZERO);

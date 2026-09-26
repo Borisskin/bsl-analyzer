@@ -23,10 +23,11 @@ use crate::{
     BaselineOverlaySearchService, BaselineRef, CorpusId,
 };
 use code_chunk::Chunker;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
@@ -35,100 +36,8 @@ std::thread_local! {
     static CONSTRUCTOR_APPLY_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[derive(Debug, Default)]
-pub struct IndexProgress {
-    pub active: AtomicBool,
-    /// How many passes are running. A pause reads it rather than a snapshot of `active`: by the
-    /// time the pause ends, the pass it paused may already have gone.
-    passes: AtomicUsize,
-    pub total_files: AtomicUsize,
-    pub total_chunks: AtomicUsize,
-    pub total_batches: AtomicUsize,
-    pub done_batches: AtomicUsize,
-    pub done_chunks: AtomicUsize,
-}
-
-impl IndexProgress {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
-    }
-
-    pub fn reset(&self) {
-        self.active.store(false, Ordering::Relaxed);
-        self.total_files.store(0, Ordering::Relaxed);
-        self.total_chunks.store(0, Ordering::Relaxed);
-        self.total_batches.store(0, Ordering::Relaxed);
-        self.done_batches.store(0, Ordering::Relaxed);
-        self.done_chunks.store(0, Ordering::Relaxed);
-    }
-
-    pub fn percent(&self) -> usize {
-        let total = self.total_chunks.load(Ordering::Relaxed);
-        if total == 0 {
-            return 0;
-        }
-        let done = self.done_chunks.load(Ordering::Relaxed);
-        (done * 100) / total
-    }
-
-    pub fn is_active(&self) -> bool {
-        self.active.load(Ordering::Relaxed)
-    }
-
-    /// Mark a pass running until the returned guard drops.
-    pub fn begin_pass(self: &Arc<Self>) -> ActivePass {
-        self.passes.fetch_add(1, Ordering::Relaxed);
-        self.active.store(true, Ordering::Relaxed);
-        ActivePass(Arc::clone(self))
-    }
-
-    /// Mark a running pass as WAITING until the returned guard drops. For a backoff inside a
-    /// pass: the work has not ended, but nothing is being done, and a process kept alive by
-    /// this flag has no reason to stay up for it.
-    pub fn pause_pass(self: &Arc<Self>) -> PausedPass {
-        self.active.store(false, Ordering::Relaxed);
-        PausedPass(Arc::clone(self))
-    }
-}
-
-/// Lowers [`IndexProgress::active`] for as long as a pass is WAITING rather than working.
-///
-/// A backoff inside a pass can run for half an hour. The claim stays — nobody else may start a
-/// pass — but the flag that keeps a broker backend alive must not, or the pause pins a
-/// multi-gigabyte resident for the whole wait, which is the opposite of what pausing is for.
-/// On drop the flag goes back to what it was, which is how the pass resumes counting as work.
-///
-/// What it must NOT do is store `true`: this guard's only job is to be reversible, and a pause
-/// that outlives the pass it paused would then raise a flag [`ActivePass`] had already lowered
-/// — pinning the multi-gigabyte resident for good, which is the exact failure both guards exist
-/// to prevent. Nothing reaches that ordering today; nothing enforced it either, and it is one
-/// caller away.
-pub struct PausedPass(Arc<IndexProgress>);
-
-impl Drop for PausedPass {
-    fn drop(&mut self) {
-        // Raised again only while a pass is still running. Stored unconditionally — and a
-        // snapshot taken at pause time is unconditional too, just later — this would raise a
-        // flag [`ActivePass`] had already lowered, pinning the multi-gigabyte resident for
-        // good: the exact failure both guards exist to prevent.
-        self.0.active.store(self.0.passes.load(Ordering::Relaxed) > 0, Ordering::Relaxed);
-    }
-}
-
-/// Lowers [`IndexProgress::active`] on every way out of an indexing pass.
-///
-/// The flag outgrew its status line: an MCP broker backend stays alive while it is raised,
-/// so a pass that leaves it up on a fence refusal, a store error or a panic pins a
-/// multi-gigabyte resident process for good. A hand-written `store(false)` covers only the
-/// exits somebody remembered; the guard covers the rest.
-pub struct ActivePass(Arc<IndexProgress>);
-
-impl Drop for ActivePass {
-    fn drop(&mut self) {
-        self.0.passes.fetch_sub(1, Ordering::Relaxed);
-        self.0.active.store(false, Ordering::Relaxed);
-    }
-}
+pub use crate::progress::{ActivePass, IndexProgress};
+use crate::progress::{IndexPassState, IndexPassToken, IndexPhase};
 
 #[derive(Default)]
 pub struct SearchConfig {
@@ -509,12 +418,24 @@ impl WorkspaceRootsTransitionPlan {
     }
 }
 
+/// In-memory proof only; all observations are captured by existing work, never by polling.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SemanticIndexQualification {
+    pub identity_verified: bool,
+    pub coverage_complete: bool,
+    pub pending_work: bool,
+    pub context_pending: bool,
+    pub epoch: u64,
+}
+
 pub struct SearchEngine {
     store: Store,
     embedder: Option<Embedder>,
     index: VectorIndex,
     dim: usize,
     loaded_reference_fingerprint: Option<String>,
+    accepted_native_sidecar: bool,
+    semantic_qualification: Cell<SemanticIndexQualification>,
     batch_size: usize,
     concurrency: usize,
     workspace_roots: Option<WorkspaceRoots>,
@@ -628,7 +549,7 @@ impl SearchEngine {
         let dim = embedder_config.dim.unwrap_or(1024);
         let embedder = Embedder::new(embedder_config);
 
-        let (index, built_generation) =
+        let (index, built_generation, identity_verified) =
             Self::load_or_build_index_unpublished(&store, dim, Some(&embedder))?;
         let loaded_reference_fingerprint = store.reference_collection_fingerprint("platform")?;
         info!(vectors = index.len(), dim, "search index loaded");
@@ -658,12 +579,19 @@ impl SearchEngine {
             FenceOutcome::Released => return Ok(FenceOutcome::Released),
         }
 
+        let context_pending = store.startup_context_pending();
         Ok(FenceOutcome::Applied(Self {
             store,
             embedder: Some(embedder),
             index,
             dim,
             loaded_reference_fingerprint,
+            accepted_native_sidecar: built_generation.is_none(),
+            semantic_qualification: Cell::new(SemanticIndexQualification {
+                identity_verified,
+                context_pending,
+                ..SemanticIndexQualification::default()
+            }),
             batch_size: execution.batch_size(),
             concurrency: execution.concurrency(),
             workspace_roots: None,
@@ -869,14 +797,14 @@ impl SearchEngine {
         store: &Store,
         dim: usize,
         embedder: Option<&Embedder>,
-    ) -> Result<(VectorIndex, Option<i64>), SearchError> {
+    ) -> Result<(VectorIndex, Option<i64>, bool), SearchError> {
         if let Some(key) = Self::persist_key(store, dim, embedder) {
             if let Some(index) = crate::vector_persist::try_load(store, &key) {
                 info!(vectors = index.len(), "loaded persisted vector index");
-                return Ok((index, None));
+                return Ok((index, None, true));
             }
         }
-        let (generation, data) = store.load_all_embeddings_with_generation(dim)?;
+        let (generation, data, stored) = store.load_index_embedding_snapshot(dim)?;
         #[cfg(test)]
         CONSTRUCTOR_APPLY_ACTIVE.with(|active| {
             assert!(!active.get(), "HNSW build ran inside the constructor apply callback")
@@ -886,7 +814,7 @@ impl SearchEngine {
             lifecycle::Record::new(store.db_path(), "artifact_rebuilt", Reason::ExplicitRebuild);
         observed.outcome = Outcome::Completed;
         observed.emit(false);
-        Ok((index, Some(generation)))
+        Ok((index, Some(generation), stored == 0))
     }
 
     /// Build the vector index from SQLite and persist it (best-effort) when persistence applies.
@@ -898,33 +826,7 @@ impl SearchEngine {
         dim: usize,
         embedder: Option<&Embedder>,
     ) -> Result<VectorIndex, SearchError> {
-        let (generation, data) = store.load_all_embeddings_with_generation(dim)?;
-        let index = VectorIndex::build(dim, &data)?;
-        Self::persist_built(store, dim, embedder, &index, generation);
-        let mut observed =
-            lifecycle::Record::new(store.db_path(), "artifact_rebuilt", Reason::ExplicitRebuild);
-        observed.outcome = Outcome::Completed;
-        observed.emit(false);
-        Ok(index)
-    }
-
-    /// Persist a freshly built `index` stamped with the `embedding_generation` of the snapshot it
-    /// was built from. Best-effort and gated: only a model-backed, file-backed engine with a
-    /// non-empty index writes a sidecar; in-memory/FTS-only/overlay engines and the pre-embedding
-    /// empty state are skipped.
-    fn persist_built(
-        store: &Store,
-        dim: usize,
-        embedder: Option<&Embedder>,
-        index: &VectorIndex,
-        generation: i64,
-    ) {
-        if let Some(mut prepared) = Self::prepare_built(store, dim, embedder, index, generation) {
-            if let Err(error) = Self::install_prepared_built(store, &mut prepared) {
-                warn!("failed to publish vector index: {error}");
-            }
-            prepared.finish();
-        }
+        Self::build_persisted_index_with_progress(store, dim, embedder, None)
     }
 
     fn prepare_built(
@@ -934,6 +836,17 @@ impl SearchEngine {
         index: &VectorIndex,
         generation: i64,
     ) -> Option<crate::vector_persist::PreparedPersist> {
+        Self::prepare_built_with_progress(store, dim, embedder, index, generation, None)
+    }
+
+    fn prepare_built_with_progress(
+        store: &Store,
+        dim: usize,
+        embedder: Option<&Embedder>,
+        index: &VectorIndex,
+        generation: i64,
+        progress: Option<&IndexPassToken>,
+    ) -> Option<crate::vector_persist::PreparedPersist> {
         if index.is_empty() {
             return None;
         }
@@ -941,6 +854,9 @@ impl SearchEngine {
         match crate::vector_persist::prepare(index, &key, generation) {
             Ok(prepared) => Some(prepared),
             Err(error) => {
+                if let Some(token) = progress {
+                    token.finish(IndexPassState::Failed);
+                }
                 let mut record = lifecycle::Record::new(
                     store.db_path(),
                     "artifact_prepare",
@@ -954,9 +870,48 @@ impl SearchEngine {
         }
     }
 
+    fn build_persisted_index_with_progress(
+        store: &Store,
+        dim: usize,
+        embedder: Option<&Embedder>,
+        progress: Option<&IndexPassToken>,
+    ) -> Result<VectorIndex, SearchError> {
+        if let Some(token) = progress {
+            token.phase(IndexPhase::Persisting);
+        }
+        let (generation, data) = store.load_all_embeddings_with_generation(dim)?;
+        let index = VectorIndex::build(dim, &data)?;
+        if let Some(mut prepared) =
+            Self::prepare_built_with_progress(store, dim, embedder, &index, generation, progress)
+        {
+            if let Err(error) =
+                Self::install_prepared_built_with_progress(store, &mut prepared, progress)
+            {
+                if let Some(token) = progress {
+                    token.finish(IndexPassState::Failed);
+                }
+                warn!("failed to publish vector index: {error}");
+            }
+            prepared.finish();
+        }
+        let mut observed =
+            lifecycle::Record::new(store.db_path(), "artifact_rebuilt", Reason::ExplicitRebuild);
+        observed.outcome = Outcome::Completed;
+        observed.emit(false);
+        Ok(index)
+    }
+
     fn install_prepared_built(
         store: &Store,
         prepared: &mut crate::vector_persist::PreparedPersist,
+    ) -> Result<(), SearchError> {
+        Self::install_prepared_built_with_progress(store, prepared, None)
+    }
+
+    fn install_prepared_built_with_progress(
+        store: &Store,
+        prepared: &mut crate::vector_persist::PreparedPersist,
+        progress: Option<&IndexPassToken>,
     ) -> Result<(), SearchError> {
         let generation = store.embedding_generation().inspect_err(|_| {
             let mut record =
@@ -976,6 +931,9 @@ impl SearchEngine {
             ));
         }
         if let Err(error) = prepared.install() {
+            if let Some(token) = progress {
+                token.finish(IndexPassState::Failed);
+            }
             warn!("failed to persist vector index: {error}");
         }
         Ok(())
@@ -1041,6 +999,8 @@ impl SearchEngine {
             index,
             dim,
             loaded_reference_fingerprint,
+            accepted_native_sidecar: false,
+            semantic_qualification: Cell::new(SemanticIndexQualification::default()),
             batch_size: EmbeddingExecutionPolicy::default().batch_size(),
             concurrency: EmbeddingExecutionPolicy::default().concurrency(),
             workspace_roots: None,
@@ -1108,6 +1068,8 @@ impl SearchEngine {
             index,
             dim,
             loaded_reference_fingerprint,
+            accepted_native_sidecar: false,
+            semantic_qualification: Cell::new(SemanticIndexQualification::default()),
             batch_size: execution.batch_size(),
             concurrency: execution.concurrency(),
             workspace_roots: None,
@@ -1216,6 +1178,9 @@ impl SearchEngine {
         root: &Path,
         progress: Option<&Arc<IndexProgress>>,
     ) -> Result<usize, SearchError> {
+        let mut pass = progress.map(IndexProgress::begin_pass);
+        let token = pass.as_ref().map(ActivePass::token);
+        let progress = token.as_ref();
         let lifecycle_batch = Batch::new(self.store.db_path(), Reason::ExplicitRebuild);
         let lifecycle_result = lifecycle_batch.context().in_scope(|| {
         let bsl_files = self.boot_ingest_files(root);
@@ -1237,6 +1202,7 @@ impl SearchEngine {
                 Err(e) => {
                     lifecycle::decision(self.store.db_path(), key, Reason::ReadError, None, None);
                     warn!(?file_path, "failed to read file: {e}");
+                    if let Some(p) = progress { p.finish(IndexPassState::Failed); }
                     continue;
                 }
             };
@@ -1280,15 +1246,12 @@ impl SearchEngine {
             return Ok(0);
         }
 
+        let dim = self.dim;
         let total_batches: usize = tasks.iter().map(|t| t.ranges.len()).sum();
 
-        let _pass = progress.map(IndexProgress::begin_pass);
+
         if let Some(p) = &progress {
-            p.total_files.store(tasks.len(), Ordering::Relaxed);
-            p.total_chunks.store(total_chunks, Ordering::Relaxed);
-            p.total_batches.store(total_batches, Ordering::Relaxed);
-            p.done_batches.store(0, Ordering::Relaxed);
-            p.done_chunks.store(0, Ordering::Relaxed);
+            p.set_totals(tasks.len(), total_chunks, total_batches);
         }
 
         let concurrency = self.concurrency.min(tasks.len());
@@ -1321,10 +1284,10 @@ impl SearchEngine {
                             let refs: Vec<&str> = batch.iter().map(|s| s.as_str()).collect();
                             match emb.embed_batch(&refs) {
                                 Ok(embs) => {
+                                    Self::observe_embedding_dimensions(&embs, dim, prog.as_ref());
                                     embeddings.extend(embs);
                                     if let Some(p) = &prog {
-                                        p.done_chunks.fetch_add(batch.len(), Ordering::Relaxed);
-                                        p.done_batches.fetch_add(1, Ordering::Relaxed);
+                                        p.advance(batch.len(), 1);
                                     }
                                 }
                                 Err(e) => {
@@ -1397,11 +1360,13 @@ impl SearchEngine {
         }
 
         if let Some(p) = &progress {
-            p.active.store(false, Ordering::Relaxed);
+            p.phase(IndexPhase::Persisting);
         }
 
-        if let Some(error) = first_error { return Err(error); }
-        self.index = Self::build_persisted_index(&self.store, self.dim, self.embedder.as_ref())?;
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        self.index = Self::build_persisted_index_with_progress(&self.store, self.dim, self.embedder.as_ref(), progress)?;
         self.observe_live_index("live_index_replaced", Reason::ExplicitRebuild, Outcome::Completed);
 
         info!(indexed, total_vectors = self.index.len(), "indexing complete");
@@ -1410,6 +1375,13 @@ impl SearchEngine {
         let lifecycle_outcome =
             if lifecycle_result.is_ok() { Outcome::Completed } else { Outcome::Failed };
         lifecycle_batch.finish(lifecycle_outcome);
+        if let Some(pass) = pass.as_mut() {
+            pass.finish(if lifecycle_result.is_ok() {
+                IndexPassState::Ready
+            } else {
+                IndexPassState::Failed
+            });
+        }
         lifecycle_result
     }
 
@@ -1447,6 +1419,7 @@ impl SearchEngine {
         graph_contexts: &[Option<String>],
         checkpoint: &mut dyn FnMut() -> ControlFlow<()>,
     ) -> ControlFlow<(), Result<(), SearchError>> {
+        self.invalidate_semantic_coverage();
         match self.store.reindex_file_with_context_checkpointed(
             key,
             hash,
@@ -1514,6 +1487,41 @@ impl SearchEngine {
         progress: Option<&Arc<IndexProgress>>,
         should_continue: Option<&(dyn Fn() -> bool + Sync)>,
         apply: F,
+        retry_transient: R,
+    ) -> Result<FenceOutcome<VectorIndex>, SearchError>
+    where
+        F: FnMut(
+            &mut dyn FnMut() -> Result<(), SearchError>,
+        ) -> FenceOutcome<Result<(), SearchError>>,
+        R: FnMut() -> bool,
+    {
+        let mut pass = progress.map(IndexProgress::begin_pass);
+        let token = pass.as_ref().map(ActivePass::token);
+        let result = Self::embed_pending_chunks_fenced_retrying_owned(
+            db_path,
+            config,
+            token.as_ref(),
+            should_continue,
+            apply,
+            retry_transient,
+        );
+        if let Some(pass) = pass.as_mut() {
+            pass.finish(match &result {
+                Ok(FenceOutcome::Applied(_)) => IndexPassState::Ready,
+                Ok(FenceOutcome::Superseded) => IndexPassState::Superseded,
+                Ok(FenceOutcome::Released) => IndexPassState::Cancelled,
+                _ => IndexPassState::Failed,
+            });
+        }
+        result
+    }
+
+    pub fn embed_pending_chunks_fenced_retrying_owned<F, R>(
+        db_path: &Path,
+        config: &SearchConfig,
+        progress: Option<&IndexPassToken>,
+        should_continue: Option<&(dyn Fn() -> bool + Sync)>,
+        mut apply: F,
         mut retry_transient: R,
     ) -> Result<FenceOutcome<VectorIndex>, SearchError>
     where
@@ -1523,12 +1531,15 @@ impl SearchEngine {
         R: FnMut() -> bool,
     {
         let store = Store::open_existing(db_path)?;
-        let (index, completed) = Self::embed_pending_chunks_with_fence(
+        let (index, completed) = Self::run_embedding_pass_owned(
             &store,
-            config,
+            &Embedder::new(config.embedder.clone()),
+            config.embedder.dim.unwrap_or(1024),
+            config.execution.batch_size(),
+            config.execution.concurrency(),
             progress,
             should_continue,
-            apply,
+            &mut apply,
             Some(&mut retry_transient),
         )?;
         Ok(match completed {
@@ -1592,7 +1603,7 @@ impl SearchEngine {
         dim: usize,
         ranges: &[std::ops::Range<usize>],
         items: &[(i64, String)],
-        progress: Option<&Arc<IndexProgress>>,
+        progress: Option<&IndexPassToken>,
         should_continue: Option<&(dyn Fn() -> bool + Sync)>,
         apply: &mut impl FnMut(
             &mut dyn FnMut() -> Result<(), SearchError>,
@@ -1632,9 +1643,9 @@ impl SearchEngine {
                 }
             };
             if let Some(progress) = progress {
-                progress.done_chunks.fetch_add(batch.len(), Ordering::Relaxed);
-                progress.done_batches.fetch_add(1, Ordering::Relaxed);
+                progress.advance(batch.len(), 1);
             }
+            Self::observe_embedding_dimensions(&embeddings, dim, progress);
             let pairs: Vec<_> = batch.iter().map(|(id, _)| *id).zip(embeddings).collect();
             match Self::fenced_value_retrying(
                 apply,
@@ -1658,7 +1669,7 @@ impl SearchEngine {
         }
 
         if let Some(progress) = progress {
-            progress.active.store(false, Ordering::Relaxed);
+            progress.phase(IndexPhase::Persisting);
         }
         let (generation, data) = store.load_all_embeddings_with_generation(dim)?;
         let index = VectorIndex::build(dim, &data)?;
@@ -1673,12 +1684,17 @@ impl SearchEngine {
                 Ok((index, outcome))
             };
         }
-        let persisted = if let Some(mut prepared) =
-            Self::prepare_built(store, dim, Some(embedder), &index, generation)
-        {
+        let persisted = if let Some(mut prepared) = Self::prepare_built_with_progress(
+            store,
+            dim,
+            Some(embedder),
+            &index,
+            generation,
+            progress,
+        ) {
             let outcome = Self::fenced_value_retrying(
                 apply,
-                || Self::install_prepared_built(store, &mut prepared),
+                || Self::install_prepared_built_with_progress(store, &mut prepared, progress),
                 retry_transient,
             )?;
             if matches!(outcome, FenceOutcome::Applied(())) {
@@ -1713,6 +1729,44 @@ impl SearchEngine {
         apply: &mut impl FnMut(
             &mut dyn FnMut() -> Result<(), SearchError>,
         ) -> FenceOutcome<Result<(), SearchError>>,
+        retry_transient: Option<&mut dyn FnMut() -> bool>,
+    ) -> Result<(VectorIndex, FenceOutcome<()>), SearchError> {
+        let mut pass = progress.map(IndexProgress::begin_pass);
+        let token = pass.as_ref().map(ActivePass::token);
+        let result = Self::run_embedding_pass_owned(
+            store,
+            embedder,
+            dim,
+            batch_size,
+            concurrency,
+            token.as_ref(),
+            should_continue,
+            apply,
+            retry_transient,
+        );
+        if let Some(pass) = pass.as_mut() {
+            pass.finish(match &result {
+                Ok((_, FenceOutcome::Applied(()))) => IndexPassState::Ready,
+                Ok((_, FenceOutcome::Superseded)) => IndexPassState::Superseded,
+                Ok((_, FenceOutcome::Released)) => IndexPassState::Cancelled,
+                _ => IndexPassState::Failed,
+            });
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_embedding_pass_owned(
+        store: &Store,
+        embedder: &Embedder,
+        dim: usize,
+        batch_size: usize,
+        concurrency: usize,
+        progress: Option<&IndexPassToken>,
+        should_continue: Option<&(dyn Fn() -> bool + Sync)>,
+        apply: &mut impl FnMut(
+            &mut dyn FnMut() -> Result<(), SearchError>,
+        ) -> FenceOutcome<Result<(), SearchError>>,
         mut retry_transient: Option<&mut dyn FnMut() -> bool>,
     ) -> Result<(VectorIndex, FenceOutcome<()>), SearchError> {
         let lifecycle_batch = Batch::new(store.db_path(), Reason::Embedding);
@@ -1722,6 +1776,9 @@ impl SearchEngine {
             let pending = store.load_pending_embedding_documents("code")?;
             lifecycle_batch.pending(pending.len() as u64);
             if pending.is_empty() {
+                if let Some(p) = progress {
+                    p.phase(IndexPhase::Persisting);
+                }
                 embedding_skipped = true;
                 let (generation, data) = store.load_all_embeddings_with_generation(dim)?;
                 let index = VectorIndex::build(dim, &data)?;
@@ -1730,10 +1787,17 @@ impl SearchEngine {
                 if should_continue.is_some_and(|keep_going| !keep_going()) {
                     return Ok((index, FenceOutcome::Released));
                 }
-                let persisted = if let Some(mut prepared) =
-                    Self::prepare_built(store, dim, Some(embedder), &index, generation)
-                {
-                    let mut persist = || Self::install_prepared_built(store, &mut prepared);
+                let persisted = if let Some(mut prepared) = Self::prepare_built_with_progress(
+                    store,
+                    dim,
+                    Some(embedder),
+                    &index,
+                    generation,
+                    progress,
+                ) {
+                    let mut persist = || {
+                        Self::install_prepared_built_with_progress(store, &mut prepared, progress)
+                    };
                     let outcome = match retry_transient.as_deref_mut() {
                         Some(retry) => Self::fenced_value_retrying(apply, &mut persist, retry)?,
                         None => Self::fenced_value(apply, persist)?,
@@ -1757,13 +1821,9 @@ impl SearchEngine {
             let texts: Vec<&str> = items.iter().map(|(_, text)| text.as_str()).collect();
             let ranges = embedder.batch_ranges(&texts, batch_size)?;
             let total_batches = ranges.len();
-            let _pass = progress.map(IndexProgress::begin_pass);
+
             if let Some(p) = &progress {
-                p.total_files.store(0, Ordering::Relaxed);
-                p.total_chunks.store(total, Ordering::Relaxed);
-                p.total_batches.store(total_batches, Ordering::Relaxed);
-                p.done_batches.store(0, Ordering::Relaxed);
-                p.done_chunks.store(0, Ordering::Relaxed);
+                p.set_totals(0, total, total_batches);
             }
 
             let concurrency = concurrency.min(total_batches.max(1));
@@ -1807,9 +1867,13 @@ impl SearchEngine {
                                     batch.iter().map(|(_, t)| t.as_str()).collect();
                                 let out = match emb.embed_batch(&refs) {
                                     Ok(embs) => {
+                                        Self::observe_embedding_dimensions(
+                                            &embs,
+                                            dim,
+                                            prog.as_ref(),
+                                        );
                                         if let Some(p) = &prog {
-                                            p.done_chunks.fetch_add(batch.len(), Ordering::Relaxed);
-                                            p.done_batches.fetch_add(1, Ordering::Relaxed);
+                                            p.advance(batch.len(), 1);
                                         }
                                         Ok(batch.iter().map(|(id, _)| *id).zip(embs).collect())
                                     }
@@ -1903,7 +1967,7 @@ impl SearchEngine {
                 }
             }
             if let Some(p) = &progress {
-                p.active.store(false, Ordering::Relaxed);
+                p.phase(IndexPhase::Persisting);
             }
 
             let (generation, data) = store.load_all_embeddings_with_generation(dim)?;
@@ -1932,11 +1996,16 @@ impl SearchEngine {
                     Ok((index, outcome))
                 };
             }
-            let persisted = if let Some(mut prepared) =
-                Self::prepare_built(store, dim, Some(embedder), &index, generation)
-            {
+            let persisted = if let Some(mut prepared) = Self::prepare_built_with_progress(
+                store,
+                dim,
+                Some(embedder),
+                &index,
+                generation,
+                progress,
+            ) {
                 let outcome = Self::fenced_value(apply, || {
-                    Self::install_prepared_built(store, &mut prepared)
+                    Self::install_prepared_built_with_progress(store, &mut prepared, progress)
                 })?;
                 if matches!(outcome, FenceOutcome::Applied(())) {
                     prepared.finish();
@@ -1964,6 +2033,15 @@ impl SearchEngine {
             Ok((_, FenceOutcome::Superseded | FenceOutcome::Released)) => Outcome::Interrupted,
             Err(_) => Outcome::Failed,
         };
+        if let Some(token) = progress {
+            match &lifecycle_result {
+                Ok((_, FenceOutcome::Applied(()))) => token.phase(IndexPhase::Persisting),
+                Ok((_, FenceOutcome::Superseded)) => token.finish(IndexPassState::Superseded),
+                Ok((_, FenceOutcome::Released)) => token.finish(IndexPassState::Cancelled),
+                Ok((_, FenceOutcome::TransientRefusal)) => token.phase(IndexPhase::Persisting),
+                _ => token.finish(IndexPassState::Failed),
+            }
+        }
         lifecycle_batch.finish(lifecycle_outcome);
         lifecycle_result
     }
@@ -2149,6 +2227,9 @@ impl SearchEngine {
         prepared: &PreparedBootFile,
         checkpoint: &mut dyn FnMut() -> ControlFlow<()>,
     ) -> ControlFlow<(), Result<(), SearchError>> {
+        if matches!(&prepared, PreparedBootFile::Reindex { .. }) {
+            self.invalidate_semantic_coverage();
+        }
         match prepared {
             PreparedBootFile::Remove(key, reason) => {
                 if checkpoint().is_break() {
@@ -2469,6 +2550,9 @@ impl SearchEngine {
         documents: &[Document],
         progress: Option<&Arc<IndexProgress>>,
     ) -> Result<usize, SearchError> {
+        let mut pass = progress.map(IndexProgress::begin_pass);
+        let token = pass.as_ref().map(ActivePass::token);
+        let progress = token.as_ref();
         let lifecycle_batch = Batch::new(self.store.db_path(), Reason::ExplicitRebuild);
         let lifecycle_result = lifecycle_batch.context().in_scope(|| {
             self.invalidate_reference_stamp(collection)?;
@@ -2494,8 +2578,12 @@ impl SearchEngine {
                 )
             })?;
             if embeddings.is_some() {
-                self.index =
-                    Self::build_persisted_index(&self.store, self.dim, self.embedder.as_ref())?;
+                self.index = Self::build_persisted_index_with_progress(
+                    &self.store,
+                    self.dim,
+                    self.embedder.as_ref(),
+                    progress,
+                )?;
                 self.observe_live_index(
                     "live_index_replaced",
                     Reason::ExplicitRebuild,
@@ -2510,6 +2598,13 @@ impl SearchEngine {
         let lifecycle_outcome =
             if lifecycle_result.is_ok() { Outcome::Completed } else { Outcome::Failed };
         lifecycle_batch.finish(lifecycle_outcome);
+        if let Some(pass) = pass.as_mut() {
+            pass.finish(if lifecycle_result.is_ok() {
+                IndexPassState::Ready
+            } else {
+                IndexPassState::Failed
+            });
+        }
         lifecycle_result
     }
 
@@ -2550,93 +2645,130 @@ impl SearchEngine {
         documents: &[Document],
         progress: Option<&Arc<IndexProgress>>,
     ) -> Result<ReferenceCollectionReplaceOutcome, SearchError> {
-        let stamp =
-            Self::reference_stamp(fingerprint, self.embedding_model(), self.embedding_dimension());
-        let committed = self.store.reference_collection_fingerprint(collection)?;
-        if committed.as_deref() == Some(stamp.as_str()) {
-            if self.loaded_reference_fingerprint != committed && self.embedder.is_some() {
-                self.index =
-                    Self::build_persisted_index(&self.store, self.dim, self.embedder.as_ref())?;
+        let mut pass = progress.map(IndexProgress::begin_pass);
+        let token = pass.as_ref().map(ActivePass::token);
+        let progress = token.as_ref();
+        let result = (|| {
+            let stamp = Self::reference_stamp(
+                fingerprint,
+                self.embedding_model(),
+                self.embedding_dimension(),
+            );
+            let committed = self.store.reference_collection_fingerprint(collection)?;
+            if committed.as_deref() == Some(stamp.as_str()) {
+                if self.loaded_reference_fingerprint != committed && self.embedder.is_some() {
+                    self.index = Self::build_persisted_index_with_progress(
+                        &self.store,
+                        self.dim,
+                        self.embedder.as_ref(),
+                        progress,
+                    )?;
+                    self.observe_live_index(
+                        "live_index_replaced",
+                        Reason::ExplicitRebuild,
+                        Outcome::Completed,
+                    );
+                }
+                self.loaded_reference_fingerprint = committed;
+                return Ok(ReferenceCollectionReplaceOutcome {
+                    committed_fingerprint: stamp,
+                    written: false,
+                    embedding_failure: None,
+                });
+            }
+            // A corpus that could not be vectorised is still worth publishing lexically: refusing
+            // to publish it costs the caller find_docs entirely, and the stamp above records that
+            // the published corpus has no vectors — so a later boot with a reachable embedder sees
+            // a stale stamp and embeds it then. Without that stamp this degradation would be
+            // permanent, which is why it is safe only now.
+            let (embeddings, embedding_failure) = match self.embed_documents(documents, progress) {
+                Ok(embeddings) => (embeddings, None),
+                Err(error) => {
+                    warn!(%error, collection, "reference corpus embedding failed, publishing lexical-only");
+                    if let Some(token) = progress {
+                        token.finish(IndexPassState::Failed);
+                    }
+                    (
+                        None,
+                        Some(error.embedding_failure().unwrap_or_else(|| {
+                            crate::EmbeddingFailure::new(
+                                crate::EmbeddingFailureCode::EmbeddingFailed,
+                            )
+                        })),
+                    )
+                }
+            };
+            let stamp = if embeddings.is_some() {
+                stamp
+            } else {
+                Self::reference_stamp(fingerprint, None, None)
+            };
+            let outcome = self.store.replace_reference_collection_if_stale(
+                collection,
+                virtual_path,
+                &stamp,
+                documents,
+                embeddings.as_deref(),
+            )?;
+            if self.loaded_reference_fingerprint.as_deref()
+                != Some(outcome.committed_fingerprint.as_str())
+                && self.embedder.is_some()
+            {
+                self.index = Self::build_persisted_index_with_progress(
+                    &self.store,
+                    self.dim,
+                    self.embedder.as_ref(),
+                    progress,
+                )?;
                 self.observe_live_index(
                     "live_index_replaced",
                     Reason::ExplicitRebuild,
                     Outcome::Completed,
                 );
             }
-            self.loaded_reference_fingerprint = committed;
-            return Ok(ReferenceCollectionReplaceOutcome {
-                committed_fingerprint: stamp,
-                written: false,
-                embedding_failure: None,
+            self.loaded_reference_fingerprint = Some(outcome.committed_fingerprint.clone());
+            Ok(ReferenceCollectionReplaceOutcome {
+                committed_fingerprint: outcome.committed_fingerprint,
+                written: outcome.written,
+                embedding_failure,
+            })
+        })();
+        if let Some(pass) = pass.as_mut() {
+            pass.finish(if result.is_ok() {
+                IndexPassState::Ready
+            } else {
+                IndexPassState::Failed
             });
         }
-        // A corpus that could not be vectorised is still worth publishing lexically: refusing
-        // to publish it costs the caller find_docs entirely, and the stamp above records that
-        // the published corpus has no vectors — so a later boot with a reachable embedder sees
-        // a stale stamp and embeds it then. Without that stamp this degradation would be
-        // permanent, which is why it is safe only now.
-        let (embeddings, embedding_failure) = match self.embed_documents(documents, progress) {
-            Ok(embeddings) => (embeddings, None),
-            Err(error) => {
-                warn!(%error, collection, "reference corpus embedding failed, publishing lexical-only");
-                (
-                    None,
-                    Some(error.embedding_failure().unwrap_or_else(|| {
-                        crate::EmbeddingFailure::new(crate::EmbeddingFailureCode::EmbeddingFailed)
-                    })),
-                )
+        result
+    }
+
+    fn observe_embedding_dimensions(
+        vectors: &[Vec<f32>],
+        dim: usize,
+        progress: Option<&IndexPassToken>,
+    ) {
+        if vectors.iter().any(|vector| vector.len() != dim) {
+            if let Some(token) = progress {
+                token.finish(IndexPassState::Failed);
             }
-        };
-        let stamp = if embeddings.is_some() {
-            stamp
-        } else {
-            Self::reference_stamp(fingerprint, None, None)
-        };
-        let outcome = self.store.replace_reference_collection_if_stale(
-            collection,
-            virtual_path,
-            &stamp,
-            documents,
-            embeddings.as_deref(),
-        )?;
-        if self.loaded_reference_fingerprint.as_deref()
-            != Some(outcome.committed_fingerprint.as_str())
-            && self.embedder.is_some()
-        {
-            self.index =
-                Self::build_persisted_index(&self.store, self.dim, self.embedder.as_ref())?;
-            self.observe_live_index(
-                "live_index_replaced",
-                Reason::ExplicitRebuild,
-                Outcome::Completed,
-            );
         }
-        self.loaded_reference_fingerprint = Some(outcome.committed_fingerprint.clone());
-        Ok(ReferenceCollectionReplaceOutcome {
-            committed_fingerprint: outcome.committed_fingerprint,
-            written: outcome.written,
-            embedding_failure,
-        })
     }
 
     fn embed_documents(
         &self,
         documents: &[Document],
-        progress: Option<&Arc<IndexProgress>>,
+        progress: Option<&IndexPassToken>,
     ) -> Result<Option<Vec<Vec<f32>>>, SearchError> {
         let Some(embedder) = &self.embedder else { return Ok(None) };
         let texts: Vec<String> = documents.iter().map(|d| d.body.clone()).collect();
+        let dim = self.dim;
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         let ranges = embedder.batch_ranges(&refs, self.batch_size)?;
         let total_batches = ranges.len();
 
-        let _pass = progress.map(IndexProgress::begin_pass);
         if let Some(p) = progress {
-            p.total_files.store(1, Ordering::Relaxed);
-            p.total_chunks.store(texts.len(), Ordering::Relaxed);
-            p.total_batches.store(total_batches, Ordering::Relaxed);
-            p.done_batches.store(0, Ordering::Relaxed);
-            p.done_chunks.store(0, Ordering::Relaxed);
+            p.set_totals(1, texts.len(), total_batches);
         }
 
         let concurrency = self.concurrency.min(total_batches.max(1));
@@ -2659,9 +2791,11 @@ impl SearchEngine {
                     while let Ok((idx, batch)) = rx.recv() {
                         let refs: Vec<&str> = batch.iter().map(|s| s.as_str()).collect();
                         let result = emb.embed_batch(&refs);
+                        if let Ok(vectors) = &result {
+                            Self::observe_embedding_dimensions(vectors, dim, prog.as_ref());
+                        }
                         if let (Ok(_), Some(p)) = (&result, &prog) {
-                            p.done_chunks.fetch_add(batch.len(), Ordering::Relaxed);
-                            p.done_batches.fetch_add(1, Ordering::Relaxed);
+                            p.advance(batch.len(), 1);
                         }
                         if tx.send((idx, result)).is_err() {
                             break;
@@ -2714,7 +2848,7 @@ impl SearchEngine {
         }
 
         if let Some(p) = progress {
-            p.active.store(false, Ordering::Relaxed);
+            p.phase(IndexPhase::Persisting);
         }
 
         if let Some(error) = failure {
@@ -3110,6 +3244,14 @@ impl SearchEngine {
             &staging.unread_present,
             staging.overlay_files,
         );
+        let prior_coverage = self.semantic_qualification.get().coverage_complete;
+        self.invalidate_semantic_coverage();
+        if !staging.pending_collection_embeddings && prior_coverage {
+            let mut evidence = self.semantic_qualification.get();
+            evidence.coverage_complete = true;
+            evidence.pending_work = false;
+            self.semantic_qualification.set(evidence);
+        }
         self.index = staging.next_index;
         self.observe_live_index("live_index_replaced", Reason::RootTransition, Outcome::Completed);
         self.workspace_roots = Some(plan.next_roots.clone());
@@ -3209,12 +3351,16 @@ impl SearchEngine {
         let WorkspaceDriftStoreOutcome { removed_chunk_ids, context_mark_seq } = outcome;
         if let Some(seq) = context_mark_seq {
             self.store.observe_committed_mark_seq(seq);
+            let mut evidence = self.semantic_qualification.get();
+            evidence.context_pending = true;
+            self.semantic_qualification.set(evidence);
         }
         let mut eviction_outcome = Outcome::Completed;
         let evicted_any = !removed_chunk_ids.is_empty();
         for chunk_id in removed_chunk_ids {
             if let Err(error) = self.index.remove(chunk_id) {
                 eviction_outcome = Outcome::Failed;
+                self.invalidate_semantic_coverage();
                 tracing::warn!(chunk_id, "failed to evict a committed drift removal: {error}");
             }
         }
@@ -3376,6 +3522,9 @@ impl SearchEngine {
 
     pub fn mark_workspace_key_context_dirty(&self, key: &FileKey) -> Result<(), SearchError> {
         self.store.mark_context_dirty("code", &key.root_id, &key.path)?;
+        let mut evidence = self.semantic_qualification.get();
+        evidence.context_pending = true;
+        self.semantic_qualification.set(evidence);
         Ok(())
     }
 
@@ -3383,7 +3532,13 @@ impl SearchEngine {
     /// changed: conservatively assume any module's context could shift). Returns the
     /// number of files marked.
     pub fn mark_workspace_context_dirty(&self) -> Result<usize, SearchError> {
-        Ok(self.store.mark_collection_context_dirty("code")?.0)
+        let count = self.store.mark_collection_context_dirty("code")?.0;
+        if count > 0 {
+            let mut evidence = self.semantic_qualification.get();
+            evidence.context_pending = true;
+            self.semantic_qualification.set(evidence);
+        }
+        Ok(count)
     }
 
     /// [`Self::mark_workspace_context_dirty`] for a caller that consumes the batch in the same
@@ -3392,7 +3547,13 @@ impl SearchEngine {
     /// fresher drift keeps its own mark instead of being swept up by it. Returns the number of
     /// rows written.
     pub fn mark_workspace_context_dirty_at(&self, stamp_seq: i64) -> Result<usize, SearchError> {
-        self.store.mark_collection_context_dirty_at("code", stamp_seq)
+        let count = self.store.mark_collection_context_dirty_at("code", stamp_seq)?;
+        if count > 0 {
+            let mut evidence = self.semantic_qualification.get();
+            evidence.context_pending = true;
+            self.semantic_qualification.set(evidence);
+        }
+        Ok(count)
     }
 
     /// The set of paths currently marked context-dirty in `collection`.
@@ -3834,6 +3995,11 @@ impl SearchEngine {
         let lifecycle_batch = Batch::new(self.store.db_path(), Reason::ContextChanged);
         let lifecycle_result = lifecycle_batch.context().in_scope(|| {
             let bounded = self.store.context_dirty_paths_bounded("code", seq_bound)?;
+            if topology_changed || !bounded.is_empty() {
+                let mut evidence = self.semantic_qualification.get();
+                evidence.context_pending = true;
+                self.semantic_qualification.set(evidence);
+            }
             let mut keys = bounded.clone();
             if topology_changed {
                 let all_dirty = self.store.context_dirty_paths("code")?;
@@ -3847,6 +4013,7 @@ impl SearchEngine {
             keys.sort();
 
             let mut mutations = Vec::new();
+            let mut retained_context = false;
             if topology_changed {
                 mutations.extend(
                     keys.iter()
@@ -3899,6 +4066,7 @@ impl SearchEngine {
                     None,
                 );
                 if render_failed {
+                    retained_context = true;
                     continue;
                 }
                 mutations.extend(updates);
@@ -3914,6 +4082,9 @@ impl SearchEngine {
                 })?;
                 match outcome {
                     FenceOutcome::Applied((marked, updated, cleared)) => {
+                        if updated > 0 {
+                            self.invalidate_semantic_coverage();
+                        }
                         stats.paths_marked += marked;
                         stats.paths_cleared += cleared;
                         stats.chunks_updated += updated;
@@ -3926,6 +4097,10 @@ impl SearchEngine {
                     FenceOutcome::Released => return Ok((stats, FenceOutcome::Released)),
                 }
             }
+            let mut evidence = self.semantic_qualification.get();
+            evidence.context_pending =
+                retained_context || self.store.mark_seq_handle().load(Ordering::SeqCst) > seq_bound;
+            self.semantic_qualification.set(evidence);
             Ok((stats, FenceOutcome::Applied(())))
         });
         let lifecycle_outcome = match &lifecycle_result {
@@ -3977,6 +4152,9 @@ impl SearchEngine {
             } else if checkpoint().is_break() {
                 return ControlFlow::Break(());
             }
+            if self.serves_external_baseline != serves {
+                self.invalidate_semantic_coverage();
+            }
             self.serves_external_baseline = serves;
             ControlFlow::Continue(Ok(()))
         })();
@@ -4024,10 +4202,27 @@ impl SearchEngine {
         Ok(OverlayRetrySignals {
             initialized: cache.is_initialized(),
             needs_full_rescan: cache.needs_full_rescan(),
-            pending_dirty_paths: cache.dirty_paths_snapshot().len(),
+            pending_dirty_paths: cache.dirty_paths_count(),
             unembedded_entries: cache.unembedded_entry_count(),
             unread_keys: cache.unread_keys_count(),
         })
+    }
+
+    /// Bounded telemetry only: no engine/overlay wait, clone, scan or lazy refresh.
+    pub fn try_workspace_overlay_retry_signals(&self) -> Option<OverlayRetrySignals> {
+        let cache = self.workspace_overlay_cache.try_lock().ok()?;
+        Some(OverlayRetrySignals {
+            initialized: cache.is_initialized(),
+            needs_full_rescan: cache.needs_full_rescan(),
+            pending_dirty_paths: cache.dirty_paths_count(),
+            unembedded_entries: cache.unembedded_entry_count(),
+            unread_keys: cache.unread_keys_count(),
+        })
+    }
+
+    /// Identity captured by the published overlay; never reads the Store or refreshes it.
+    pub fn try_workspace_overlay_baseline_identity(&self) -> Option<(String, Option<String>)> {
+        self.workspace_overlay_cache.try_lock().ok()?.baseline_identity.clone()
     }
 
     pub fn workspace_overlay_stats(&self) -> Result<Option<WorkspaceOverlayStats>, SearchError> {
@@ -4217,6 +4412,10 @@ impl SearchEngine {
     /// Prepare the cold overlay refresh off the caller's publication barrier, then swap the
     /// completed in-memory cache while that barrier is held. `Prime` is a local-baseline path;
     /// its clone refresh reads/scans/embeds but writes no shared Store rows.
+    ///
+    /// An embedding failure does not withhold the overlay: the refresh reached its tail, so the
+    /// cache is installed and the typed failure is returned only once the barrier applied it.
+    /// The refused keys keep a dirty mark for the next refresh.
     pub fn prime_workspace_overlay_fenced<F>(
         &self,
         mut apply: F,
@@ -4235,20 +4434,27 @@ impl SearchEngine {
             .lock()
             .map_err(|e| SearchError::Index(format!("workspace overlay cache lock error: {e}")))?
             .clone();
-        prepared.refresh(
+        let embedding_failure = match prepared.refresh(
             &self.store,
             roots,
             self.embedder.as_ref(),
             self.batch_size,
             self.workspace_baseline_hash_mode,
             true,
-        )?;
-        Self::fenced_value(&mut apply, || {
+        ) {
+            Ok(()) => None,
+            Err(error) => Some(error.embedding_failure().ok_or(error)?),
+        };
+        let outcome = Self::fenced_value(&mut apply, || {
             *self.workspace_overlay_cache.lock().map_err(|e| {
                 SearchError::Index(format!("workspace overlay cache lock error: {e}"))
             })? = prepared;
             Ok(())
-        })
+        })?;
+        match (outcome, embedding_failure) {
+            (FenceOutcome::Applied(()), Some(failure)) => Err(failure.into()),
+            (outcome, _) => Ok(outcome),
+        }
     }
 
     /// Mark the workspace overlay initialized with zero entries, WITHOUT a disk scan. The caller
@@ -4262,11 +4468,17 @@ impl SearchEngine {
         if self.workspace_roots.is_none() {
             return Ok(());
         }
+        let identity = if self.serves_external_baseline {
+            self.store.load_baseline_manifest()?.map(|r| (r.snapshot_id, r.fingerprint))
+        } else {
+            None
+        };
         let mut cache = self
             .workspace_overlay_cache
             .lock()
             .map_err(|e| SearchError::Index(format!("workspace overlay cache lock error: {e}")))?;
         cache.mark_initialized_clean();
+        cache.baseline_identity = identity;
         Ok(())
     }
 
@@ -5105,6 +5317,9 @@ impl SearchEngine {
         shared_embeddings: Option<&HashMap<String, Vec<f32>>>,
         progress: Option<&Arc<IndexProgress>>,
     ) -> Result<usize, SearchError> {
+        let mut pass = progress.map(IndexProgress::begin_pass);
+        let token = pass.as_ref().map(ActivePass::token);
+        let progress = token.as_ref();
         let lifecycle_batch = Batch::new(self.store.db_path(), Reason::ExplicitRebuild);
         let lifecycle_result = lifecycle_batch.context().in_scope(|| {
             use std::collections::{BTreeMap, HashSet};
@@ -5127,13 +5342,16 @@ impl SearchEngine {
             }
 
             let total_chunks = documents.len();
-            let _pass = progress.map(IndexProgress::begin_pass);
+
             if let Some(p) = progress {
-                p.total_files.store(grouped.len(), Ordering::Relaxed);
-                p.total_chunks.store(total_chunks, Ordering::Relaxed);
-                p.total_batches.store(0, Ordering::Relaxed);
-                p.done_batches.store(0, Ordering::Relaxed);
-                p.done_chunks.store(0, Ordering::Relaxed);
+                p.set_totals(
+                    grouped.len(),
+                    total_chunks,
+                    grouped
+                        .values()
+                        .map(|documents| documents.len().div_ceil(self.batch_size.max(1)))
+                        .sum(),
+                );
             }
 
             let mut indexed = 0usize;
@@ -5162,9 +5380,14 @@ impl SearchEngine {
                         if let Some(shared_embedding) =
                             shared_embeddings.and_then(|items| items.get(&embedding_key))
                         {
+                            if shared_embedding.len() != self.dim {
+                                if let Some(token) = progress {
+                                    token.finish(IndexPassState::Failed);
+                                }
+                            }
                             vectors[idx] = shared_embedding.clone();
                             if let Some(p) = progress {
-                                p.done_chunks.fetch_add(1, Ordering::Relaxed);
+                                p.advance(1, 0);
                             }
                         } else {
                             missing_indices.push(idx);
@@ -5174,14 +5397,17 @@ impl SearchEngine {
 
                     let refs = missing_texts.iter().map(String::as_str).collect::<Vec<_>>();
                     let ranges = embedder.batch_ranges(&refs, self.batch_size)?;
+                    // The totals above count requests by document count alone; a byte-bounded
+                    // split can need more, and only the overflow is new work.
+                    let estimated = file_documents.len().div_ceil(self.batch_size.max(1));
                     if let Some(p) = progress {
-                        p.total_batches.fetch_add(ranges.len(), Ordering::Relaxed);
+                        p.add_batches(ranges.len().saturating_sub(estimated));
                     }
                     for range in ranges {
                         let batch_vectors = embedder.embed_batch(&refs[range.clone()])?;
+                        Self::observe_embedding_dimensions(&batch_vectors, self.dim, progress);
                         if let Some(p) = progress {
-                            p.done_chunks.fetch_add(range.len(), Ordering::Relaxed);
-                            p.done_batches.fetch_add(1, Ordering::Relaxed);
+                            p.advance(range.len(), 1);
                         }
 
                         for (offset, embedding) in batch_vectors.into_iter().enumerate() {
@@ -5209,7 +5435,7 @@ impl SearchEngine {
             }
 
             if let Some(p) = progress {
-                p.active.store(false, Ordering::Relaxed);
+                p.phase(IndexPhase::Persisting);
             }
 
             // Метка снимается и ПОСЛЕ записи, не только до неё: запись идёт файл за файлом,
@@ -5217,8 +5443,12 @@ impl SearchEngine {
             // в середине — его метка описывала бы содержимое, которого здесь уже нет.
             self.invalidate_reference_stamp(collection)?;
 
-            self.index =
-                Self::build_persisted_index(&self.store, self.dim, self.embedder.as_ref())?;
+            self.index = Self::build_persisted_index_with_progress(
+                &self.store,
+                self.dim,
+                self.embedder.as_ref(),
+                progress,
+            )?;
             self.observe_live_index(
                 "live_index_replaced",
                 Reason::ExplicitRebuild,
@@ -5229,6 +5459,13 @@ impl SearchEngine {
         let lifecycle_outcome =
             if lifecycle_result.is_ok() { Outcome::Completed } else { Outcome::Failed };
         lifecycle_batch.finish(lifecycle_outcome);
+        if let Some(pass) = pass.as_mut() {
+            pass.finish(if lifecycle_result.is_ok() {
+                IndexPassState::Ready
+            } else {
+                IndexPassState::Failed
+            });
+        }
         lifecycle_result
     }
 
@@ -5238,6 +5475,46 @@ impl SearchEngine {
 
     pub fn file_count(&self) -> Result<usize, SearchError> {
         self.store.file_count()
+    }
+
+    /// Startup identity proof only: a SQLite BLOB rebuild does not prove model provenance.
+    pub fn semantic_index_qualification(&self) -> SemanticIndexQualification {
+        self.semantic_qualification.get()
+    }
+
+    /// Capture the existing boot count results. Failed reads cannot prove an empty scope.
+    pub fn observe_semantic_boot_coverage(&self, chunks: Option<usize>, embeddings: Option<usize>) {
+        let mut evidence = self.semantic_qualification.get();
+        evidence.coverage_complete = matches!((chunks, embeddings), (Some(chunks), Some(embeddings)) if chunks == embeddings && self.index.len() >= chunks);
+        evidence.pending_work =
+            matches!((chunks, embeddings), (Some(chunks), Some(embeddings)) if chunks > embeddings);
+        self.semantic_qualification.set(evidence);
+    }
+
+    fn invalidate_semantic_coverage(&self) {
+        let mut evidence = self.semantic_qualification.get();
+        if let Some(epoch) = evidence.epoch.checked_add(1) {
+            evidence.epoch = epoch;
+        } else {
+            evidence.identity_verified = false;
+        }
+        evidence.coverage_complete = false;
+        evidence.pending_work = true;
+        self.semantic_qualification.set(evidence);
+    }
+
+    /// Called after a fully successful native pass and live installation, for its captured epoch.
+    pub fn observe_semantic_publication(&self, epoch: u64) {
+        let mut evidence = self.semantic_qualification.get();
+        if evidence.epoch == epoch && evidence.identity_verified {
+            evidence.coverage_complete = true;
+            evidence.pending_work = false;
+            self.semantic_qualification.set(evidence);
+        }
+    }
+
+    pub fn accepted_native_sidecar(&self) -> bool {
+        self.accepted_native_sidecar
     }
 
     pub fn vector_count(&self) -> usize {
@@ -5491,26 +5768,8 @@ mod index_progress_ownership {
         let raised_by_hand = ["active", ".store(true"].concat();
         assert_eq!(
             production.matches(&raised_by_hand).count(),
-            1,
+            0,
             "raise IndexProgress::active through begin_pass, so every exit lowers it again"
-        );
-        // And that one raise is `begin_pass`. A pause resumes by restoring the flag to what a
-        // LIVE pass says it should be, never by storing `true`: a pause outliving its pass
-        // would otherwise raise a flag `ActivePass` had already lowered, and nothing would ever
-        // lower it again.
-        let begin = production.find("fn begin_pass(").expect("begin_pass");
-        let body = &production[begin + "fn begin_pass(".len()..];
-        let next_fn =
-            body.find("\n    fn ").or_else(|| body.find("\n    pub fn ")).unwrap_or(body.len());
-        assert!(
-            body[..next_fn].contains(&raised_by_hand),
-            "the only unconditional raise belongs to begin_pass, and it is not there",
-        );
-        let resume = ["self.0", ".active.store(self.0.passes.load"].concat();
-        assert_eq!(
-            production.matches(&resume).count(),
-            1,
-            "a pause resumes from the live pass count, not from `true` and not from a snapshot",
         );
     }
 }
@@ -5527,22 +5786,21 @@ mod tests {
     /// keeps alive.
     #[test]
     fn a_pause_outliving_its_pass_leaves_the_flag_down() {
-        use std::sync::atomic::Ordering;
         let progress = std::sync::Arc::new(crate::IndexProgress::default());
         let paused = {
             let _active = progress.begin_pass();
-            assert!(progress.active.load(Ordering::Relaxed), "the pass is working");
+            assert!(progress.is_active(), "the pass is working");
             let paused = progress.pause_pass();
-            assert!(!progress.active.load(Ordering::Relaxed), "a pause is not work");
+            assert!(!progress.is_active(), "a pause is not work");
             paused
         };
         assert!(
-            !progress.active.load(Ordering::Relaxed),
+            !progress.is_active(),
             "the pass ended, so the flag is down however the guards were dropped",
         );
         drop(paused);
         assert!(
-            !progress.active.load(Ordering::Relaxed),
+            !progress.is_active(),
             "a pause that outlived its pass raised the flag nothing will ever lower",
         );
     }
@@ -10631,5 +10889,258 @@ mod tests {
                 .unwrap();
             assert_eq!((chunks, fts), (1, 1));
         }
+    }
+}
+
+#[cfg(test)]
+mod indexing_pass_lifecycle {
+    use super::*;
+
+    #[test]
+    fn empty_owned_work_waits_for_publication_and_keeps_typed_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.db");
+        let store = Store::open(&path).unwrap();
+        let config = SearchConfig::default();
+        let progress = IndexProgress::new();
+        let mut owner = progress.begin_pass();
+        let token = owner.token();
+        let result = SearchEngine::embed_pending_chunks_fenced_retrying_owned(
+            &path,
+            &config,
+            Some(&token),
+            None,
+            |op| FenceOutcome::Applied(op()),
+            || false,
+        )
+        .unwrap();
+        assert!(matches!(result, FenceOutcome::Applied(_)));
+        let snapshot = progress.snapshot().unwrap();
+        assert_eq!(snapshot.state, IndexPassState::Running);
+        assert_eq!(snapshot.phase, Some(IndexPhase::Persisting));
+        assert!(snapshot.counters.is_none());
+        owner.finish(IndexPassState::Ready);
+        assert_eq!(progress.snapshot().unwrap().state, IndexPassState::Ready);
+        let mut owner = progress.begin_pass();
+        let token = owner.token();
+        let embedder = Embedder::new(config.embedder);
+        let result = SearchEngine::run_embedding_pass_owned(
+            &store,
+            &embedder,
+            3,
+            1,
+            1,
+            Some(&token),
+            Some(&|| false),
+            &mut |op| FenceOutcome::Applied(op()),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(result.1, FenceOutcome::Released));
+        owner.finish(IndexPassState::Ready);
+        assert_eq!(progress.snapshot().unwrap().state, IndexPassState::Cancelled);
+    }
+
+    #[test]
+    fn best_effort_persistence_keeps_serving_but_never_reports_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("search.db");
+        let mut store = Store::open(&path).unwrap();
+        let chunk = crate::Chunk {
+            kind: crate::ChunkKind::Procedure,
+            name: "One".into(),
+            is_export: false,
+            annotations: Vec::new(),
+            line_start: 1,
+            line_end: 2,
+            text: "Процедура One()\nКонецПроцедуры".into(),
+        };
+        store.reindex_file("", "M.bsl", b"hash", &[chunk], Some(&[vec![1.0, 0.0, 0.0]])).unwrap();
+        // A directory at the publication destination deterministically refuses the rename.
+        std::fs::create_dir(path.with_file_name("search.db.usearch")).unwrap();
+        std::fs::write(path.with_file_name("search.db.usearch").join("occupied"), b"fixture")
+            .unwrap();
+        let progress = IndexProgress::new();
+        let mut owner = progress.begin_pass();
+        let embedder = Embedder::new(EmbedderConfig { dim: Some(3), ..EmbedderConfig::default() });
+        let index = SearchEngine::build_persisted_index_with_progress(
+            &store,
+            3,
+            Some(&embedder),
+            Some(&owner.token()),
+        )
+        .unwrap();
+        assert_eq!(index.len(), 1);
+        owner.finish(IndexPassState::Ready);
+        assert_eq!(progress.snapshot().unwrap().state, IndexPassState::Failed);
+        assert!(!progress.is_active());
+    }
+
+    #[test]
+    fn failed_native_store_read_is_retained_after_guard_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.db");
+        let progress = IndexProgress::new();
+        let owner = progress.begin_pass();
+        let token = owner.token();
+        assert!(SearchEngine::embed_pending_chunks_fenced_retrying_owned(
+            &path,
+            &SearchConfig::default(),
+            Some(&token),
+            None,
+            |op| FenceOutcome::Applied(op()),
+            || false,
+        )
+        .is_err());
+        drop(owner);
+        assert_eq!(progress.snapshot().unwrap().state, IndexPassState::Failed);
+    }
+}
+
+#[cfg(test)]
+mod indexing_local_qualification {
+    use super::*;
+
+    fn config(dim: usize) -> SearchConfig {
+        SearchConfig {
+            embedder: EmbedderConfig {
+                dim: Some(dim),
+                base_url: "http://127.0.0.1:0".into(),
+                ..EmbedderConfig::default()
+            },
+            ..SearchConfig::default()
+        }
+    }
+    fn seed(store: &mut Store, vector: Option<Vec<f32>>) {
+        let chunk = crate::Chunk {
+            kind: crate::ChunkKind::Procedure,
+            name: "One".into(),
+            is_export: false,
+            annotations: Vec::new(),
+            line_start: 1,
+            line_end: 2,
+            text: "Процедура One()\nКонецПроцедуры".into(),
+        };
+        let vectors = vector.map(|vector| vec![vector]);
+        store.reindex_file("", "M.bsl", b"hash", &[chunk], vectors.as_deref()).unwrap();
+    }
+    fn observe(engine: &SearchEngine) {
+        engine.observe_semantic_boot_coverage(
+            engine.chunk_count().ok(),
+            engine.embedding_count_by_collection("code").ok(),
+        );
+    }
+    #[test]
+    fn cold_empty_failed_counts_and_generation_qualified_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("search.db");
+        let mut engine = SearchEngine::new(&path, config(3)).unwrap();
+        observe(&engine);
+        assert!(engine.semantic_index_qualification().identity_verified);
+        assert!(engine.semantic_index_qualification().coverage_complete);
+        engine.observe_semantic_boot_coverage(None, Some(0));
+        assert!(!engine.semantic_index_qualification().coverage_complete);
+        assert!(!engine.semantic_index_qualification().pending_work);
+        seed(&mut engine.store, None);
+        observe(&engine);
+        assert!(engine.semantic_index_qualification().pending_work);
+        let epoch = engine.semantic_index_qualification().epoch;
+        engine.invalidate_semantic_coverage();
+        engine.observe_semantic_publication(epoch);
+        assert!(!engine.semantic_index_qualification().coverage_complete);
+        seed(&mut engine.store, Some(vec![1.0, 0.0, 0.0]));
+        let owner = IndexProgress::new();
+        let mut pass = owner.begin_pass();
+        let result = SearchEngine::embed_pending_chunks_fenced_retrying_owned(
+            &path,
+            &config(3),
+            Some(&pass.token()),
+            None,
+            |op| FenceOutcome::Applied(op()),
+            || false,
+        )
+        .unwrap();
+        let FenceOutcome::Applied(index) = result else { panic!("publication failed") };
+        engine.set_vector_index(index);
+        engine.observe_semantic_publication(engine.semantic_index_qualification().epoch);
+        pass.finish(IndexPassState::Ready);
+        assert!(engine.semantic_index_qualification().coverage_complete);
+        assert!(!engine.semantic_index_qualification().pending_work);
+    }
+
+    #[test]
+    fn blob_fallback_wrong_dimension_and_accepted_sidecar_have_distinct_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, vector_dim) in [("valid", 3), ("wrong", 2)] {
+            let path = dir.path().join(format!("{name}.db"));
+            let mut store = Store::open(&path).unwrap();
+            seed(&mut store, Some(vec![1.0; vector_dim]));
+            drop(store);
+            let engine = SearchEngine::new(&path, config(3)).unwrap();
+            observe(&engine);
+            assert!(
+                !engine.semantic_index_qualification().identity_verified,
+                "BLOB provenance is unknown"
+            );
+            if vector_dim == 2 {
+                assert!(!engine.semantic_index_qualification().coverage_complete);
+            }
+            if vector_dim == 3 {
+                drop(engine);
+                let warm = SearchEngine::new(&path, config(3)).unwrap();
+                observe(&warm);
+                assert!(warm.accepted_native_sidecar());
+                assert!(warm.semantic_index_qualification().identity_verified);
+                assert!(warm.semantic_index_qualification().coverage_complete);
+                assert!(warm.search("query", 1, None).is_err());
+                assert!(
+                    warm.semantic_index_qualification().coverage_complete,
+                    "query failure does not invalidate the index"
+                );
+                warm.store.mark_context_dirty("code", "", "M.bsl").unwrap();
+                drop(warm);
+                let reopened = SearchEngine::new(&path, config(3)).unwrap();
+                observe(&reopened);
+                assert!(
+                    reopened.semantic_index_qualification().context_pending,
+                    "persisted context debt survives restart"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_native_vectors_and_mode_changes_cannot_restore_ready() {
+        let progress = IndexProgress::new();
+        let mut pass = progress.begin_pass();
+        SearchEngine::observe_embedding_dimensions(&[vec![1.0, 0.0]], 3, Some(&pass.token()));
+        pass.finish(IndexPassState::Ready);
+        assert_eq!(progress.snapshot().unwrap().state, IndexPassState::Failed);
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = SearchEngine::new(&dir.path().join("search.db"), config(3)).unwrap();
+        observe(&engine);
+        let epoch = engine.semantic_index_qualification().epoch;
+        engine.set_serves_external_baseline(true).unwrap();
+        engine.set_serves_external_baseline(false).unwrap();
+        engine.observe_semantic_publication(epoch);
+        assert!(!engine.semantic_index_qualification().coverage_complete);
+    }
+
+    #[test]
+    fn committed_drift_context_marks_revoke_readiness_without_clearing_base_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = SearchEngine::new(&dir.path().join("search.db"), config(3)).unwrap();
+        seed(&mut engine.store, Some(vec![1.0, 0.0, 0.0]));
+        engine.index =
+            SearchEngine::build_persisted_index(&engine.store, 3, engine.embedder.as_ref())
+                .unwrap();
+        observe(&engine);
+        let key = FileKey::new("", "M.bsl");
+        let outcome = engine.apply_prepared_workspace_drift_batch(&[], &[], &[key], &mut || {
+            ControlFlow::Continue(())
+        });
+        assert!(matches!(outcome, ControlFlow::Continue(Ok(_))));
+        assert!(engine.semantic_index_qualification().coverage_complete);
+        assert!(engine.semantic_index_qualification().context_pending);
     }
 }

@@ -26,10 +26,12 @@ pub(super) const HYBRID_FETCH_MULTIPLIER: usize = 2;
 /// `line_start`/`line_end` are untouched.
 ///
 /// `5` — `search_code` only — adds `freshness.drift_watch` and the completeness reasons the
-/// overlay's own state gives. `6` adds optional semantic failure diagnostics; the independent
-/// documentation schema advances from `4` to `5` for the same diagnostics.
-pub(super) const SEARCH_CODE_SCHEMA_VERSION: &str = "6";
-pub(super) const DOCS_SCHEMA_VERSION: &str = "5";
+/// overlay's own state gives. The `reference` profile's documentation actions changed nothing
+/// and stayed on `4`: their number is independent. Structured indexing advances code to `6`
+/// and documentation to `5`; optional semantic failure diagnostics advance them to `7` and `6`.
+pub(super) const SEARCH_CODE_SCHEMA_VERSION: &str = "7";
+pub(super) const DOCS_SCHEMA_VERSION: &str = "6";
+
 // Schema-only mirrors keep the MCP dependency out of the native search crate.
 // The parity test below validates every native failure code against this schema.
 #[derive(JsonSchema)]
@@ -99,6 +101,7 @@ enum SearchOutput<C> {
         schema_version: StatusSchemaVersion,
         profile: SearchProfile,
         state: SearchState,
+        indexing: crate::indexing::Indexing,
         #[serde(skip_serializing_if = "Option::is_none")]
         #[schemars(default, with = "SemanticFailureSchema")]
         semantic_failure: Option<bsl_search::EmbeddingFailure>,
@@ -109,6 +112,7 @@ enum SearchOutput<C> {
 struct SearchHits<A, V> {
     action: A,
     schema_version: V,
+    indexing: crate::indexing::Indexing,
     hits: Vec<Value>,
     shown: usize,
     total: usize,
@@ -125,6 +129,7 @@ struct SearchHits<A, V> {
 struct SearchNotReady<A, V> {
     action: A,
     schema_version: V,
+    indexing: crate::indexing::Indexing,
     status: NotReadyStatus,
     retry_after_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -152,10 +157,10 @@ const_enum!(FindDocsAction, FindDocs, "find_docs");
 const_enum!(SearchDocsAction, SearchDocs, "search_docs");
 const_enum!(ListPlatformAction, ListPlatform, "list_platform");
 const_enum!(StatusAction, Status, "status");
-const_enum!(SearchCodeSchemaVersion, V6, "6");
-const_enum!(SearchSchemaVersion, V5, "5");
+const_enum!(SearchCodeSchemaVersion, V7, "7");
+const_enum!(SearchSchemaVersion, V6, "6");
 const_enum!(ListPlatformSchemaVersion, V1, "1");
-const_enum!(StatusSchemaVersion, V2, "2");
+const_enum!(StatusSchemaVersion, V3, "3");
 const_enum!(NotReadyStatus, NotReady, "not_ready");
 
 #[derive(JsonSchema, Serialize)]
@@ -364,6 +369,21 @@ mod tests {
             EmbeddingFailureCode::EmbeddingInvalidResponse,
             EmbeddingFailureCode::EmbeddingFailed,
         ];
+        // The list above is checked against the native enum by the compiler: a new code makes
+        // this match non-exhaustive, so the mirror cannot fall behind unnoticed.
+        for code in codes {
+            match code {
+                EmbeddingFailureCode::EmbeddingInvalidConfig
+                | EmbeddingFailureCode::EmbeddingInputTooLarge
+                | EmbeddingFailureCode::EmbeddingRequestTooLarge
+                | EmbeddingFailureCode::EmbeddingResponseTooLarge
+                | EmbeddingFailureCode::EmbeddingTimeout
+                | EmbeddingFailureCode::EmbeddingTransportError
+                | EmbeddingFailureCode::EmbeddingProviderError
+                | EmbeddingFailureCode::EmbeddingInvalidResponse
+                | EmbeddingFailureCode::EmbeddingFailed => {}
+            }
+        }
         assert_eq!(
             schema["$defs"]["SemanticFailureCodeSchema"]["enum"].as_array().unwrap().len(),
             codes.len()
@@ -398,16 +418,20 @@ mod tests {
 
         let output_schema = Value::Object((*search_output_schema()).clone());
         let output_validator = jsonschema::validator_for(&output_schema).unwrap();
+        // Every response leaves the handler with its indexing telemetry attached.
+        let indexed = |mut result: rmcp::model::CallToolResult| {
+            use crate::indexing::{Indexing, Kind, State, Target};
+            Indexing::single(Target::new(Kind::Reference, State::Ready, None)).attach(&mut result);
+            result.structured_content.unwrap()
+        };
         for action in ["search_code", "find_docs", "search_docs"] {
-            let ready = super::super::render::no_hits_response(
+            let ready = indexed(super::super::render::no_hits_response(
                 None,
                 super::super::render::Envelope::No,
                 action,
                 None,
-            )
-            .structured_content
-            .unwrap();
-            let pending = super::super::status::docs_not_ready(action).structured_content.unwrap();
+            ));
+            let pending = indexed(super::super::status::docs_not_ready(action));
             for mut output in [ready, pending] {
                 assert!(output.get("semantic_failure").is_none());
                 assert!(output_validator.is_valid(&output), "{output}");
@@ -429,7 +453,7 @@ mod tests {
                 Some(failure),
             );
             for result in [ready, pending] {
-                let output = result.structured_content.unwrap();
+                let output = indexed(result);
                 assert_eq!(output["semantic_failure"], value);
                 assert!(output_validator.is_valid(&output), "{output}");
             }
@@ -453,7 +477,7 @@ mod tests {
                     std::time::Duration::ZERO,
                 )
                 .unwrap();
-                let mut output = result.structured_content.unwrap();
+                let mut output = indexed(result);
                 assert_eq!(output.get("semantic_failure"), known_failure.map(|_| &value));
                 assert!(output_validator.is_valid(&output), "{output}");
                 output["semantic_failure"]["extra"] = json!(true);

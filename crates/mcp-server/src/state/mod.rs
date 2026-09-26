@@ -564,6 +564,233 @@ impl SharedState {
         self.workspace_search_initializing.load(Ordering::Relaxed)
     }
 
+    /// Observe qualified indexing evidence without waiting or starting work.
+    pub(crate) fn workspace_indexing(&self) -> crate::indexing::Indexing {
+        use crate::baseline::BaselineIndexingPublication;
+        use crate::indexing::{Indexing, Kind, Reason, State, Target};
+        let sample = self.index_progress.snapshot();
+        let unknown = || {
+            Indexing::workspace(
+                Target::unknown(Kind::Lexical),
+                Target::unknown(Kind::Semantic).with_attempt(sample.as_ref()),
+                sample.as_ref(),
+            )
+        };
+        let (runtime_disabled, runtime_failed) = {
+            let Ok(runtime) = self.semantic_runtime.try_lock() else { return unknown() };
+            (matches!(*runtime, SemanticRuntimeStatus::Disabled), runtime.is_failed())
+        };
+        let Some(engine) = self.search_engine.try_snapshot() else {
+            let semantic = match &sample {
+                Some(sample)
+                    if sample.pass_id.is_some()
+                        && sample.state != bsl_search::IndexPassState::Ready =>
+                {
+                    Target::native(Kind::Semantic, sample)
+                }
+                _ => Target::unknown(Kind::Semantic).with_attempt(sample.as_ref()),
+            };
+            return Indexing::workspace(Target::unknown(Kind::Lexical), semantic, sample.as_ref());
+        };
+        let lexical = if engine.is_some() {
+            Target::new(Kind::Lexical, State::Ready, None)
+        } else if self.workspace_search_initializing.load(Ordering::Relaxed) {
+            Target::new(Kind::Lexical, State::Waiting, Some(Reason::Initializing))
+        } else if runtime_failed {
+            Target::new(Kind::Lexical, State::Failed, Some(Reason::NativeFailure))
+        } else {
+            Target::new(Kind::Lexical, State::Waiting, Some(Reason::Initializing))
+        };
+        let remote =
+            matches!(self.workspace_search_mode, WorkspaceSearchMode::PostgresRemoteOverlay);
+        let warmup = if remote {
+            self.overlay_warmup.try_lock().ok().map(|state| match &*state {
+                OverlayWarmupState::Failed(_) | OverlayWarmupState::EmbeddingFailed(_) => {
+                    State::Failed
+                }
+                OverlayWarmupState::Superseded => State::Superseded,
+                OverlayWarmupState::Synced { .. } | OverlayWarmupState::NoLocalDiffs => {
+                    State::Ready
+                }
+                _ => State::Waiting,
+            })
+        } else {
+            None
+        };
+        let semantic = if sample.is_none() {
+            Target::unknown(Kind::Semantic)
+        } else if runtime_disabled {
+            Target::new(Kind::Semantic, State::Disabled, Some(Reason::SemanticDisabled))
+        } else if self.workspace_lease.is_superseded() {
+            Target::new(Kind::Semantic, State::Superseded, Some(Reason::Superseded))
+        } else if self.workspace_lease.is_released() {
+            Target::new(Kind::Semantic, State::Cancelled, Some(Reason::Cancelled))
+        } else if let Some(sample) = sample.as_ref().filter(|sample| {
+            sample.pass_id.is_some()
+                && matches!(
+                    sample.state,
+                    bsl_search::IndexPassState::Running
+                        | bsl_search::IndexPassState::Failed
+                        | bsl_search::IndexPassState::Cancelled
+                        | bsl_search::IndexPassState::Superseded
+                )
+        }) {
+            Target::native(Kind::Semantic, sample)
+        } else if runtime_failed {
+            Target::new(Kind::Semantic, State::Failed, Some(Reason::NativeFailure))
+        } else if self.embed_flight.is_in_flight()
+            || self.overlay_retry.as_ref().is_some_and(|retry| retry.pass_active())
+        {
+            Target::new(Kind::Semantic, State::Running, None)
+        } else if remote && warmup.is_none() {
+            Target::unknown(Kind::Semantic)
+        } else if matches!(warmup, Some(State::Failed)) {
+            Target::new(Kind::Semantic, State::Failed, Some(Reason::NativeFailure))
+        } else if matches!(warmup, Some(State::Superseded)) {
+            Target::new(Kind::Semantic, State::Superseded, Some(Reason::Superseded))
+        } else if let Some(engine) = engine.as_ref() {
+            match engine.try_workspace_overlay_retry_signals() {
+                None => Target::unknown(Kind::Semantic),
+                Some(signals) if signals.demands_a_pass() || signals.pending_dirty_paths > 0 => {
+                    Target::new(
+                        Kind::Semantic,
+                        State::Waiting,
+                        Some(if remote { Reason::OverlayPending } else { Reason::PendingWork }),
+                    )
+                }
+                Some(_) => match self.workspace_search_mode {
+                    WorkspaceSearchMode::SqliteLocal => {
+                        let evidence = engine.semantic_index_qualification();
+                        if evidence.context_pending || evidence.pending_work {
+                            Target::new(Kind::Semantic, State::Waiting, Some(Reason::PendingWork))
+                        } else if !evidence.identity_verified {
+                            Target::new(
+                                Kind::Semantic,
+                                State::Unknown,
+                                Some(Reason::IdentityUnverified),
+                            )
+                        } else if !evidence.coverage_complete {
+                            Target::new(
+                                Kind::Semantic,
+                                State::Unknown,
+                                Some(Reason::CoverageUnverified),
+                            )
+                        } else {
+                            Target::new(Kind::Semantic, State::Ready, None)
+                        }
+                    }
+                    WorkspaceSearchMode::PostgresRemoteOverlay => {
+                        if !matches!(warmup, Some(State::Ready)) {
+                            Target::new(
+                                Kind::Semantic,
+                                State::Waiting,
+                                Some(Reason::OverlayPending),
+                            )
+                        } else {
+                            let Some(baseline) = self.baseline.try_external() else {
+                                return unknown();
+                            };
+                            match (baseline, engine.embedding_model(), engine.embedding_dimension())
+                            {
+                                (Some(baseline), Some(model), Some(dim)) => match baseline
+                                    .indexing_publication(
+                                        model,
+                                        dim,
+                                        engine.try_workspace_overlay_baseline_identity().as_ref(),
+                                    ) {
+                                    BaselineIndexingPublication::Ready => {
+                                        Target::new(Kind::Semantic, State::Ready, None)
+                                    }
+                                    BaselineIndexingPublication::UnverifiedIdentity => Target::new(
+                                        Kind::Semantic,
+                                        State::Unknown,
+                                        Some(Reason::IdentityUnverified),
+                                    ),
+                                    BaselineIndexingPublication::UnverifiedCoverage => Target::new(
+                                        Kind::Semantic,
+                                        State::Unknown,
+                                        Some(Reason::CoverageUnverified),
+                                    ),
+                                    BaselineIndexingPublication::Stale => Target::new(
+                                        Kind::Semantic,
+                                        State::Unknown,
+                                        Some(Reason::StaleGeneration),
+                                    ),
+                                    BaselineIndexingPublication::Unavailable => Target::new(
+                                        Kind::Semantic,
+                                        State::Waiting,
+                                        Some(Reason::BaselineUnavailable),
+                                    ),
+                                    BaselineIndexingPublication::SnapshotUnavailable => {
+                                        Target::unknown(Kind::Semantic)
+                                    }
+                                },
+                                _ => Target::new(
+                                    Kind::Semantic,
+                                    State::Waiting,
+                                    Some(Reason::BaselineUnavailable),
+                                ),
+                            }
+                        }
+                    }
+                },
+            }
+        } else {
+            Target::new(Kind::Semantic, State::Waiting, Some(Reason::Initializing))
+        };
+        let lexical =
+            if matches!(self.workspace_search_mode, WorkspaceSearchMode::PostgresRemoteOverlay)
+                && lexical.state == State::Ready
+            {
+                match (self.baseline.try_external(), engine.as_ref()) {
+                    (Some(baseline), Some(engine)) => match baseline {
+                        Some(baseline) => {
+                            let proof = baseline.indexing_publication(
+                                engine.embedding_model().unwrap_or(""),
+                                engine.embedding_dimension().unwrap_or(0),
+                                engine.try_workspace_overlay_baseline_identity().as_ref(),
+                            );
+                            let clean =
+                                engine.try_workspace_overlay_retry_signals().is_some_and(|s| {
+                                    s.initialized
+                                        && !s.needs_full_rescan
+                                        && s.pending_dirty_paths == 0
+                                        && s.unread_keys == 0
+                                });
+                            if matches!(
+                                proof,
+                                BaselineIndexingPublication::Ready
+                                    | BaselineIndexingPublication::UnverifiedIdentity
+                                    | BaselineIndexingPublication::UnverifiedCoverage
+                            ) && clean
+                            {
+                                lexical
+                            } else {
+                                Target::new(
+                                    Kind::Lexical,
+                                    State::Waiting,
+                                    Some(Reason::BaselineUnavailable),
+                                )
+                            }
+                        }
+                        None => Target::new(
+                            Kind::Lexical,
+                            State::Waiting,
+                            Some(Reason::BaselineUnavailable),
+                        ),
+                    },
+                    _ => Target::unknown(Kind::Lexical),
+                }
+            } else {
+                lexical
+            };
+        Indexing::workspace(lexical, semantic.with_attempt(sample.as_ref()), sample.as_ref())
+    }
+
+    pub(crate) fn reference_indexing(&self) -> crate::indexing::Indexing {
+        crate::indexing::Indexing::single(self.reference_search.indexing_snapshot())
+    }
+
     /// Whether work this backend owns is still running, and so whether the broker must keep
     /// the process alive past its idle TTL.
     ///
@@ -1184,7 +1411,6 @@ mod consumer_phase_tests {
 #[cfg(test)]
 mod background_lifetime_tests {
     use super::{SemanticRuntimeStatus, SharedState};
-    use std::sync::atomic::Ordering;
 
     /// A shutdown is a request every background owner answers at once. The search consumer
     /// used to park in a 30-second hub wait and in retry sleeps of up to half an hour, so a
@@ -1401,7 +1627,7 @@ mod background_lifetime_tests {
         let state = SharedState::shared();
         assert!(!state.background_work_active());
 
-        state.index_progress().active.store(true, Ordering::Relaxed);
+        let _pass = state.index_progress().begin_pass();
 
         assert!(state.background_work_active());
     }
@@ -1429,3 +1655,6 @@ mod background_lifetime_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod indexing_tests;

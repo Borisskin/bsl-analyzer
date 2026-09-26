@@ -6,8 +6,8 @@ use crate::error::{reason, ReasonCode, SearchError};
 use crate::external_baseline::{
     BaselineCollectionRecord, BaselineEmbeddingCoverageRecord, BaselineEmbeddingModelRecord,
     BaselineEmbeddingStats, BaselineFileObjectDetails, BaselineFileObjectRecord,
-    BaselineFileObjectReference, BaselineGcReport, BaselineSnapshotDetails, BaselineSnapshotRecord,
-    SemanticPublishPhase, SemanticPublishProgress,
+    BaselineFileObjectReference, BaselineGcReport, BaselineSemanticPublication,
+    BaselineSnapshotDetails, BaselineSnapshotRecord, SemanticPublishPhase, SemanticPublishProgress,
 };
 use crate::ports::{
     BaselineLexicalSearch, BaselineSemanticSearch, SnapshotCatalog, SnapshotContentStore,
@@ -875,22 +875,46 @@ impl PostgresBaselineAdapter {
                     s.parent_snapshot_id,
                     s.branch,
                     s.commit_sha,
-                    s.created_at::TEXT AS created_at
+                    s.created_at::TEXT AS created_at,
+                    model.value AS semantic_model,
+                    dimension.value AS semantic_dimension,
+                    publication.value AS semantic_publication
              FROM {} s
+             LEFT JOIN {metadata} model ON model.setting = '{EMBEDDING_MODEL_SETTING}'
+             LEFT JOIN {metadata} dimension ON dimension.setting = '{EMBEDDING_DIMENSION_SETTING}'
+             LEFT JOIN {metadata} publication ON publication.setting =
+                 '{SEMANTIC_PUBLICATION_COMPLETE_PREFIX}' || s.id || ':' || model.value || ':' || dimension.value
              WHERE s.id = $1
              LIMIT 1",
             self.table("snapshots"),
+            metadata = self.table(SCHEMA_METADATA_TABLE),
         );
         let Some(snapshot_row) = client.query_opt(&summary_query, &[&snapshot_id])? else {
             return Ok(None);
         };
+        let model: Option<String> = snapshot_row.get("semantic_model");
+        let dimension: Option<String> = snapshot_row.get("semantic_dimension");
+        let publication: Option<String> = snapshot_row.get("semantic_publication");
+        let semantic_publication =
+            model.filter(|model| !model.trim().is_empty()).and_then(|model_id| {
+                let raw_dimension = dimension?;
+                let dimension = raw_dimension.parse::<usize>().ok()?;
+                // The publisher uses canonical positive dimensions in marker keys.
+                (dimension > 0 && dimension.to_string() == raw_dimension).then_some(
+                    BaselineSemanticPublication {
+                        model_id,
+                        dimension,
+                        complete: publication.as_deref() == Some("complete"),
+                    },
+                )
+            });
         let mut snapshot = snapshot_record_from_metadata_row(snapshot_row);
         let summary = effective_snapshot_summary(&mut *client, self, snapshot_id)?;
         snapshot.files = summary.total_files;
         snapshot.documents = summary.total_documents;
         let collections = summary.collections;
 
-        Ok(Some(BaselineSnapshotDetails { snapshot, collections }))
+        Ok(Some(BaselineSnapshotDetails { snapshot, collections, semantic_publication }))
     }
 
     pub fn list_file_objects(
@@ -4720,6 +4744,72 @@ mod tests {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
                 as u64;
         format!("bsl_{prefix}_{:02x}{:08x}", std::process::id() % 256, nanos as u32)
+    }
+
+    #[test]
+    #[ignore = "requires a live Postgres; set BSL_TEST_PG_URL and run with --ignored"]
+    fn indexing_remote_publication_reader() {
+        let url = std::env::var("BSL_TEST_PG_URL").expect("isolated Postgres URL required");
+        let schema = unique_schema("indexing");
+        let adapter = PostgresBaselineAdapter::new(
+            ExternalBaselineConfig::postgres(url).with_schema(&schema),
+        )
+        .unwrap();
+        let _guard = TestSchemaGuard { adapter: adapter.clone(), schema: schema.clone() };
+        adapter.migrate_storage().unwrap();
+        let mut client = adapter.connect().unwrap();
+        client
+            .batch_execute(&format!(
+                "INSERT INTO {schema}.snapshots (id, corpus, fingerprint)
+             VALUES ('empty', 'code', 'fingerprint');"
+            ))
+            .unwrap();
+        assert!(adapter.snapshot_details("absent").unwrap().is_none());
+        let read = || adapter.snapshot_details("empty").unwrap().unwrap();
+        assert!(read().semantic_publication.is_none());
+        let set = |client: &mut postgres::Client, key: &str, value: &str| {
+            client
+                .execute(
+                    &format!(
+                        "INSERT INTO {schema}._schema_metadata_ (setting, value) VALUES ($1, $2)
+                 ON CONFLICT (setting) DO UPDATE SET value = excluded.value"
+                    ),
+                    &[&key, &value],
+                )
+                .unwrap();
+        };
+        set(&mut client, "embedding_model", "model");
+        set(&mut client, "embedding_dimension", "4");
+        assert!(!read().semantic_publication.unwrap().complete);
+        // Other identities/snapshots must not qualify this details row.
+        for key in [
+            "semantic_publication_complete:other:model:4",
+            "semantic_publication_complete:empty:other:4",
+            "semantic_publication_complete:empty:model:8",
+        ] {
+            set(&mut client, key, "complete");
+            assert!(!read().semantic_publication.unwrap().complete);
+        }
+        let marker = "semantic_publication_complete:empty:model:4";
+        set(&mut client, marker, "complete");
+        let details = read();
+        assert_eq!(details.snapshot.snapshot_id, "empty");
+        assert_eq!(details.snapshot.fingerprint.as_deref(), Some("fingerprint"));
+        assert_eq!((details.snapshot.files, details.snapshot.documents), (0, 0));
+        let evidence = details.semantic_publication.unwrap();
+        assert_eq!(
+            (evidence.model_id.as_str(), evidence.dimension, evidence.complete),
+            ("model", 4, true)
+        );
+        set(&mut client, marker, "invalidated");
+        assert!(!read().semantic_publication.unwrap().complete);
+        for dimension in ["bad", "0", "-1", "04", "184467440737095516160"] {
+            set(&mut client, "embedding_dimension", dimension);
+            assert!(read().semantic_publication.is_none(), "{dimension}");
+        }
+        set(&mut client, "embedding_dimension", "4");
+        set(&mut client, "embedding_model", " ");
+        assert!(read().semantic_publication.is_none());
     }
 
     /// The catalog after migration agrees with the generated SQL — for the keys AND for the two

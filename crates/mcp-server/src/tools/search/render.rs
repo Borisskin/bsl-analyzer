@@ -221,15 +221,25 @@ fn budgeted_hits(
 /// the sentence clients have parsed since before the structured envelope existed.
 const NO_HITS_TEXT: &str = "No results found.";
 
-/// Retry envelopes mirror their JSON in text; keep the two copies identical.
+/// A retry envelope whose text mirrors its JSON keeps mirroring it; one that speaks a sentence
+/// (the documentation index's) keeps its sentence, and the failure travels in the JSON only.
 pub(crate) fn not_ready_with_failure(
-    result: CallToolResult,
+    mut result: CallToolResult,
     failure: Option<EmbeddingFailure>,
 ) -> CallToolResult {
     let Some(failure) = failure else { return result };
-    let mut body = result.structured_content.expect("structured retry envelope");
+    let body = result.structured_content.as_mut().expect("structured retry envelope");
+    let old_mirror = serde_json::to_string(body).expect("JSON serializes");
     body["semantic_failure"] = json!(failure);
-    crate::tools::response::structured(body)
+    let mirror = serde_json::to_string(body).expect("JSON serializes");
+    for content in &mut result.content {
+        if let rmcp::model::ContentBlock::Text(text) = content {
+            if text.text == old_mirror {
+                text.text.clone_from(&mirror);
+            }
+        }
+    }
+    result
 }
 
 pub(crate) fn embedding_mcp_error(failure: EmbeddingFailure) -> rmcp::ErrorData {
@@ -255,7 +265,7 @@ pub(super) fn failure_hits_response(
     let total = blocks.len();
     let budget = max_output_tokens.saturating_mul(4);
     let wrap = |shown, budget_exhausted| {
-        let text = if shown == 0 {
+        let text = if total == 0 {
             NO_HITS_TEXT.to_owned()
         } else {
             let mut text = prefix.to_owned();
@@ -849,6 +859,49 @@ mod tests {
     }
 
     #[test]
+    fn payload_mcp_contract_failure_keeps_each_envelope_text_form() {
+        use super::not_ready_with_failure;
+        use bsl_search::{EmbeddingFailure, EmbeddingFailureCode};
+        let failure = EmbeddingFailure::new(EmbeddingFailureCode::EmbeddingTimeout);
+        let docs = super::super::status::docs_not_ready("find_docs");
+        let sentence = docs.content[0].as_text().unwrap().text.clone();
+        let docs = not_ready_with_failure(docs, Some(failure));
+        assert_eq!(docs.content[0].as_text().unwrap().text, sentence, "the sentence stays");
+        assert_eq!(docs.structured_content.as_ref().unwrap()["semantic_failure"], json!(failure));
+        let code = not_ready_with_failure(
+            super::super::status::baseline_warming_not_ready(&bsl_search::IndexProgress::new()),
+            Some(failure),
+        );
+        assert_eq!(
+            code.content[0].as_text().unwrap().text,
+            serde_json::to_string(code.structured_content.as_ref().unwrap()).unwrap(),
+            "a mirrored envelope keeps mirroring"
+        );
+    }
+
+    #[test]
+    fn payload_mcp_contract_failure_below_one_hit_does_not_claim_no_results() {
+        use super::{code_hit_blocks, failure_hits_response};
+        use bsl_search::{EmbeddingFailure, EmbeddingFailureCode};
+        let hits: Vec<_> = (0..3).map(|i| fused(&format!("Метод{i}"), Modality::Lexical)).collect();
+        let result = failure_hits_response(
+            code_hit_blocks(&hits, None),
+            "Modality: [L] lexical\n",
+            Some("semantic skipped: embedding failed"),
+            Envelope::Yes,
+            "search_code",
+            EmbeddingFailure::new(EmbeddingFailureCode::EmbeddingInputTooLarge),
+            0,
+            None,
+        );
+        let text = &result.content[0].as_text().unwrap().text;
+        let body = result.structured_content.as_ref().unwrap();
+        assert_eq!((body["shown"].clone(), body["total"].clone()), (json!(0), json!(3)));
+        assert_ne!(text, "No results found.", "ranked hits exist: {text}");
+        assert!(text.contains("showing 0 of 3"), "{text}");
+    }
+
+    #[test]
     fn payload_mcp_contract_empty_failure_preserves_the_soft_minimum() {
         use super::failure_hits_response;
         use bsl_search::{EmbeddingFailure, EmbeddingFailureCode};
@@ -1202,13 +1255,21 @@ mod tests {
             unread: 1,
             overlay_unknown: true,
         };
-        let code = no_hits_response(None, Envelope::Yes, "search_code", Some(&facts));
+        let mut code = no_hits_response(None, Envelope::Yes, "search_code", Some(&facts));
+        let indexing = crate::indexing::Indexing::single(crate::indexing::Target::unknown(
+            crate::indexing::Kind::Semantic,
+        ));
+        indexing.attach(&mut code);
         let code = code.structured_content.unwrap();
         assert!(valid(workspace(), &code), "{code}");
-        assert!(!valid(reference(), &code), "the reference schema admits a v5 answer: {code}");
+        assert!(!valid(reference(), &code), "the reference schema admits a v6 answer: {code}");
         for action in ["find_docs", "search_docs"] {
-            let docs =
-                no_hits_response(None, Envelope::No, action, None).structured_content.unwrap();
+            let mut docs = no_hits_response(None, Envelope::No, action, None);
+            crate::indexing::Indexing::single(crate::indexing::Target::unknown(
+                crate::indexing::Kind::Reference,
+            ))
+            .attach(&mut docs);
+            let docs = docs.structured_content.unwrap();
             assert!(valid(workspace(), &docs) && valid(reference(), &docs), "{docs}");
         }
     }
@@ -1252,11 +1313,11 @@ mod tests {
         let docs = no_hits_response(None, Envelope::No, "find_docs", None);
         let body = docs.structured_content.unwrap();
         assert!(body.get("freshness").is_none());
-        assert_eq!(body["schema_version"], "5");
+        assert_eq!(body["schema_version"], "6");
         let code = no_hits_response(None, Envelope::Yes, "search_code", None);
         let body = code.structured_content.unwrap();
         assert!(body["freshness"].get("drift_watch").is_none());
-        assert_eq!(body["schema_version"], "6");
+        assert_eq!(body["schema_version"], "7");
     }
 
     #[test]

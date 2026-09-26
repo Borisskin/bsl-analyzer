@@ -228,7 +228,6 @@ pub(super) mod tests {
     use project_model::{ResolvedWorkspaceBaselineSupport, SearchBaselineSupportState};
     use rmcp::model::ErrorCode;
     use std::fs;
-    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
@@ -570,7 +569,7 @@ pub(super) mod tests {
         assert!(text.starts_with("Modality tag per hit:"), "text listing unchanged: {text}");
 
         let body = result.structured_content.as_ref().expect("structured listing");
-        assert_eq!(body["schema_version"], "6");
+        assert_eq!(body["schema_version"], "7");
         assert_eq!(body["action"], "search_code");
         let hits = body["hits"].as_array().expect("hits array");
         assert_eq!(hits.len(), body["shown"].as_u64().unwrap() as usize);
@@ -593,11 +592,10 @@ pub(super) mod tests {
         let engine: crate::state::SharedSearchEngine = crate::state::shared_engine(None);
         let runtime = Arc::new(Mutex::new(SemanticRuntimeStatus::Ready));
         let progress = Arc::new(IndexProgress::default());
-        progress.active.store(true, Ordering::Relaxed);
-        progress.total_chunks.store(100, Ordering::Relaxed);
-        progress.done_chunks.store(40, Ordering::Relaxed);
-        progress.total_batches.store(10, Ordering::Relaxed);
-        progress.done_batches.store(4, Ordering::Relaxed);
+        let _pass = progress.begin_pass();
+        let token = _pass.token();
+        token.set_totals(0, 100, 10);
+        token.advance(40, 4);
 
         let result = hybrid_code(
             &engine,
@@ -631,8 +629,10 @@ pub(super) mod tests {
         let engine: crate::state::SharedSearchEngine = crate::state::shared_engine(None);
         let runtime = Arc::new(Mutex::new(SemanticRuntimeStatus::Ready));
         let progress = Arc::new(IndexProgress::default());
-        progress.total_chunks.store(100, Ordering::Relaxed);
-        progress.done_chunks.store(100, Ordering::Relaxed);
+        let mut pass = progress.begin_pass();
+        pass.token().set_totals(0, 100, 1);
+        pass.token().advance(100, 1);
+        pass.finish(bsl_search::IndexPassState::Ready);
 
         let result = hybrid_code(
             &engine,

@@ -44,7 +44,10 @@ fn capture_level(level: tracing::level_filters::LevelFilter, f: impl FnOnce()) -
 }
 
 /// Finite local fake: returns exactly the requests the test expects, with no model/provider.
-fn server(requests: usize) -> (Embedder, std::thread::JoinHandle<Vec<String>>) {
+fn server(
+    requests: usize,
+    mut observe: impl FnMut() + Send + 'static,
+) -> (Embedder, std::thread::JoinHandle<Vec<String>>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let thread = std::thread::spawn(move || {
@@ -71,6 +74,7 @@ fn server(requests: usize) -> (Embedder, std::thread::JoinHandle<Vec<String>>) {
                     break serde_json::from_slice::<Value>(&bytes[split + 4..]).unwrap();
                 }
             };
+            observe();
             let inputs = body["input"].as_array().unwrap();
             submitted.extend(inputs.iter().map(|text| text.as_str().unwrap().to_owned()));
             let data: Vec<_> = (0..inputs.len())
@@ -167,7 +171,7 @@ fn vector_lifecycle_partial_resume_only_submits_pending_then_warm_skip() {
     let store = seed(&path, 1, 2);
     let preserved = store.load_all_embeddings(3).unwrap()[0].clone();
     drop(store);
-    let (embedder, requests) = server(2);
+    let (embedder, requests) = server(2, || {});
     let records = capture(|| {
         let store = Store::open_existing(&path).unwrap();
         let (index, outcome) = SearchEngine::run_embedding_pass(
@@ -220,7 +224,7 @@ fn vector_lifecycle_refusal_and_failure_retain_earlier_committed_batch() {
     for failed in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let store = seed(&dir.path().join("search.db"), 0, 2);
-        let (embedder, requests) = server(2);
+        let (embedder, requests) = server(2, || {});
         let mut commits = 0;
         let records = capture(|| {
             let result = SearchEngine::run_embedding_pass(
@@ -261,6 +265,26 @@ fn vector_lifecycle_refusal_and_failure_retain_earlier_committed_batch() {
     }
 }
 
+/// Batch totals the progress record shows while each request is in flight. A finished pass
+/// clears its counters, so the plan is observable only while the pass still runs.
+#[allow(clippy::type_complexity, reason = "a fixture reply paired with its sample log")]
+fn sampling_batches(
+    progress: &Arc<IndexProgress>,
+    mut reply: impl FnMut(usize, &[u8]) -> (u16, String) + Send + 'static,
+) -> (impl FnMut(usize, &[u8]) -> (u16, String) + Send + 'static, Arc<Mutex<Vec<Option<usize>>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (progress, record) = (Arc::clone(progress), Arc::clone(&seen));
+    let wrapped = move |index, body: &[u8]| {
+        let total = (0..10_000)
+            .find_map(|_| progress.snapshot())
+            .and_then(|snapshot| snapshot.counters)
+            .and_then(|counters| counters.total_batches);
+        record.lock().unwrap().push(total);
+        reply(index, body)
+    };
+    (wrapped, seen)
+}
+
 #[test]
 fn payload_pending_publication_retains_commits_and_recovers_in_both_paths() {
     use crate::embedder::payload_tests::{success, vector, PayloadServer};
@@ -283,12 +307,16 @@ fn payload_pending_publication_retains_commits_and_recovers_in_both_paths() {
             })
             .max()
             .unwrap();
-        let server =
-            PayloadServer::new(
-                |i, body| if i == 1 { (413, "rejected".into()) } else { success(i, body) },
-            );
-        let embedder = Embedder::new(server.config(limit));
         let progress = IndexProgress::new();
+        let (reply, batches) = sampling_batches(&progress, |i, body| {
+            if i == 1 {
+                (413, "rejected".into())
+            } else {
+                success(i, body)
+            }
+        });
+        let server = PayloadServer::new(reply);
+        let embedder = Embedder::new(server.config(limit));
         let mut retry = || false;
         let error = SearchEngine::run_embedding_pass(
             &store,
@@ -304,8 +332,12 @@ fn payload_pending_publication_retains_commits_and_recovers_in_both_paths() {
         .err()
         .expect("known later failure");
         assert_eq!(error.to_string(), "embedding_request_too_large");
-        assert!(!progress.active.load(Ordering::Relaxed));
-        assert_eq!(progress.total_batches.load(Ordering::Relaxed), 3);
+        assert!(!progress.is_active());
+        let planned = batches.lock().unwrap().clone();
+        assert!(
+            !planned.is_empty() && planned.iter().all(|total| *total == Some(3)),
+            "{planned:?}"
+        );
         let committed = store.load_all_embeddings(3).unwrap();
         assert!(committed.contains(&preserved));
         assert_eq!(committed.len(), if fenced { 2 } else { 3 });
@@ -415,13 +447,14 @@ fn payload_file_collection_mapping_cached_gaps_and_batch_totals() {
         let dir = tempfile::tempdir().unwrap();
         let (content, mut docs, limit) = payload_documents();
         std::fs::write(dir.path().join("Module.bsl"), content).unwrap();
-        let server = PayloadServer::new(success);
+        let progress = IndexProgress::new();
+        let (reply, batches) = sampling_batches(&progress, success);
+        let server = PayloadServer::new(reply);
         let config = SearchConfig {
             embedder: server.config(limit),
             execution: crate::EmbeddingExecutionPolicy::default(),
         };
         let mut engine = SearchEngine::new(&dir.path().join("search.db"), config).unwrap();
-        let progress = IndexProgress::new();
         if collection_sync {
             let cached = [1, 3]
                 .into_iter()
@@ -450,8 +483,10 @@ fn payload_file_collection_mapping_cached_gaps_and_batch_totals() {
         let requests = server.requests();
         assert_eq!(requests.len(), if collection_sync { 2 } else { 4 });
         assert!(requests.iter().all(|body| body.len() <= limit));
-        assert_eq!(progress.total_batches.load(Ordering::Relaxed), requests.len());
-        assert_eq!(progress.done_chunks.load(Ordering::Relaxed), 4);
+        let planned = batches.lock().unwrap().clone();
+        assert_eq!(planned.len(), requests.len());
+        assert!(planned.iter().all(|total| *total == Some(requests.len())), "{planned:?}");
+        assert_eq!(progress.snapshot().unwrap().state, IndexPassState::Ready);
         for (id, actual) in engine.store.load_all_embeddings(3).unwrap() {
             let chunk = engine.store.chunk_by_id(id).unwrap().unwrap();
             let doc = docs.iter().find(|d| d.symbol_name == chunk.symbol_name).unwrap();
@@ -459,6 +494,45 @@ fn payload_file_collection_mapping_cached_gaps_and_batch_totals() {
         }
         assert_eq!(engine.store.load_all_embeddings(3).unwrap().len(), 4);
     }
+}
+
+#[test]
+fn payload_overlay_prime_installs_the_lexical_overlay_before_reporting_embedding_failure() {
+    use crate::embedder::payload_tests::PayloadServer;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Module.bsl"), "Процедура Тест()\nКонецПроцедуры").unwrap();
+    let server = PayloadServer::new(|_, _| (401, "refused".into()));
+    let config = SearchConfig {
+        embedder: server.config(4096),
+        execution: crate::EmbeddingExecutionPolicy::default(),
+    };
+    let mut engine = SearchEngine::new(&dir.path().join("search.db"), config).unwrap();
+    engine.set_workspace_root(dir.path());
+    let error =
+        engine.prime_workspace_overlay_fenced(|op| FenceOutcome::Applied(op())).unwrap_err();
+    assert_eq!(
+        error.embedding_failure().unwrap().code,
+        crate::EmbeddingFailureCode::EmbeddingProviderError
+    );
+    assert_eq!(server.requests().len(), 1, "a final refusal is not retried");
+    let signals = engine.workspace_overlay_retry_signals().unwrap();
+    assert!(signals.initialized, "the lexical overlay is installed despite the failure");
+    assert_eq!(signals.pending_dirty_paths, 1, "the failed key stays owed a refresh: {signals:?}");
+
+    // A barrier that let go wins over the embedding failure: nothing was installed.
+    let mut released = SearchEngine::new(
+        &dir.path().join("released.db"),
+        SearchConfig {
+            embedder: server.config(4096),
+            execution: crate::EmbeddingExecutionPolicy::default(),
+        },
+    )
+    .unwrap();
+    released.set_workspace_root(dir.path());
+    assert!(matches!(
+        released.prime_workspace_overlay_fenced(|_| FenceOutcome::Released),
+        Ok(FenceOutcome::Released)
+    ));
 }
 
 #[test]
@@ -525,10 +599,15 @@ fn payload_reference_publication_preserves_lexical_failure_then_retries_in_order
         })
         .max()
         .unwrap();
-    let server =
-        PayloadServer::new(
-            |i, body| if i == 1 { (413, "refused".into()) } else { success(i, body) },
-        );
+    let progress = IndexProgress::new();
+    let (reply, batches) = sampling_batches(&progress, |i, body| {
+        if i == 1 {
+            (413, "refused".into())
+        } else {
+            success(i, body)
+        }
+    });
+    let server = PayloadServer::new(reply);
     let mut engine = SearchEngine::new(
         &dir.path().join("reference.db"),
         SearchConfig {
@@ -537,7 +616,6 @@ fn payload_reference_publication_preserves_lexical_failure_then_retries_in_order
         },
     )
     .unwrap();
-    let progress = IndexProgress::new();
     let failed = engine
         .replace_reference_collection_if_stale(
             "platform",
@@ -553,11 +631,12 @@ fn payload_reference_publication_preserves_lexical_failure_then_retries_in_order
         crate::EmbeddingFailureCode::EmbeddingRequestTooLarge
     );
     assert!(failed.committed_fingerprint.ends_with(":fts"));
-    assert!(!progress.active.load(Ordering::Relaxed));
+    assert!(!progress.is_active());
     assert_eq!(engine.vector_count(), 0);
     assert_eq!(engine.text_search("uniquemarker0", 10, Some("platform")).unwrap().len(), 1);
 
     let before = server.requests().len();
+    batches.lock().unwrap().clear();
     let recovered = engine
         .replace_reference_collection_if_stale(
             "platform",
@@ -571,7 +650,8 @@ fn payload_reference_publication_preserves_lexical_failure_then_retries_in_order
     assert!(recovered.embedding_failure.is_none());
     assert!(recovered.committed_fingerprint.ends_with(":fixture:3"));
     assert_eq!(server.requests().len() - before, documents.len());
-    assert_eq!(progress.total_batches.load(Ordering::Relaxed), documents.len());
+    let batches = batches.lock().unwrap().clone();
+    assert!(batches.iter().all(|total| *total == Some(documents.len())), "{batches:?}");
     for (id, actual) in engine.store.load_all_embeddings(3).unwrap() {
         let chunk = engine.store.chunk_by_id(id).unwrap().unwrap();
         assert_eq!(actual, vector(&chunk.text));
@@ -873,4 +953,120 @@ fn vector_lifecycle_bulk_removal_bounds_info_and_retains_commits_before_refusal(
         assert_eq!(terminal["committed_totals"]["sqlite_vectors_removed"], removed);
         assert_eq!(engine.store().load_all_embeddings(3).unwrap().len(), 257 - removed);
     }
+}
+
+#[test]
+fn vector_lifecycle_full_index_that_skipped_a_rejected_file_is_failed() {
+    // A permanent embedder refusal leaves the other files' work committed but fails the pass
+    // with the typed cause, exactly as a failed batch in the embedding pass does; both must end
+    // the same way in the journal.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let refusals = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
+        let mut buffer = [0; 4096];
+        let _ = stream.read(&mut buffer);
+        let body = r#"{"error":"rejected"}"#;
+        write!(stream, "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("src");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("M.bsl"), "Процедура A()\nКонецПроцедуры\n").unwrap();
+    let mut engine = SearchEngine::new(
+        &dir.path().join("search.db"),
+        SearchConfig {
+            embedder: EmbedderConfig {
+                base_url: format!("http://{address}"),
+                model: "fixture".into(),
+                dim: Some(3),
+                api_key: None,
+                provider: None,
+                max_request_bytes: EmbedderConfig::DEFAULT_MAX_REQUEST_BYTES,
+            },
+            execution: crate::EmbeddingExecutionPolicy::default(),
+        },
+    )
+    .unwrap();
+    let records = capture(|| {
+        let error = engine.index_directory(&root, None).unwrap_err();
+        assert_eq!(
+            error.embedding_failure().unwrap().code,
+            crate::EmbeddingFailureCode::EmbeddingProviderError
+        );
+    });
+    refusals.join().unwrap();
+    let summary = records
+        .iter()
+        .rev()
+        .find(|r| r["kind"] == "mutation_summary" && r["outcome"] != "started")
+        .unwrap();
+    assert_eq!(summary["outcome"], "failed", "{summary}");
+}
+
+#[test]
+fn indexing_pass_lifecycle_sync_counts_batches_per_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let progress = IndexProgress::new();
+    let observer = Arc::clone(&progress);
+    let (embedder, requests) = server(3, move || {
+        let sample = observer.snapshot().unwrap();
+        let counters = sample.counters.expect("each file batch retains the coherent sample");
+        assert_eq!(counters.total_chunks, Some(3));
+        assert_eq!(counters.total_batches, Some(3));
+        assert_eq!(counters.done_chunks, counters.done_batches);
+    });
+    let mut engine = SearchEngine::fts_only(&dir.path().join("search.db")).unwrap();
+    engine.embedder = Some(embedder);
+    engine.dim = 3;
+    engine.batch_size = 8;
+    let documents: Vec<_> = (0..3)
+        .map(|i| crate::IndexedDocument {
+            collection: "code".into(),
+            root_id: "".into(),
+            path: format!("M{i}.bsl"),
+            symbol_name: format!("Method{i}"),
+            kind: "procedure".into(),
+            line_start: 1,
+            line_end: 2,
+            text: format!("Процедура Method{i}() КонецПроцедуры"),
+            content_hash: format!("hash{i}"),
+            graph_context: None,
+        })
+        .collect();
+    engine.sync_indexed_documents_in_collection("code", &documents, Some(&progress)).unwrap();
+    assert_eq!(requests.join().unwrap().len(), 3);
+    assert_eq!(progress.snapshot().unwrap().state, IndexPassState::Ready);
+}
+
+#[test]
+fn indexing_pass_lifecycle_directory_and_documents_own_complete_attempts() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("M.bsl"), "Процедура One()\nКонецПроцедуры").unwrap();
+    let progress = IndexProgress::new();
+    let observer = Arc::clone(&progress);
+    let (embedder, requests) = server(2, move || {
+        let sample = observer.snapshot().unwrap();
+        assert!(sample.active);
+        assert_eq!(sample.state, IndexPassState::Running);
+        assert_eq!(sample.phase, Some(IndexPhase::Embedding));
+        assert_eq!(sample.counters.unwrap().total_chunks, Some(1));
+    });
+    let mut engine = SearchEngine::fts_only(&dir.path().join("search.db")).unwrap();
+    engine.embedder = Some(embedder);
+    engine.dim = 3;
+    engine.concurrency = 1;
+    engine.index_directory(dir.path(), Some(&progress)).unwrap();
+    let first = progress.snapshot().unwrap();
+    assert_eq!(first.state, IndexPassState::Ready);
+    assert!(!first.active);
+    let docs =
+        [Document { title: "One".into(), body: "Reference text".into(), kind: "type".into() }];
+    engine.index_documents("platform", "docs", b"v1", &docs, Some(&progress)).unwrap();
+    let second = progress.snapshot().unwrap();
+    assert_eq!(second.state, IndexPassState::Ready);
+    assert!(!second.active);
+    assert_ne!(first.pass_id, second.pass_id);
+    assert_eq!(requests.join().unwrap().len(), 2);
 }

@@ -164,6 +164,26 @@ impl ReferenceSearchState {
         }
     }
 
+    pub(crate) fn indexing_snapshot(&self) -> crate::indexing::Target {
+        use crate::indexing::{Kind, Reason, State, Target};
+        if self.stopped.load(Ordering::Acquire) {
+            return Target::new(Kind::Reference, State::Cancelled, Some(Reason::Cancelled));
+        }
+        let Ok(lifecycle) = self.lifecycle.try_lock() else {
+            return Target::unknown(Kind::Reference);
+        };
+        match &*lifecycle {
+            ReferenceSearchLifecycle::Uninitialized => {
+                Target::new(Kind::Reference, State::Waiting, Some(Reason::Initializing))
+            }
+            ReferenceSearchLifecycle::Loading => Target::new(Kind::Reference, State::Running, None),
+            ReferenceSearchLifecycle::Ready => Target::new(Kind::Reference, State::Ready, None),
+            ReferenceSearchLifecycle::Failed { .. } => {
+                Target::new(Kind::Reference, State::Failed, Some(Reason::NativeFailure))
+            }
+        }
+    }
+
     fn finish_initialization(
         &self,
         initialization: Result<(SearchEngine, Option<EmbeddingFailure>), ReferenceInitError>,
@@ -171,7 +191,8 @@ impl ReferenceSearchState {
         if self.stopped.load(Ordering::Acquire) {
             return;
         }
-        let mut lifecycle = self.lifecycle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let lock_lifecycle =
+            || self.lifecycle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         match initialization {
             Ok((engine, embedding_failure)) => {
                 let status = embedding_failure.map_or_else(
@@ -183,8 +204,13 @@ impl ReferenceSearchState {
                     },
                     SemanticRuntimeStatus::EmbeddingFailed,
                 );
+                // `Ready` is the claim that the engine is in the slot, so it is made only where
+                // the engine reaches it. A refused admission — the daemon stopping, or a
+                // poisoned slot — published nothing, and saying ready over an empty slot sends
+                // every reader to a profile that cannot answer.
                 match self.engine.acquire_for_owner(&self.stop) {
                     Ok(mut slot) => {
+                        let mut lifecycle = lock_lifecycle();
                         *slot = Some(engine);
                         SharedState::set_semantic_runtime_status(&self.semantic_runtime, status);
                         *lifecycle = ReferenceSearchLifecycle::Ready;
@@ -195,7 +221,11 @@ impl ReferenceSearchState {
                             &self.semantic_runtime,
                             SemanticRuntimeStatus::Failed(message.clone()),
                         );
-                        *lifecycle = ReferenceSearchLifecycle::Failed {
+                        // The worker ended without putting an engine in the slot, which is what
+                        // this code has always named. A new one would reach
+                        // `find_docs`/`search_docs` callers as `data.reasonCode`, and the
+                        // reference profile is frozen.
+                        *lock_lifecycle() = ReferenceSearchLifecycle::Failed {
                             message,
                             reason_code: "worker_gone".to_owned(),
                         };
@@ -210,7 +240,7 @@ impl ReferenceSearchState {
                         SemanticRuntimeStatus::EmbeddingFailed,
                     ),
                 );
-                *lifecycle = ReferenceSearchLifecycle::Failed { message, reason_code };
+                *lock_lifecycle() = ReferenceSearchLifecycle::Failed { message, reason_code };
             }
         }
     }
@@ -772,7 +802,19 @@ impl SharedState {
                             bsl_search::FenceOutcome::Superseded
                             | bsl_search::FenceOutcome::Released,
                         ) => Ok(None),
-                        Err(error) => Err(error),
+                        // The overlay was installed; losing some vectors must not withhold the
+                        // engine and with it the lexical search. Nothing is latched, since no
+                        // local owner could clear it: the refused keys stay dirty and are rebuilt
+                        // lexically, and their vectors wait for the next boot's prime, as before.
+                        Err(error) => match error.embedding_failure() {
+                            Some(_) => {
+                                tracing::warn!(
+                                    "workspace overlay prime left entries without vectors: {error}"
+                                );
+                                Ok(Some(()))
+                            }
+                            None => Err(error),
+                        },
                     },
                     OverlayInit::RemoteWarmup => Ok(Some(())),
                 };
@@ -1747,8 +1789,14 @@ impl SharedState {
 
             // Schedule the background pass only when chunks actually lack vectors. A warm
             // restart has none pending, so it stays `Ready` with no transient downgrade.
-            let code_chunks = engine.chunk_count().unwrap_or(0);
-            let code_embeddings = engine.embedding_count_by_collection("code").unwrap_or(0);
+            let chunks_result = engine.chunk_count();
+            let embeddings_result = engine.embedding_count_by_collection("code");
+            engine.observe_semantic_boot_coverage(
+                chunks_result.as_ref().ok().copied(),
+                embeddings_result.as_ref().ok().copied(),
+            );
+            let code_chunks = chunks_result.unwrap_or(0);
+            let code_embeddings = embeddings_result.unwrap_or(0);
             let pending_embed = (code_chunks > code_embeddings)
                 .then(Self::embedding_config)
                 .transpose()?
@@ -3463,6 +3511,33 @@ mod tests {
         state.shutdown();
         assert!(state.worker.lock().unwrap().is_none());
         assert!(state.engine.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn indexing_owner_lifecycles_reference_publication_failure() {
+        let _env = env_lock();
+        let dir = tempdir().unwrap();
+        let _cache = EnvVarGuard::set("XDG_CACHE_HOME", dir.path().to_str().unwrap());
+        let _url = EnvVarGuard::unset("EMBEDDING_URL");
+        let _model = EnvVarGuard::unset("EMBEDDING_MODEL");
+        let state = super::ReferenceSearchState::new(None);
+        let engine = state.engine.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = engine.lock().unwrap();
+            panic!("refuse engine publication");
+        })
+        .join();
+        state.ensure_loading();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while state.loading() {
+            assert!(std::time::Instant::now() < deadline, "reference publication deadline");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            matches!(state.lifecycle(), super::ReferenceSearchLifecycle::Failed { reason_code, .. } if reason_code == "worker_gone")
+        );
+        assert_eq!(state.indexing_snapshot().state, crate::indexing::State::Failed);
+        state.shutdown();
     }
 
     #[test]

@@ -59,6 +59,38 @@ fn invalid_config() -> SearchError {
     EmbeddingFailure::new(EmbeddingFailureCode::EmbeddingInvalidConfig).into()
 }
 
+/// Отказ сервиса эмбеддингов, разделённый по тому, способен ли повтор его изменить.
+enum BatchFailure {
+    /// Сервис ответил, и ответ тот же самый сколько ни спрашивай: не принят ключ,
+    /// неизвестна модель, негоден или слишком велик запрос. Повторять такое — значит платить
+    /// полным расписанием отсрочек за уже известный ответ.
+    Permanent(SearchError),
+    /// Сеть, перегрузка, сбой на стороне сервиса — состояние, которое проходит.
+    Transient(SearchError),
+}
+
+impl BatchFailure {
+    fn into_error(self) -> SearchError {
+        match self {
+            Self::Permanent(error) | Self::Transient(error) => error,
+        }
+    }
+
+    /// Клиентский код означает, что сервис разобрал запрос и отказал по существу, —
+    /// кроме трёх, которые говорят «повтори позже», а не «не выйдет»: 408 (запрос не
+    /// принят целиком), 425 (слишком рано) и 429 (слишком часто). Разряд перечислен
+    /// целиком, а не вырезан из диапазона арифметикой: границы вида `400..=428` читаются
+    /// как произвольные и при следующей правке молча захватывают лишний код.
+    fn from_status(code: u16, error: SearchError) -> Self {
+        const TRY_LATER: [u16; 3] = [408, 425, 429];
+        if (400..=499).contains(&code) && !TRY_LATER.contains(&code) {
+            Self::Permanent(error)
+        } else {
+            Self::Transient(error)
+        }
+    }
+}
+
 pub struct Embedder {
     config: EmbedderConfig,
     /// Resilient agent for the unattended batch indexing pass: a long global timeout, paired
@@ -157,12 +189,16 @@ impl Embedder {
         for attempt in 0..Self::MAX_RETRIES {
             match self.send_request(&self.agent, &body, texts.len()) {
                 Ok(result) => return Ok(result),
-                Err(error) => {
-                    if attempt + 1 == Self::MAX_RETRIES
-                        || error.embedding_failure().is_some_and(|f| {
-                            f.code == EmbeddingFailureCode::EmbeddingRequestTooLarge
-                        })
-                    {
+                // Отказ по существу повторять нельзя: полное расписание отсрочек — около
+                // двух минут на партию, и на каждой партии индексации оно платится заново,
+                // в каждом рабочем потоке. Снаружи это выглядит как замерший сервер, хотя
+                // ответ был получен сразу и он окончателен.
+                Err(BatchFailure::Permanent(error)) => {
+                    tracing::warn!("embedding batch rejected, not retrying: {error}");
+                    return Err(error);
+                }
+                Err(BatchFailure::Transient(error)) => {
+                    if attempt + 1 == Self::MAX_RETRIES {
                         return Err(error);
                     }
                     let delay = std::time::Duration::from_millis(500 * 2u64.pow(attempt.min(6)));
@@ -222,17 +258,47 @@ impl Embedder {
         agent: &ureq::Agent,
         body: &[u8],
         input_count: usize,
-    ) -> Result<Vec<Vec<f32>>, SearchError> {
+    ) -> Result<Vec<Vec<f32>>, BatchFailure> {
         let url = format!("{}/v1/embeddings", self.config.base_url);
         let mut req = agent.post(&url).header("Content-Type", "application/json");
         if let Some(ref key) = self.config.api_key {
             req = req.header("Authorization", &format!("Bearer {key}"));
         }
-        let mut resp = req.send(body).map_err(|e| transport_failure(e, false))?;
+        let mut resp = req.send(body).map_err(|e| {
+            tracing::debug!(
+                request_bytes = body.len(),
+                input_count,
+                "embedding request failed: {e}"
+            );
+            match e {
+                ureq::Error::StatusCode(code) => {
+                    BatchFailure::from_status(code, transport_failure(e, false))
+                }
+                e => BatchFailure::Transient(transport_failure(e, false)),
+            }
+        })?;
         // Retain ureq's existing 10 MiB read bound, independent of the request ceiling.
-        let body = resp.body_mut().read_to_string().map_err(|e| transport_failure(e, true))?;
+        let body = resp.body_mut().read_to_string().map_err(|e| {
+            tracing::debug!("failed to read embedding response body: {e}");
+            let error = transport_failure(e, true);
+            // The same request draws an answer of the same size; only a broken read may pass.
+            if error
+                .embedding_failure()
+                .is_some_and(|f| f.code == EmbeddingFailureCode::EmbeddingResponseTooLarge)
+            {
+                BatchFailure::Permanent(error)
+            } else {
+                BatchFailure::Transient(error)
+            }
+        })?;
         let mut data = serde_json::from_str::<EmbeddingResponse>(&body)
-            .map_err(|_| failure(EmbeddingFailureCode::EmbeddingInvalidResponse))?
+            .map_err(|e| {
+                tracing::debug!(
+                    response_bytes = body.len(),
+                    "failed to parse embedding response: {e}"
+                );
+                BatchFailure::Transient(failure(EmbeddingFailureCode::EmbeddingInvalidResponse))
+            })?
             .data;
         data.sort_by_key(|d| d.index);
         if data.len() != input_count
@@ -242,7 +308,12 @@ impl Embedder {
                     || d.embedding.iter().any(|v| !v.is_finite())
             })
         {
-            return Err(failure(EmbeddingFailureCode::EmbeddingInvalidResponse));
+            // A parsed answer of the wrong shape — count, order, dimension or non-finite
+            // values — is the provider's settled reply to this request, not a passing state:
+            // retrying would pay the whole backoff schedule for the same vectors.
+            return Err(BatchFailure::Permanent(failure(
+                EmbeddingFailureCode::EmbeddingInvalidResponse,
+            )));
         }
         Ok(data.into_iter().map(|d| d.embedding).collect())
     }
@@ -268,14 +339,21 @@ impl Embedder {
             return Ok(Vec::new());
         }
         self.send_request(&self.interactive_agent, &body, texts.len())
+            .map_err(BatchFailure::into_error)
     }
 
     pub fn health_check(&self) -> Result<(), SearchError> {
         self.config.validate()?;
         let health_url = format!("{}/health", self.config.base_url);
         let models_url = format!("{}/v1/models", self.config.base_url);
-        if self.agent.get(&health_url).call().is_err() {
-            self.agent.get(&models_url).call().map_err(|e| transport_failure(e, false))?;
+        // Проба доступности идёт коротким агентом: вопрос «сервис вообще там есть» полезен
+        // только пока на ответ можно опереться, а на батчевом бюджете сама проба ждала бы
+        // минутами.
+        if self.interactive_agent.get(&health_url).call().is_err() {
+            self.interactive_agent
+                .get(&models_url)
+                .call()
+                .map_err(|e| transport_failure(e, false))?;
         }
         Ok(())
     }
@@ -379,5 +457,43 @@ mod tests {
         let embedder = Embedder::new(EmbedderConfig { max_request_bytes: 0, ..Default::default() });
         assert_eq!(embedder.embed("input").unwrap_err().to_string(), "embedding_invalid_config");
         assert!(embedder.embed_batch_interactive(&[]).is_err());
+    }
+
+    fn classify(code: u16) -> BatchFailure {
+        BatchFailure::from_status(code, SearchError::Embedder(format!("HTTP {code}")))
+    }
+
+    /// Разряд перечислён целиком, а не представителем: у клиентских кодов «повтори
+    /// позже» — это 408, 425 и 429, и все три обязаны остаться временными. Отнести
+    /// хоть один к окончательным значит оборвать партию на состоянии, которое проходит
+    /// само.
+    #[test]
+    fn client_codes_that_mean_try_later_stay_transient() {
+        for code in [408, 425, 429] {
+            assert!(
+                matches!(classify(code), BatchFailure::Transient(_)),
+                "HTTP {code} означает «повтори позже» и не может быть окончательным"
+            );
+        }
+    }
+
+    #[test]
+    fn client_codes_that_mean_never_are_permanent() {
+        for code in [400, 401, 403, 404, 413, 422] {
+            assert!(
+                matches!(classify(code), BatchFailure::Permanent(_)),
+                "HTTP {code} — отказ по существу, повтор его не изменит"
+            );
+        }
+    }
+
+    #[test]
+    fn server_codes_stay_transient() {
+        for code in [500, 502, 503, 504] {
+            assert!(
+                matches!(classify(code), BatchFailure::Transient(_)),
+                "HTTP {code} — сбой на стороне сервиса, повтор осмыслен"
+            );
+        }
     }
 }

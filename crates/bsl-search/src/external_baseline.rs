@@ -38,6 +38,15 @@ pub struct BaselineCollectionRecord {
 pub struct BaselineSnapshotDetails {
     pub snapshot: BaselineSnapshotRecord,
     pub collections: Vec<BaselineCollectionRecord>,
+    /// Publication identity read atomically with `snapshot`; absent when unqualified.
+    pub semantic_publication: Option<BaselineSemanticPublication>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaselineSemanticPublication {
+    pub model_id: String,
+    pub dimension: usize,
+    pub complete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

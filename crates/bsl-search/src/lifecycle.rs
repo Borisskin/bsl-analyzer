@@ -25,7 +25,7 @@ pub fn set_process_id(id: String) {
     let _ = PROCESS.set(bounded(&id, 64));
 }
 
-fn process_id() -> &'static str {
+pub(crate) fn process_id() -> &'static str {
     PROCESS.get_or_init(|| format!("{}-{}", std::process::id(), now().as_nanos()))
 }
 

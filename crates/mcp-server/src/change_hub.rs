@@ -2145,6 +2145,26 @@ impl WorkspaceChangeHub {
         self.inner.polling.load(Ordering::SeqCst)
     }
 
+    /// Bounded telemetry sample: polling, cycle seconds, and overdue qualification.
+    pub(crate) fn try_poll_status(&self) -> Option<(bool, Option<u64>, bool)> {
+        let polling = self.is_polling() || !self.inner.blind_targets.try_lock().ok()?.is_empty();
+        if !polling {
+            return Some((false, None, false));
+        }
+        let state = *self.inner.poll_state.try_lock().ok()?;
+        let expected = *self.inner.poll_expected_since.try_lock().ok()?;
+        let passes = state.bytes.div_ceil(self.inner.poll.verify_bytes.max(1)).max(1);
+        let ticks = passes.saturating_mul(2).saturating_add(3);
+        let cycle = self.inner.poll.period.saturating_mul(u32::try_from(ticks).unwrap_or(u32::MAX));
+        let owed_since = match (state.last, expected) {
+            (Some(last), Some(expected)) => Some(last.max(expected)),
+            (last, expected) => last.or(expected),
+        };
+        let overdue =
+            owed_since.is_some_and(|since| since.elapsed() > self.poll_period().saturating_mul(2));
+        Some((true, Some(cycle.as_secs()), overdue))
+    }
+
     /// How old the fallback poll's last walk is, and how long an edit that kept its size and
     /// mtime can go unnoticed. `None` while nothing is polled.
     ///
@@ -5167,6 +5187,31 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn poll_telemetry_is_bounded_and_matches_the_owner_sample() {
+        let hub = WorkspaceChangeHub::start(vec![]);
+        hub.shutdown();
+        hub.inner.polling.store(false, Ordering::SeqCst);
+        assert_eq!(hub.try_poll_status(), Some((false, None, false)));
+        {
+            let _held = hub.inner.blind_targets.lock().unwrap();
+            assert!(hub.try_poll_status().is_none());
+        }
+        hub.inner.polling.store(true, Ordering::SeqCst);
+        assert_eq!(
+            hub.try_poll_status(),
+            Some((true, hub.poll_report().map(|(_, cycle)| cycle.as_secs()), hub.poll_overdue()))
+        );
+        {
+            let _held = hub.inner.poll_state.lock().unwrap();
+            assert!(hub.try_poll_status().is_none());
+        }
+        {
+            let _held = hub.inner.poll_expected_since.lock().unwrap();
+            assert!(hub.try_poll_status().is_none());
+        }
+    }
+
     use super::test_support::*;
     use super::*;
     use notify::event::{CreateKind, EventKind, ModifyKind, RemoveKind};

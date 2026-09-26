@@ -46,6 +46,7 @@ impl WorkspaceOverlayIndex {
 #[derive(Debug, Clone)]
 pub struct RefreshPlan {
     snapshot_id: String,
+    baseline_identity: Option<(String, Option<String>)>,
     /// Overlay file entries with lexical docs + embedding inputs but no vectors yet; vectors are
     /// assembled in Phase C from the merged embedding cache.
     entries: Vec<(FileKey, PlannedEntry)>,
@@ -156,7 +157,9 @@ pub struct WorkspaceOverlayStats {
 
 #[derive(Clone, Default)]
 pub struct WorkspaceOverlayCache {
+    pub(crate) baseline_identity: Option<(String, Option<String>)>,
     entries: HashMap<FileKey, OverlayFileEntry>,
+    unembedded_entries: usize,
     hidden_paths: HashSet<FileKey>,
     embedding_cache: HashMap<String, Vec<f32>>,
     /// Watcher-marked paths awaiting re-embed, each tagged with the sequence at which it was last
@@ -346,8 +349,46 @@ impl std::fmt::Debug for WorkspaceOverlayCache {
 }
 
 impl WorkspaceOverlayCache {
+    fn insert_entry(&mut self, key: FileKey, entry: OverlayFileEntry) -> Option<OverlayFileEntry> {
+        self.unembedded_entries +=
+            usize::from(entry.vector_documents.len() < entry.embedding_inputs.len());
+        let previous = self.entries.insert(key, entry);
+        if let Some(previous) = &previous {
+            self.unembedded_entries -=
+                usize::from(previous.vector_documents.len() < previous.embedding_inputs.len());
+        }
+        previous
+    }
+
+    fn remove_entry(&mut self, key: &FileKey) -> Option<OverlayFileEntry> {
+        let previous = self.entries.remove(key);
+        if let Some(previous) = &previous {
+            self.unembedded_entries -=
+                usize::from(previous.vector_documents.len() < previous.embedding_inputs.len());
+        }
+        previous
+    }
+
+    fn retain_entries(&mut self, mut keep: impl FnMut(&FileKey, &mut OverlayFileEntry) -> bool) {
+        let count = &mut self.unembedded_entries;
+        self.entries.retain(|key, entry| {
+            let retained = keep(key, entry);
+            if !retained {
+                *count -= usize::from(entry.vector_documents.len() < entry.embedding_inputs.len());
+            }
+            retained
+        });
+    }
+
+    /// Number of watcher marks, without copying the key set.
+    pub fn dirty_paths_count(&self) -> usize {
+        self.dirty_paths.len()
+    }
+
     pub fn clear(&mut self) {
+        self.baseline_identity = None;
         self.entries.clear();
+        self.unembedded_entries = 0;
         self.hidden_paths.clear();
         self.dirty_paths.clear();
         self.dirty_failures.clear();
@@ -367,7 +408,9 @@ impl WorkspaceOverlayCache {
     /// ([`Self::capture_point_keys`] captures nothing), so this is what unblocks the resident-fed
     /// path; from here the watcher marks and point refreshes serve fresh edits.
     pub fn mark_initialized_clean(&mut self) {
+        self.baseline_identity = None;
         self.entries.clear();
+        self.unembedded_entries = 0;
         self.hidden_paths.clear();
         self.dirty_paths.clear();
         self.dirty_failures.clear();
@@ -384,6 +427,7 @@ impl WorkspaceOverlayCache {
     pub fn set_graph_context_provider(&mut self, provider: Arc<dyn GraphContextProvider>) {
         self.graph_context_provider = Some(provider);
         self.entries.clear();
+        self.unembedded_entries = 0;
         self.embedding_cache.clear();
         self.initialized = false;
         // A changed semantic source invalidates everything a plan built without it: an older
@@ -443,7 +487,7 @@ impl WorkspaceOverlayCache {
             .collect();
 
         let binding_changed = |key: &FileKey| changed_root_ids.contains(&key.root_id);
-        self.entries.retain(|key, _| !binding_changed(key));
+        self.retain_entries(|key, _| !binding_changed(key));
         self.hidden_paths.retain(|key| !binding_changed(key));
         self.dirty_paths.retain(|key, _| !binding_changed(key));
         self.dirty_failures.retain(|key, _| !binding_changed(key));
@@ -451,7 +495,7 @@ impl WorkspaceOverlayCache {
         self.settled_seq.retain(|key, _| !binding_changed(key) && !cleanup.contains(key));
 
         for key in cleanup {
-            self.entries.remove(key);
+            self.remove_entry(key);
             self.dirty_paths.remove(key);
             self.dirty_failures.remove(key);
             self.unread_keys.remove(key);
@@ -479,7 +523,7 @@ impl WorkspaceOverlayCache {
 
         for file in files {
             if file.baseline_equal {
-                self.entries.remove(&file.key);
+                self.remove_entry(&file.key);
                 self.hidden_paths.remove(&file.key);
                 continue;
             }
@@ -497,7 +541,7 @@ impl WorkspaceOverlayCache {
                 })
                 .collect();
             let key = file.key;
-            self.entries.insert(
+            self.insert_entry(
                 key.clone(),
                 OverlayFileEntry {
                     fingerprint: FileFingerprint {
@@ -546,7 +590,7 @@ impl WorkspaceOverlayCache {
     /// if the deletion event lied and the file is alive, the next point pass republishes it.
     pub fn remove_known_deleted(&mut self, key: &FileKey, has_baseline: bool) {
         self.record_settlement(key);
-        self.entries.remove(key);
+        self.remove_entry(key);
         self.unread_keys.remove(key);
         // The baseline copy is HIDDEN, not unhidden: for a remote baseline this set is the
         // only filter, and the deleted file would otherwise resurface as a baseline hit the
@@ -757,6 +801,20 @@ impl WorkspaceOverlayCache {
         self.dirty_paths.keys().cloned().collect()
     }
 
+    /// An embedding failure is reported only after the pass reached its tail: every key it could
+    /// build is published, and a key whose build was refused keeps its previous version and a
+    /// dirty mark, exactly as a build fault always has. The cache therefore counts as built; any
+    /// other error leaves it unbuilt for the next pass.
+    fn settle_cold_refresh(
+        &mut self,
+        refreshed: Result<(), SearchError>,
+    ) -> Result<(), SearchError> {
+        if refreshed.as_ref().err().is_none_or(|error| error.embedding_failure().is_some()) {
+            self.initialized = true;
+        }
+        refreshed
+    }
+
     /// `allow_cold_scan` gates the only expensive operation here: a cold full-tree scan + read +
     /// chunk of every workspace file (`full_refresh_from_manifest`). The background warmup
     /// The embedding refresh passes `true`; status paths pass `false`
@@ -773,14 +831,14 @@ impl WorkspaceOverlayCache {
         allow_cold_scan: bool,
     ) -> Result<(), SearchError> {
         if allow_cold_scan {
-            if !self.initialized || !self.watcher_mode || self.full_rescan_pending {
+            let refreshed = if !self.initialized || !self.watcher_mode || self.full_rescan_pending {
                 self.full_refresh_from_manifest(
                     manifest_fingerprints,
                     roots,
                     embedder,
                     batch_size,
                     store,
-                )?;
+                )
             } else if !self.dirty_paths.is_empty() {
                 let dirty: Vec<FileKey> = self.dirty_paths.drain().map(|(key, _)| key).collect();
                 self.refresh_dirty_paths_from_manifest(
@@ -790,9 +848,11 @@ impl WorkspaceOverlayCache {
                     embedder,
                     batch_size,
                     &HashMap::new(),
-                )?;
-            }
-            self.initialized = true;
+                )
+            } else {
+                Ok(())
+            };
+            return self.settle_cold_refresh(refreshed);
         } else if self.initialized && !self.dirty_paths.is_empty() {
             // ReuseOnly: never cold-scan. An already-populated cache still applies the cheap
             // watcher-marked dirty-path refresh, but a `!watcher_mode` (polling) cache must NOT
@@ -827,8 +887,8 @@ impl WorkspaceOverlayCache {
         if allow_cold_scan {
             let baseline_files: HashMap<FileKey, Vec<u8>> =
                 store.all_files_in_collection("code")?.into_iter().collect();
-            if !self.initialized || !self.watcher_mode || self.full_rescan_pending {
-                self.full_refresh(&baseline_files, roots, embedder, batch_size, hash_mode)?;
+            let refreshed = if !self.initialized || !self.watcher_mode || self.full_rescan_pending {
+                self.full_refresh(&baseline_files, roots, embedder, batch_size, hash_mode)
             } else if !self.dirty_paths.is_empty() {
                 let dirty: Vec<FileKey> = self.dirty_paths.drain().map(|(key, _)| key).collect();
                 self.refresh_dirty_paths(
@@ -838,9 +898,11 @@ impl WorkspaceOverlayCache {
                     embedder,
                     batch_size,
                     &HashMap::new(),
-                )?;
-            }
-            self.initialized = true;
+                )
+            } else {
+                Ok(())
+            };
+            return self.settle_cold_refresh(refreshed);
         } else if self.initialized && !self.dirty_paths.is_empty() {
             // ReuseOnly: never cold-scan. Only the cheap dirty-path refresh on an already-populated
             // cache; a `!watcher_mode` (polling) cache must NOT re-run the full scan, and an
@@ -920,11 +982,22 @@ impl WorkspaceOverlayCache {
                                 &entry.embedding_inputs,
                                 &mut self.embedding_cache,
                             ) {
-                                Ok(vectors) => entry.vector_documents = vectors,
+                                Ok(vectors) => {
+                                    self.unembedded_entries -= usize::from(
+                                        entry.vector_documents.len() < entry.embedding_inputs.len(),
+                                    );
+                                    entry.vector_documents = vectors;
+                                    self.unembedded_entries += usize::from(
+                                        entry.vector_documents.len() < entry.embedding_inputs.len(),
+                                    );
+                                }
                                 Err(error) => {
                                     embedding_failure =
                                         embedding_failure.or(error.embedding_failure());
-                                    tracing::warn!("failed to attach overlay vectors; keeping the entry lexical-only: {error}");
+                                    tracing::warn!(
+                                        "failed to attach overlay vectors; keeping the entry \
+                                         lexical-only: {error}"
+                                    );
                                 }
                             }
                         }
@@ -933,7 +1006,7 @@ impl WorkspaceOverlayCache {
                 }
             }
             if should_remove_cached_entry {
-                self.entries.remove(&file.key);
+                self.remove_entry(&file.key);
                 continue;
             }
 
@@ -948,7 +1021,7 @@ impl WorkspaceOverlayCache {
             };
             let file_hash = compute_file_hash(&content, hash_mode);
             if baseline_hash.is_some_and(|stored_hash| stored_hash == &file_hash) {
-                self.entries.remove(&file.key);
+                self.remove_entry(&file.key);
                 continue;
             }
 
@@ -968,7 +1041,7 @@ impl WorkspaceOverlayCache {
                     if baseline_hash.is_some() {
                         hidden_paths.insert(file.key.clone());
                     }
-                    self.entries.insert(file.key, entry);
+                    self.insert_entry(file.key, entry);
                 }
                 Err(error) => {
                     embedding_failure = embedding_failure.or(error.embedding_failure());
@@ -985,7 +1058,7 @@ impl WorkspaceOverlayCache {
         }
 
         if scan_is_clean {
-            self.entries.retain(|key, _| seen_keys.contains(key));
+            self.retain_entries(|key, _| seen_keys.contains(key));
             for key in baseline_files.keys() {
                 if !seen_keys.contains(key) {
                     hidden_paths.insert(key.clone());
@@ -1015,6 +1088,7 @@ impl WorkspaceOverlayCache {
         };
         let to_consume = self.publication_consumption(&verdict);
         self.finish_publication(&verdict, &to_consume, true);
+        self.baseline_identity = None;
         // An in-place full publication replaces the whole state: any plan whose Phase A
         // started before this moment must not publish over it.
         self.bump_wholesale();
@@ -1158,7 +1232,7 @@ impl WorkspaceOverlayCache {
     /// Remove a point-refresh key that is PROVABLY gone: the entry goes, and the baseline copy
     /// (when there is one) is hidden, exactly as a clean full scan would settle it.
     fn remove_point_entry(&mut self, key: FileKey, has_baseline: bool) {
-        self.entries.remove(&key);
+        self.remove_entry(&key);
         if has_baseline {
             self.hidden_paths.insert(key);
         } else {
@@ -1181,13 +1255,13 @@ impl WorkspaceOverlayCache {
                     self.hidden_paths.remove(&key);
                 }
                 self.unread_keys.remove(&key);
-                self.entries.insert(key.clone(), entry);
+                self.insert_entry(key.clone(), entry);
                 if store_fault {
                     self.retain_dirty_uncharged(key, prior_failures);
                 }
             }
             PointAction::BaselineEqual => {
-                self.entries.remove(&key);
+                self.remove_entry(&key);
                 self.hidden_paths.remove(&key);
                 self.unread_keys.remove(&key);
                 if store_fault {
@@ -1346,14 +1420,11 @@ impl WorkspaceOverlayCache {
         store: &Store,
     ) -> Result<(), SearchError> {
         let mut embedding_failure = None;
-        let manifest_snapshot_id = store
-            .load_baseline_manifest()
-            .ok()
-            .flatten()
-            .map(|r| r.snapshot_id)
-            .unwrap_or_default();
+        let baseline_identity =
+            store.load_baseline_manifest()?.map(|r| (r.snapshot_id, r.fingerprint));
+        let manifest_snapshot_id = baseline_identity.as_ref().map(|r| r.0.as_str()).unwrap_or("");
         let persisted = store
-            .load_overlay_fingerprint_cache(&manifest_snapshot_id)
+            .load_overlay_fingerprint_cache(manifest_snapshot_id)
             .unwrap_or(None)
             .unwrap_or_default();
 
@@ -1433,11 +1504,22 @@ impl WorkspaceOverlayCache {
                                 &entry.embedding_inputs,
                                 &mut self.embedding_cache,
                             ) {
-                                Ok(vectors) => entry.vector_documents = vectors,
+                                Ok(vectors) => {
+                                    self.unembedded_entries -= usize::from(
+                                        entry.vector_documents.len() < entry.embedding_inputs.len(),
+                                    );
+                                    entry.vector_documents = vectors;
+                                    self.unembedded_entries += usize::from(
+                                        entry.vector_documents.len() < entry.embedding_inputs.len(),
+                                    );
+                                }
                                 Err(error) => {
                                     embedding_failure =
                                         embedding_failure.or(error.embedding_failure());
-                                    tracing::warn!("failed to attach overlay vectors; keeping the entry lexical-only: {error}");
+                                    tracing::warn!(
+                                        "failed to attach overlay vectors; keeping the entry \
+                                         lexical-only: {error}"
+                                    );
                                 }
                             }
                         }
@@ -1446,7 +1528,7 @@ impl WorkspaceOverlayCache {
                 }
             }
             if should_remove_cached_entry {
-                self.entries.remove(&file.key);
+                self.remove_entry(&file.key);
                 continue;
             }
 
@@ -1457,7 +1539,7 @@ impl WorkspaceOverlayCache {
                     if baseline_fingerprint
                         .is_some_and(|stored| stored == &cached.content_fingerprint)
                     {
-                        self.entries.remove(&file.key);
+                        self.remove_entry(&file.key);
                         continue;
                     }
                 }
@@ -1489,7 +1571,7 @@ impl WorkspaceOverlayCache {
             }
 
             if baseline_fingerprint.is_some_and(|stored| stored == &local_fp) {
-                self.entries.remove(&file.key);
+                self.remove_entry(&file.key);
                 continue;
             }
 
@@ -1509,7 +1591,7 @@ impl WorkspaceOverlayCache {
                     if baseline_fingerprint.is_some() {
                         hidden_paths.insert(file.key.clone());
                     }
-                    self.entries.insert(file.key.clone(), entry);
+                    self.insert_entry(file.key.clone(), entry);
                 }
                 Err(error) => {
                     embedding_failure = embedding_failure.or(error.embedding_failure());
@@ -1526,7 +1608,7 @@ impl WorkspaceOverlayCache {
         }
 
         if scan_is_clean {
-            self.entries.retain(|key, _| seen_keys.contains(key));
+            self.retain_entries(|key, _| seen_keys.contains(key));
             for key in manifest_fingerprints.keys() {
                 if !seen_keys.contains(key) {
                     hidden_paths.insert(key.clone());
@@ -1558,12 +1640,13 @@ impl WorkspaceOverlayCache {
         let rows = self.split_rows_by_live_marks(updated_persisted, &to_consume, &empty_gate);
         let persist_ok = Self::persist_fingerprint_rows(
             store,
-            &manifest_snapshot_id,
+            manifest_snapshot_id,
             &rows,
             &read_failures,
             &to_consume,
         );
         self.finish_publication(&verdict, &to_consume, persist_ok);
+        self.baseline_identity = baseline_identity;
         // An in-place full publication replaces the whole state: any plan whose Phase A
         // started before this moment must not publish over it.
         self.bump_wholesale();
@@ -1617,12 +1700,9 @@ impl WorkspaceOverlayCache {
         graph_context: Option<&dyn GraphContextProvider>,
         distrusted: &HashSet<FileKey>,
     ) -> Result<RefreshPlan, SearchError> {
-        let snapshot_id = store
-            .load_baseline_manifest()
-            .ok()
-            .flatten()
-            .map(|r| r.snapshot_id)
-            .unwrap_or_default();
+        let baseline_identity =
+            store.load_baseline_manifest()?.map(|r| (r.snapshot_id, r.fingerprint));
+        let snapshot_id = baseline_identity.as_ref().map(|r| r.0.clone()).unwrap_or_default();
         let persisted =
             store.load_overlay_fingerprint_cache(&snapshot_id).unwrap_or(None).unwrap_or_default();
 
@@ -1726,6 +1806,7 @@ impl WorkspaceOverlayCache {
 
         Ok(RefreshPlan {
             snapshot_id,
+            baseline_identity,
             entries,
             hidden_paths,
             updated_persisted,
@@ -1859,7 +1940,7 @@ impl WorkspaceOverlayCache {
             // plan's version of these keys is either unproven or stale.
             for key in &carried {
                 entries.remove(key);
-                if let Some(prior) = self.entries.remove(key) {
+                if let Some(prior) = self.remove_entry(key) {
                     entries.insert(key.clone(), prior);
                 }
             }
@@ -1870,6 +1951,10 @@ impl WorkspaceOverlayCache {
                     hidden_paths.insert(key.clone());
                 }
             }
+            self.unembedded_entries = entries
+                .values()
+                .filter(|entry| entry.vector_documents.len() < entry.embedding_inputs.len())
+                .count();
             self.entries = entries;
             self.hidden_paths = hidden_paths;
         } else {
@@ -1881,14 +1966,14 @@ impl WorkspaceOverlayCache {
                 if carried.contains(&key) {
                     continue;
                 }
-                self.entries.insert(key, entry);
+                self.insert_entry(key, entry);
             }
             for key in &plan.seen_keys {
                 if carried.contains(key) {
                     continue;
                 }
                 if !planned_keys.contains(key) {
-                    self.entries.remove(key);
+                    self.remove_entry(key);
                 }
                 if plan.hidden_paths.contains(key) {
                     self.hidden_paths.insert(key.clone());
@@ -1922,6 +2007,7 @@ impl WorkspaceOverlayCache {
         // the table as well.
         let rows = self.split_rows_by_live_marks(plan.updated_persisted, &to_consume, &fenced);
         self.finish_publication(&verdict, &to_consume, true);
+        self.baseline_identity = plan.baseline_identity;
         // Settlements whose key still CARRIES state (an entry, a hiding, a mark, an unread
         // debt) are kept even below the fence: another plan with an older fence may still be
         // in flight (the library does not enforce the driver's single-flight), and pruning
@@ -2004,10 +2090,7 @@ impl WorkspaceOverlayCache {
     /// with a warm cache hit, so emptiness alone would hide a half-embedded file from the
     /// retry driver.
     pub fn unembedded_entry_count(&self) -> usize {
-        self.entries
-            .values()
-            .filter(|entry| entry.vector_documents.len() < entry.embedding_inputs.len())
-            .count()
+        self.unembedded_entries
     }
 
     /// Whether the overlay has been initialized by some full pass (or an explicit clean
@@ -7537,7 +7620,44 @@ mod tests {
     /// vectors only for warm-cached chunks, so emptiness alone would hide a half-embedded
     /// file from the retry driver.
     #[test]
-    fn a_partially_vectorized_entry_counts_as_unembedded() {
+    fn indexing_overlay_identity_follows_full_publication_not_new_manifest() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("search.db")).unwrap();
+        let roots = single_root(dir.path());
+        let mut cache = WorkspaceOverlayCache::default();
+        let save = |id: &str, fp: &str| {
+            store
+                .save_baseline_manifest(&crate::WorkspaceBaselineManifest {
+                    snapshot_id: id.into(),
+                    snapshot_fingerprint: Some(fp.into()),
+                    files: vec![],
+                })
+                .unwrap()
+        };
+        save("A", "fp-a");
+        cache.full_refresh_from_manifest(&HashMap::new(), &roots, None, 32, &store).unwrap();
+        assert_eq!(cache.baseline_identity, Some(("A".into(), Some("fp-a".into()))));
+        let baseline = cache.publication_baseline();
+        save("B", "fp-b");
+        let plan = WorkspaceOverlayCache::plan_full_refresh_from_manifest(
+            &HashMap::new(),
+            &roots,
+            &store,
+            &HashMap::new(),
+            None,
+            &HashSet::new(),
+        )
+        .unwrap();
+        save("B", "fp-c");
+        assert_eq!(cache.baseline_identity, Some(("A".into(), Some("fp-a".into()))));
+        cache.publish_plan(plan, HashMap::new(), &baseline, None, &store).unwrap();
+        assert_eq!(cache.baseline_identity, Some(("B".into(), Some("fp-b".into()))));
+        cache.clear();
+        assert!(cache.baseline_identity.is_none());
+    }
+
+    #[test]
+    fn indexing_local_qualification_tracks_partial_full_dirty_delete_and_clear() {
         let dir = tempdir().unwrap();
         let workspace = dir.path();
         let two_chunks = "Процедура Первая()\nКонецПроцедуры\nПроцедура Вторая()\nКонецПроцедуры";
@@ -7563,6 +7683,48 @@ mod tests {
         let partial = HashMap::from([(missing[0].clone(), vec![1.0f32, 0.0, 0.0])]);
         cache.publish_plan(plan, partial, &baseline, None, &store).unwrap();
         assert_eq!(cache.unembedded_entry_count(), 1, "one vector of two is NOT a finished entry");
+        let assert_count = |cache: &WorkspaceOverlayCache| {
+            assert_eq!(
+                cache.unembedded_entry_count(),
+                cache
+                    .entries
+                    .values()
+                    .filter(|entry| entry.vector_documents.len() < entry.embedding_inputs.len())
+                    .count()
+            );
+            assert_eq!(cache.dirty_paths_count(), cache.dirty_paths_snapshot().len());
+        };
+        assert_count(&cache);
+        cache.mark_dirty_path(key("A.bsl"));
+        assert_eq!(cache.dirty_paths_count(), 1);
+        let baseline = cache.publication_baseline();
+        let plan = WorkspaceOverlayCache::plan_full_refresh_from_manifest(
+            &manifest,
+            &roots,
+            &store,
+            &cache.embedding_cache_snapshot(),
+            None,
+            &HashSet::new(),
+        )
+        .unwrap();
+        let remaining = plan
+            .missing_embeddings()
+            .keys()
+            .map(|key| (key.clone(), vec![1.0f32, 0.0, 0.0]))
+            .collect();
+        cache.publish_plan(plan, remaining, &baseline, None, &store).unwrap();
+        assert_count(&cache);
+        assert_eq!(cache.unembedded_entry_count(), 0);
+        assert_eq!(cache.dirty_paths_count(), 0);
+        assert!(cache.is_initialized());
+        cache.remove_known_deleted(&key("A.bsl"), true);
+        assert_count(&cache);
+        cache.mark_initialized_clean();
+        assert_count(&cache);
+        cache.mark_dirty_path(key("A.bsl"));
+        cache.clear();
+        assert_count(&cache);
+        assert!(!cache.is_initialized());
     }
 
     /// The unread debt VETOES the full pass's equal-fingerprint gates: after the point budget
@@ -8036,7 +8198,7 @@ mod tests {
 
         let mut cache = WorkspaceOverlayCache::default();
         let stable = key("Stable.bsl");
-        cache.entries.insert(
+        cache.insert_entry(
             stable.clone(),
             super::OverlayFileEntry {
                 fingerprint: super::FileFingerprint {
@@ -8064,7 +8226,7 @@ mod tests {
     fn a_rebound_unread_key_inherits_neither_entry_nor_baseline_hiding() {
         let mut cache = WorkspaceOverlayCache::default();
         let rebound = FileKey::new("rebound", "Module.bsl");
-        cache.entries.insert(
+        cache.insert_entry(
             rebound.clone(),
             super::OverlayFileEntry {
                 fingerprint: super::FileFingerprint {
@@ -8102,7 +8264,7 @@ mod tests {
         cache.full_rescan_pending = true;
         let stable = key("Stable.bsl");
         cache.mark_dirty_path(stable.clone());
-        cache.entries.insert(
+        cache.insert_entry(
             stable.clone(),
             super::OverlayFileEntry {
                 fingerprint: super::FileFingerprint {

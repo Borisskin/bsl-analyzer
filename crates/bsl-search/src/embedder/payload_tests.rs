@@ -244,6 +244,12 @@ fn payload_transport_response_limit_and_timeout_are_independent() {
     let embedder = Embedder::new(server.config(4096));
     assert_eq!(embedder.embed("small").unwrap_err().to_string(), "embedding_response_too_large");
     assert_eq!(server.requests().len(), 1);
+    // The batch path retries a passing state, not an answer that is always too large.
+    assert_eq!(
+        embedder.embed_batch(&["small"]).unwrap_err().to_string(),
+        "embedding_response_too_large"
+    );
+    assert_eq!(server.requests().len(), 2);
     let server = PayloadServer::new(|i, body| {
         std::thread::sleep(Duration::from_millis(100));
         success(i, body)
