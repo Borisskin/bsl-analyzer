@@ -1218,7 +1218,7 @@ connection URL и учётные данные не записывают.
 Machine contract `3.1` публикуется через `bsl-analyzer contract` и ресурс
 `bsl-analyzer://contract`; схемы доступны в `tools/list`. Версии: search hits/not-ready
 `7` для `search_code` и `6` для docs-действий, search status `3`, graph schema
-descriptor `35`, indexing `1`;
+descriptor `34`, indexing `1`;
 `list_platform` остаётся `1`. У legacy graph status/loading нет нового корневого
 `schema_version`.
 

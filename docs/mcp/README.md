@@ -394,7 +394,7 @@ JSON-экранирование, модель, dimensions и provider routing. �
 Текущий machine contract — `3.1`: успешные ответы поиска и graph lifecycle/loading
 несут структурированный `indexing`, ответы поиска — необязательный `semantic_failure`.
 Search hits/not-ready имеют schema `7` для `search_code` и `6` для docs-действий,
-search status — `3`, graph descriptor — `35`; list_platform остаётся `1`.
+search status — `3`, graph descriptor — `34`; list_platform остаётся `1`.
 Готовность lexical, semantic, graph и reference читается отдельно; unknown не
 означает завершение. Точный формат, null/terminal правила и примеры описаны в
 [TOOLS_AND_EXTENSION.md](TOOLS_AND_EXTENSION.md#структурированный-прогресс-индексации).
